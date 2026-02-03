@@ -248,6 +248,55 @@ curl "http://localhost:3001/runs?limit=10"
 }
 ```
 
+## Configuration
+
+RelayPlane creates a config file on first run at `~/.relayplane/config.json`:
+
+```json
+{
+  "strategies": {
+    "code_review": { "model": "anthropic:claude-sonnet-4-20250514" },
+    "code_generation": { "model": "anthropic:claude-3-5-haiku-latest" },
+    "analysis": { "model": "anthropic:claude-sonnet-4-20250514" },
+    "summarization": { "model": "anthropic:claude-3-5-haiku-latest" },
+    "creative_writing": { "model": "anthropic:claude-sonnet-4-20250514" },
+    "data_extraction": { "model": "anthropic:claude-3-5-haiku-latest" },
+    "translation": { "model": "anthropic:claude-3-5-haiku-latest" },
+    "question_answering": { "model": "anthropic:claude-3-5-haiku-latest" },
+    "general": { "model": "anthropic:claude-3-5-haiku-latest" }
+  },
+  "defaults": {
+    "qualityModel": "claude-sonnet-4-20250514",
+    "costModel": "claude-3-5-haiku-latest"
+  }
+}
+```
+
+**Edit and save — changes apply instantly** (hot-reload, no restart needed).
+
+### Strategy Options
+
+| Field | Description |
+|-------|-------------|
+| `model` | Provider and model in format `provider:model` |
+| `minConfidence` | Optional. Only use this strategy if confidence >= threshold |
+| `fallback` | Optional. Fallback model if primary fails |
+
+### Examples
+
+Route all analysis tasks to GPT-4o:
+```json
+"analysis": { "model": "openai:gpt-4o" }
+```
+
+Use Opus for code review with fallback:
+```json
+"code_review": { 
+  "model": "anthropic:claude-opus-4-5-20250514",
+  "fallback": "anthropic:claude-sonnet-4-20250514"
+}
+```
+
 ## Data Storage
 
 All data stored locally at `~/.relayplane/data.db` (SQLite).
