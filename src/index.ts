@@ -26,18 +26,18 @@ export { DEFAULT_ENDPOINTS, MODEL_MAPPING } from './proxy.js';
 
 // Core relay functionality
 export { RelayPlane } from './relay.js';
-export type { RelayPlaneConfig } from './relay.js';
 
 // Types
 export type {
   Provider,
   TaskType,
   RoutingRule,
-  RoutingRuleSource,
+  RuleSource,
   RunRecord,
   Outcome,
   OutcomeQuality,
   Suggestion,
+  RelayPlaneConfig,
 } from './types.js';
 export { Providers, TaskTypes, TaskTypeSchema, ProviderSchema } from './types.js';
 

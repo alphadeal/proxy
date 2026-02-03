@@ -199,20 +199,13 @@ export class RelayPlane {
 
   /**
    * Gets an adapter for a provider.
+   * Note: In the standalone proxy package, adapters are not used.
+   * The proxy handles provider calls directly via HTTP.
    */
-  private async getAdapter(provider: Provider): Promise<ModelAdapter | null> {
-    try {
-      // Lazy load the adapter registry
-      if (!this.adapterRegistry) {
-        const adapters = await import('@relayplane/adapters');
-        this.adapterRegistry = adapters.defaultAdapterRegistry;
-      }
-
-      return await this.adapterRegistry.get(provider);
-    } catch {
-      // Adapter not available
-      return null;
-    }
+  private async getAdapter(_provider: Provider): Promise<ModelAdapter | null> {
+    // Adapters not available in standalone proxy package
+    // The proxy handles all provider calls directly
+    return null;
   }
 
   /**

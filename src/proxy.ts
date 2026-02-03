@@ -1600,8 +1600,5 @@ export async function main(): Promise<void> {
   }
 }
 
-// Run if executed directly
-const isMainModule = import.meta.url.endsWith(process.argv[1]?.replace(/\\/g, '/') ?? '');
-if (isMainModule) {
-  main();
-}
+// Note: Use cli.ts for direct execution
+// This module is imported by cli.ts
