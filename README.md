@@ -6,6 +6,17 @@ Intelligent AI model routing that cuts costs by 50-80% while maintaining quality
 
 > **Note:** Designed for standard API key users (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`). MAX subscription OAuth is not currently supported — MAX users should continue using their provider directly.
 
+> ⚠️ **Cost Monitoring Required**
+>
+> RelayPlane routes requests to LLM providers using your API keys. **This incurs real costs.**
+>
+> - Set up billing alerts with your providers (Anthropic, OpenAI, etc.)
+> - Monitor usage through your provider's dashboard
+> - Check `/stats` endpoint to track request volume
+> - Start with test requests to understand routing behavior
+>
+> RelayPlane provides cost *optimization*, not cost *elimination*. You are responsible for monitoring your actual spending.
+
 [![CI](https://github.com/RelayPlane/proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/RelayPlane/proxy/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/@relayplane/proxy)](https://www.npmjs.com/package/@relayplane/proxy)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -298,25 +309,6 @@ Use Opus for code review with fallback:
   "fallback": "anthropic:claude-sonnet-4-20250514"
 }
 ```
-
-### Hybrid Auth (MAX + API Key)
-
-If you have a MAX subscription, you can use MAX for Opus and API keys for cheaper models:
-
-```json
-{
-  "auth": {
-    "anthropicMaxToken": "your-max-token-here",
-    "useMaxForModels": ["opus"]
-  }
-}
-```
-
-This routes:
-- **Opus requests** → MAX token (already paid for)
-- **Haiku/Sonnet requests** → API key (pay per token)
-
-Best of both worlds: unlimited Opus via MAX, cheap Haiku for simple tasks.
 
 ## Data Storage
 
