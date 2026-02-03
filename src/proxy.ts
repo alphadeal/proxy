@@ -1280,7 +1280,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
       } else if (routingMode === 'quality') {
         // Quality mode: Always use the best available model
-        const qualityModel = process.env['RELAYPLANE_QUALITY_MODEL'] || 'claude-3-5-sonnet-latest';
+        const qualityModel = process.env['RELAYPLANE_QUALITY_MODEL'] || 'claude-sonnet-4-20250514';
         targetModel = qualityModel;
         targetProvider = 'anthropic';
       }

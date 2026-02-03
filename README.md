@@ -88,10 +88,10 @@ Unlike static routing rules, RelayPlane adapts to **your** usage patterns.
 
 | Provider | Models | Streaming | Tools |
 |----------|--------|-----------|-------|
-| **Anthropic** | Claude Opus, Sonnet, Haiku | ✓ | ✓ |
-| **OpenAI** | GPT-4o, GPT-4o-mini, o1, o3 | ✓ | ✓ |
-| **Google** | Gemini 2.0 Flash, 1.5 Pro | ✓ | — |
-| **xAI** | Grok-2, Grok-2-mini | ✓ | ✓ |
+| **Anthropic** | Claude 4.5 (Opus, Sonnet, Haiku) | ✓ | ✓ |
+| **OpenAI** | GPT-5.2, GPT-5.2-Codex, o1, o3 | ✓ | ✓ |
+| **Google** | Gemini 2.0 Flash, 2.0 Pro | ✓ | ✓ |
+| **xAI** | Grok-3, Grok-3-mini | ✓ | ✓ |
 | **Moonshot** | v1-8k, v1-32k, v1-128k | ✓ | ✓ |
 
 ## Routing Modes
