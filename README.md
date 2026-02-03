@@ -94,11 +94,14 @@ RelayPlane doesn't just route — it **learns from every request**:
 - **Local Intelligence** — All learning happens in your local SQLite DB
 
 ```bash
-# View your routing stats
+# View your routing stats (last 7 days)
 npx @relayplane/proxy stats
 
-# Query the raw data
-sqlite3 ~/.relayplane/data.db "SELECT model, outcome, COUNT(*) FROM runs GROUP BY model, outcome"
+# View last 30 days
+npx @relayplane/proxy stats --days 30
+
+# Query the raw data directly
+sqlite3 ~/.relayplane/data.db "SELECT model, task_type, COUNT(*) FROM runs GROUP BY model, task_type"
 ```
 
 Unlike static routing rules, RelayPlane adapts to **your** usage patterns.
