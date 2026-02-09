@@ -9,15 +9,19 @@
  *   relayplane-proxy [command] [options]
  * 
  * Commands:
- *   (default)          Start the proxy server
- *   stats              Show routing statistics
+ *   (default)              Start the proxy server
+ *   telemetry [on|off|status]  Manage telemetry settings
+ *   stats                  Show usage statistics
+ *   config                 Show configuration
  * 
  * Options:
  *   --port <number>    Port to listen on (default: 3001)
  *   --host <string>    Host to bind to (default: 127.0.0.1)
- *   --days <number>    Days of history for stats (default: 7)
+ *   --offline          Disable all network calls except LLM endpoints
+ *   --audit            Show telemetry payloads before sending
  *   -v, --verbose      Enable verbose logging
  *   -h, --help         Show this help message
+ *   --version          Show version
  * 
  * Environment Variables:
  *   ANTHROPIC_API_KEY  Anthropic API key
@@ -29,9 +33,26 @@
  * @packageDocumentation
  */
 
-import { startProxy } from './proxy.js';
-import { getDefaultDbPath } from './storage/index.js';
-import Database from 'better-sqlite3';
+import { startProxy } from './standalone-proxy.js';
+import {
+  loadConfig,
+  isFirstRun,
+  markFirstRunComplete,
+  isTelemetryEnabled,
+  enableTelemetry,
+  disableTelemetry,
+  getConfigPath,
+  setApiKey,
+} from './config.js';
+import {
+  printTelemetryDisclosure,
+  setAuditMode,
+  setOfflineMode,
+  getTelemetryStats,
+  getTelemetryPath,
+} from './telemetry.js';
+
+const VERSION = '0.2.1';
 
 function printHelp(): void {
   console.log(`
@@ -42,19 +63,19 @@ Usage:
   relayplane-proxy [command] [options]
 
 Commands:
-  (default)          Start the proxy server
-  stats              Show routing statistics
+  (default)              Start the proxy server
+  telemetry [on|off|status]  Manage telemetry settings
+  stats                  Show usage statistics
+  config                 Show configuration
 
-Server Options:
+Options:
   --port <number>    Port to listen on (default: 3001)
   --host <string>    Host to bind to (default: 127.0.0.1)
+  --offline          Disable all network calls except LLM endpoints
+  --audit            Show telemetry payloads before sending
   -v, --verbose      Enable verbose logging
-
-Stats Options:
-  --days <number>    Days of history to show (default: 7)
-
-General:
   -h, --help         Show this help message
+  --version          Show version
 
 Environment Variables:
   ANTHROPIC_API_KEY  Anthropic API key
@@ -63,119 +84,124 @@ Environment Variables:
   XAI_API_KEY        xAI/Grok API key (optional)
   MOONSHOT_API_KEY   Moonshot API key (optional)
 
-Examples:
+Example:
   # Start proxy on default port
   npx @relayplane/proxy
 
-  # Start on custom port with verbose logging
-  npx @relayplane/proxy --port 8080 -v
+  # Start with audit mode (see telemetry before it's sent)
+  npx @relayplane/proxy --audit
 
-  # View routing stats for last 7 days
-  npx @relayplane/proxy stats
+  # Start in offline mode (no telemetry transmission)
+  npx @relayplane/proxy --offline
 
-  # View stats for last 30 days
-  npx @relayplane/proxy stats --days 30
+  # Disable telemetry completely
+  npx @relayplane/proxy telemetry off
 
-Learn more: https://relayplane.com/integrations/openclaw
+  # Then point your SDKs to the proxy
+  export ANTHROPIC_BASE_URL=http://localhost:3001
+  export OPENAI_BASE_URL=http://localhost:3001
+
+Learn more: https://relayplane.com/docs
 `);
 }
 
-function showStats(days: number): void {
-  const dbPath = getDefaultDbPath();
+function printVersion(): void {
+  console.log(`RelayPlane Proxy v${VERSION}`);
+}
+
+function handleTelemetryCommand(args: string[]): void {
+  const subcommand = args[0];
   
-  try {
-    const db = new Database(dbPath, { readonly: true });
-    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
-    
-    // Get stats from database
-    const runs = db.prepare(`
-      SELECT 
-        model,
-        task_type,
-        COUNT(*) as count,
-        SUM(tokens_in) as total_in,
-        SUM(tokens_out) as total_out,
-        AVG(duration_ms) as avg_duration,
-        SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as successes
-      FROM runs 
-      WHERE created_at >= ?
-      GROUP BY model
-      ORDER BY count DESC
-    `).all(cutoff) as Array<{
-      model: string;
-      task_type: string;
-      count: number;
-      total_in: number;
-      total_out: number;
-      avg_duration: number;
-      successes: number;
-    }>;
-
-    const totalRuns = runs.reduce((sum, r) => sum + r.count, 0);
-    const totalTokensIn = runs.reduce((sum, r) => sum + (r.total_in || 0), 0);
-    const totalTokensOut = runs.reduce((sum, r) => sum + (r.total_out || 0), 0);
-
-    console.log('');
-    console.log(`  ╭─────────────────────────────────────────╮`);
-    console.log(`  │      RelayPlane Routing Stats          │`);
-    console.log(`  │          Last ${String(days).padStart(2)} days                  │`);
-    console.log(`  ╰─────────────────────────────────────────╯`);
-    console.log('');
-
-    if (totalRuns === 0) {
-      console.log('  No routing data found for this period.');
-      console.log('  Start using the proxy to collect stats!');
+  switch (subcommand) {
+    case 'on':
+      enableTelemetry();
+      console.log('✅ Telemetry enabled');
+      console.log('   Anonymous usage data will be collected to improve routing.');
+      console.log('   Run with --audit to see exactly what\'s collected.');
+      break;
+      
+    case 'off':
+      disableTelemetry();
+      console.log('✅ Telemetry disabled');
+      console.log('   No usage data will be collected.');
+      console.log('   The proxy will continue to work normally.');
+      break;
+      
+    case 'status':
+    default:
+      const enabled = isTelemetryEnabled();
       console.log('');
-      return;
-    }
+      console.log('📊 Telemetry Status');
+      console.log('───────────────────');
+      console.log(`   Enabled: ${enabled ? '✅ Yes' : '❌ No'}`);
+      console.log(`   Data file: ${getTelemetryPath()}`);
+      console.log('');
+      console.log('   To enable:  relayplane-proxy telemetry on');
+      console.log('   To disable: relayplane-proxy telemetry off');
+      console.log('   To audit:   relayplane-proxy --audit');
+      console.log('');
+      break;
+  }
+}
 
-    console.log('  Summary:');
-    console.log(`    Total requests:     ${totalRuns.toLocaleString()}`);
-    console.log(`    Total tokens in:    ${totalTokensIn.toLocaleString()}`);
-    console.log(`    Total tokens out:   ${totalTokensOut.toLocaleString()}`);
-    console.log('');
-
+function handleStatsCommand(): void {
+  const stats = getTelemetryStats();
+  
+  console.log('');
+  console.log('📊 Usage Statistics');
+  console.log('═══════════════════');
+  console.log('');
+  console.log(`  Total requests: ${stats.totalEvents}`);
+  console.log(`  Total cost:     $${stats.totalCost.toFixed(2)}`);
+  console.log(`  Success rate:   ${(stats.successRate * 100).toFixed(1)}%`);
+  console.log('');
+  
+  if (Object.keys(stats.byModel).length > 0) {
     console.log('  By Model:');
-    console.log('  ─────────────────────────────────────────────');
-    for (const row of runs) {
-      const pct = ((row.count / totalRuns) * 100).toFixed(1);
-      const successRate = row.count > 0 ? ((row.successes / row.count) * 100).toFixed(0) : '0';
-      console.log(`    ${row.model.padEnd(35)} ${String(row.count).padStart(6)} (${pct.padStart(5)}%)  ${successRate}% ok`);
+    for (const [model, data] of Object.entries(stats.byModel)) {
+      console.log(`    ${model}: ${data.count} requests, $${data.cost.toFixed(2)}`);
     }
-    console.log('');
-
-    // Estimate savings (rough calculation)
-    // Haiku: ~$0.25/M in, $1.25/M out
-    // Sonnet: ~$3/M in, $15/M out
-    // Opus: ~$15/M in, $75/M out
-    const haikuRuns = runs.filter(r => r.model.includes('haiku'));
-    const haikuTokensIn = haikuRuns.reduce((sum, r) => sum + (r.total_in || 0), 0);
-    const haikuTokensOut = haikuRuns.reduce((sum, r) => sum + (r.total_out || 0), 0);
-    
-    // Cost if all were Opus
-    const opusCost = (totalTokensIn * 15 / 1_000_000) + (totalTokensOut * 75 / 1_000_000);
-    // Actual cost with Haiku routing
-    const haikuCost = (haikuTokensIn * 0.25 / 1_000_000) + (haikuTokensOut * 1.25 / 1_000_000);
-    const nonHaikuCost = ((totalTokensIn - haikuTokensIn) * 3 / 1_000_000) + ((totalTokensOut - haikuTokensOut) * 15 / 1_000_000);
-    const actualCost = haikuCost + nonHaikuCost;
-    const savings = opusCost - actualCost;
-
-    if (savings > 0) {
-      console.log('  Estimated Savings:');
-      console.log(`    If all Opus:        $${opusCost.toFixed(2)}`);
-      console.log(`    With routing:       $${actualCost.toFixed(2)}`);
-      console.log(`    Saved:              $${savings.toFixed(2)} (${((savings / opusCost) * 100).toFixed(0)}%)`);
-      console.log('');
-    }
-
-    db.close();
-  } catch (err) {
-    console.error('Error reading stats:', err);
-    console.log('');
-    console.log('  No data found. The proxy stores data at:');
-    console.log(`    ${dbPath}`);
     console.log('');
   }
+  
+  if (Object.keys(stats.byTaskType).length > 0) {
+    console.log('  By Task Type:');
+    for (const [taskType, data] of Object.entries(stats.byTaskType)) {
+      console.log(`    ${taskType}: ${data.count} requests, $${data.cost.toFixed(2)}`);
+    }
+    console.log('');
+  }
+  
+  if (stats.totalEvents === 0) {
+    console.log('  No data yet. Start using the proxy to collect statistics.');
+    console.log('');
+  }
+}
+
+function handleConfigCommand(args: string[]): void {
+  const subcommand = args[0];
+  
+  if (subcommand === 'set-key' && args[1]) {
+    setApiKey(args[1]);
+    console.log('✅ API key saved');
+    console.log('   Pro features will be enabled on next proxy start.');
+    return;
+  }
+  
+  const config = loadConfig();
+  
+  console.log('');
+  console.log('⚙️  Configuration');
+  console.log('═════════════════');
+  console.log('');
+  console.log(`  Config file: ${getConfigPath()}`);
+  console.log(`  Device ID:   ${config.device_id}`);
+  console.log(`  Telemetry:   ${config.telemetry_enabled ? '✅ Enabled' : '❌ Disabled'}`);
+  console.log(`  API Key:     ${config.api_key ? '••••' + config.api_key.slice(-4) : 'Not set'}`);
+  console.log(`  Created:     ${config.created_at}`);
+  console.log('');
+  console.log('  To set API key: relayplane-proxy config set-key <your-key>');
+  console.log('');
 }
 
 async function main(): Promise<void> {
@@ -187,21 +213,36 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // Check for stats command
-  if (args[0] === 'stats') {
-    let days = 7;
-    const daysIdx = args.indexOf('--days');
-    if (daysIdx !== -1 && args[daysIdx + 1]) {
-      days = parseInt(args[daysIdx + 1]!, 10) || 7;
-    }
-    showStats(days);
+  // Check for version
+  if (args.includes('--version')) {
+    printVersion();
     process.exit(0);
   }
 
-  // Parse server arguments
+  // Handle commands
+  const command = args[0];
+  
+  if (command === 'telemetry') {
+    handleTelemetryCommand(args.slice(1));
+    process.exit(0);
+  }
+  
+  if (command === 'stats') {
+    handleStatsCommand();
+    process.exit(0);
+  }
+  
+  if (command === 'config') {
+    handleConfigCommand(args.slice(1));
+    process.exit(0);
+  }
+
+  // Parse server options
   let port = 3001;
   let host = '127.0.0.1';
   let verbose = false;
+  let audit = false;
+  let offline = false;
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -218,7 +259,24 @@ async function main(): Promise<void> {
       i++;
     } else if (arg === '-v' || arg === '--verbose') {
       verbose = true;
+    } else if (arg === '--audit') {
+      audit = true;
+    } else if (arg === '--offline') {
+      offline = true;
     }
+  }
+
+  // Set modes
+  setAuditMode(audit);
+  setOfflineMode(offline);
+
+  // First run disclosure
+  if (isFirstRun()) {
+    printTelemetryDisclosure();
+    markFirstRunComplete();
+    
+    // Wait for user to read (brief pause)
+    await new Promise(resolve => setTimeout(resolve, 1000));
   }
 
   // Check for at least one API key
@@ -237,9 +295,24 @@ async function main(): Promise<void> {
   // Print startup info
   console.log('');
   console.log('  ╭─────────────────────────────────────────╮');
-  console.log('  │         RelayPlane Proxy v0.1.0         │');
+  console.log(`  │       RelayPlane Proxy v${VERSION}          │`);
   console.log('  │    Intelligent AI Model Routing         │');
   console.log('  ╰─────────────────────────────────────────╯');
+  console.log('');
+  
+  // Show modes
+  const telemetryEnabled = isTelemetryEnabled();
+  console.log('  Mode:');
+  if (offline) {
+    console.log('    🔒 Offline (no telemetry transmission)');
+  } else if (audit) {
+    console.log('    🔍 Audit (showing telemetry payloads)');
+  } else if (telemetryEnabled) {
+    console.log('    📊 Telemetry enabled (--audit to inspect, telemetry off to disable)');
+  } else {
+    console.log('    📴 Telemetry disabled');
+  }
+  
   console.log('');
   console.log('  Providers:');
   if (hasAnthropicKey) console.log('    ✓ Anthropic');

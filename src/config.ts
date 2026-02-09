@@ -1,184 +1,206 @@
 /**
- * Configuration Management
- *
- * Handles loading, validation, and hot-reload of the config file.
- *
+ * RelayPlane Proxy Configuration
+ * 
+ * Handles configuration persistence, telemetry settings, and device identity.
+ * 
  * @packageDocumentation
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import * as os from 'node:os';
-import { z } from 'zod';
-import type { TaskType } from './types.js';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import * as crypto from 'crypto';
 
 /**
- * Strategy configuration for a task type
+ * Configuration schema for RelayPlane proxy
  */
-const StrategySchema = z.object({
-  model: z.string(),
-  minConfidence: z.number().min(0).max(1).optional(),
-  fallback: z.string().optional(),
-});
+export interface ProxyConfig {
+  /** Anonymous device ID (generated on first run) */
+  device_id: string;
+  
+  /** Telemetry enabled state */
+  telemetry_enabled: boolean;
+  
+  /** Whether first run disclosure has been shown */
+  first_run_complete: boolean;
+  
+  /** RelayPlane API key (for Pro features) */
+  api_key?: string;
+  
+  /** Schema version for migrations */
+  config_version: number;
+  
+  /** Timestamp of config creation */
+  created_at: string;
+  
+  /** Timestamp of last update */
+  updated_at: string;
+}
+
+const CONFIG_VERSION = 1;
+const CONFIG_DIR = path.join(os.homedir(), '.relayplane');
+const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 
 /**
- * Auth configuration for hybrid API key / MAX token support
+ * Generate an anonymous device ID
+ * Uses a random hash that cannot be traced back to the device
  */
-const AuthSchema = z.object({
-  anthropicApiKey: z.string().optional(),
-  anthropicMaxToken: z.string().optional(),
-  useMaxForModels: z.array(z.string()).optional(), // Default: ['opus']
-}).optional();
+function generateDeviceId(): string {
+  const randomBytes = crypto.randomBytes(16);
+  const hash = crypto.createHash('sha256').update(randomBytes).digest('hex');
+  return `anon_${hash.slice(0, 16)}`;
+}
 
 /**
- * Full config schema
+ * Ensure config directory exists
  */
-const ConfigSchema = z.object({
-  strategies: z.record(z.string(), StrategySchema).optional(),
-  defaults: z.object({
-    qualityModel: z.string().optional(),
-    costModel: z.string().optional(),
-  }).optional(),
-  auth: AuthSchema,
-});
-
-export type StrategyConfig = z.infer<typeof StrategySchema>;
-export type Config = z.infer<typeof ConfigSchema>;
+function ensureConfigDir(): void {
+  if (!fs.existsSync(CONFIG_DIR)) {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  }
+}
 
 /**
- * Default configuration
+ * Create default configuration
  */
-export const DEFAULT_CONFIG: Config = {
-  strategies: {
-    code_review: { model: 'anthropic:claude-sonnet-4-20250514' },
-    code_generation: { model: 'anthropic:claude-3-5-haiku-latest' },
-    analysis: { model: 'anthropic:claude-sonnet-4-20250514' },
-    summarization: { model: 'anthropic:claude-3-5-haiku-latest' },
-    creative_writing: { model: 'anthropic:claude-sonnet-4-20250514' },
-    data_extraction: { model: 'anthropic:claude-3-5-haiku-latest' },
-    translation: { model: 'anthropic:claude-3-5-haiku-latest' },
-    question_answering: { model: 'anthropic:claude-3-5-haiku-latest' },
-    general: { model: 'anthropic:claude-3-5-haiku-latest' },
-  },
-  defaults: {
-    qualityModel: 'claude-sonnet-4-20250514',
-    costModel: 'claude-3-5-haiku-latest',
-  },
-};
+function createDefaultConfig(): ProxyConfig {
+  const now = new Date().toISOString();
+  return {
+    device_id: generateDeviceId(),
+    telemetry_enabled: true, // On by default, opt-out available
+    first_run_complete: false,
+    config_version: CONFIG_VERSION,
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+/**
+ * Load configuration from disk
+ * Creates default config if none exists
+ */
+export function loadConfig(): ProxyConfig {
+  ensureConfigDir();
+  
+  if (!fs.existsSync(CONFIG_FILE)) {
+    const config = createDefaultConfig();
+    saveConfig(config);
+    return config;
+  }
+  
+  try {
+    const data = fs.readFileSync(CONFIG_FILE, 'utf-8');
+    const config = JSON.parse(data) as ProxyConfig;
+    
+    // Ensure required fields exist (for migrations)
+    if (!config.device_id) {
+      config.device_id = generateDeviceId();
+    }
+    if (config.telemetry_enabled === undefined) {
+      config.telemetry_enabled = true;
+    }
+    if (!config.config_version) {
+      config.config_version = CONFIG_VERSION;
+    }
+    
+    return config;
+  } catch (err) {
+    // If config is corrupted, create new one
+    const config = createDefaultConfig();
+    saveConfig(config);
+    return config;
+  }
+}
+
+/**
+ * Save configuration to disk
+ */
+export function saveConfig(config: ProxyConfig): void {
+  ensureConfigDir();
+  config.updated_at = new Date().toISOString();
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
+}
+
+/**
+ * Update specific config fields
+ */
+export function updateConfig(updates: Partial<ProxyConfig>): ProxyConfig {
+  const config = loadConfig();
+  Object.assign(config, updates);
+  saveConfig(config);
+  return config;
+}
+
+/**
+ * Check if this is the first run (disclosure not shown yet)
+ */
+export function isFirstRun(): boolean {
+  const config = loadConfig();
+  return !config.first_run_complete;
+}
+
+/**
+ * Mark first run as complete
+ */
+export function markFirstRunComplete(): void {
+  updateConfig({ first_run_complete: true });
+}
+
+/**
+ * Check if telemetry is enabled
+ */
+export function isTelemetryEnabled(): boolean {
+  const config = loadConfig();
+  return config.telemetry_enabled;
+}
+
+/**
+ * Enable telemetry
+ */
+export function enableTelemetry(): void {
+  updateConfig({ telemetry_enabled: true });
+}
+
+/**
+ * Disable telemetry
+ */
+export function disableTelemetry(): void {
+  updateConfig({ telemetry_enabled: false });
+}
+
+/**
+ * Get device ID for telemetry
+ */
+export function getDeviceId(): string {
+  const config = loadConfig();
+  return config.device_id;
+}
+
+/**
+ * Set API key for Pro features
+ */
+export function setApiKey(key: string): void {
+  updateConfig({ api_key: key });
+}
+
+/**
+ * Get API key
+ */
+export function getApiKey(): string | undefined {
+  const config = loadConfig();
+  return config.api_key;
+}
+
+/**
+ * Get config directory path
+ */
+export function getConfigDir(): string {
+  return CONFIG_DIR;
+}
 
 /**
  * Get config file path
  */
 export function getConfigPath(): string {
-  return path.join(os.homedir(), '.relayplane', 'config.json');
-}
-
-/**
- * Write default config file
- */
-export function writeDefaultConfig(): void {
-  const configPath = getConfigPath();
-  const dir = path.dirname(configPath);
-
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-
-  if (!fs.existsSync(configPath)) {
-    fs.writeFileSync(
-      configPath,
-      JSON.stringify(DEFAULT_CONFIG, null, 2) + '\n',
-      'utf-8'
-    );
-    console.log(`[relayplane] Created default config at ${configPath}`);
-  }
-}
-
-/**
- * Load and validate config
- */
-export function loadConfig(): Config {
-  const configPath = getConfigPath();
-
-  // Create default if doesn't exist
-  writeDefaultConfig();
-
-  try {
-    const raw = fs.readFileSync(configPath, 'utf-8');
-    const parsed = JSON.parse(raw);
-    const validated = ConfigSchema.parse(parsed);
-    return validated;
-  } catch (err) {
-    if (err instanceof z.ZodError) {
-      console.error(`[relayplane] Invalid config: ${err.message}`);
-    } else if (err instanceof SyntaxError) {
-      console.error(`[relayplane] Config JSON parse error: ${err.message}`);
-    } else {
-      console.error(`[relayplane] Failed to load config: ${err}`);
-    }
-    console.log('[relayplane] Using default config');
-    return DEFAULT_CONFIG;
-  }
-}
-
-/**
- * Get strategy for a task type from config
- */
-export function getStrategy(config: Config, taskType: TaskType): StrategyConfig | null {
-  return config.strategies?.[taskType] ?? null;
-}
-
-/**
- * Determine which Anthropic auth to use based on model
- * Returns: { type: 'apiKey' | 'max', value: string } or null if no auth configured
- */
-export function getAnthropicAuth(
-  config: Config,
-  model: string
-): { type: 'apiKey' | 'max'; value: string } | null {
-  const auth = config.auth;
-  
-  // Check if this model should use MAX
-  const useMaxForModels = auth?.useMaxForModels ?? ['opus'];
-  const shouldUseMax = useMaxForModels.some(m => model.toLowerCase().includes(m.toLowerCase()));
-  
-  // If MAX token configured and model matches, use MAX
-  if (shouldUseMax && auth?.anthropicMaxToken) {
-    return { type: 'max', value: auth.anthropicMaxToken };
-  }
-  
-  // Otherwise use API key from config or env
-  const apiKey = auth?.anthropicApiKey ?? process.env['ANTHROPIC_API_KEY'];
-  if (apiKey) {
-    return { type: 'apiKey', value: apiKey };
-  }
-  
-  return null;
-}
-
-/**
- * Watch config file for changes
- */
-export function watchConfig(onChange: (config: Config) => void): void {
-  const configPath = getConfigPath();
-  const dir = path.dirname(configPath);
-
-  // Ensure directory exists
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-
-  let debounceTimer: NodeJS.Timeout | null = null;
-
-  fs.watch(dir, (eventType, filename) => {
-    if (filename === 'config.json') {
-      // Debounce to avoid multiple reloads
-      if (debounceTimer) clearTimeout(debounceTimer);
-      debounceTimer = setTimeout(() => {
-        console.log('[relayplane] Config file changed, reloading...');
-        const newConfig = loadConfig();
-        onChange(newConfig);
-      }, 100);
-    }
-  });
+  return CONFIG_FILE;
 }

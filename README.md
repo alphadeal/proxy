@@ -1,375 +1,185 @@
 # @relayplane/proxy
 
-**100% Local. Zero Cloud. Full Control.**
+Intelligent AI model routing proxy for cost optimization and observability.
 
-Intelligent AI model routing that cuts costs by 50-80% while maintaining quality.
-
-> **Note:** Designed for standard API key users (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`). MAX subscription OAuth is not currently supported — MAX users should continue using their provider directly.
-
-> ⚠️ **Cost Monitoring Required**
->
-> RelayPlane routes requests to LLM providers using your API keys. **This incurs real costs.**
->
-> - Set up billing alerts with your providers (Anthropic, OpenAI, etc.)
-> - Monitor usage through your provider's dashboard
-> - Use `/relayplane stats` or `curl localhost:3001/control/stats` to track usage
-> - Start with test requests to understand routing behavior
->
-> RelayPlane provides cost *optimization*, not cost *elimination*. You are responsible for monitoring your actual spending.
-
-[![CI](https://github.com/RelayPlane/proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/RelayPlane/proxy/actions/workflows/ci.yml)
-[![npm version](https://img.shields.io/npm/v/@relayplane/proxy)](https://www.npmjs.com/package/@relayplane/proxy)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-## Install
+## Installation
 
 ```bash
-npm install @relayplane/proxy
-```
-
-Or run directly:
-
-```bash
-npx @relayplane/proxy
-```
-
-## CLI Commands
-
-```bash
-# Start the proxy server
-npx @relayplane/proxy
-
-# Start on custom port
-npx @relayplane/proxy --port 8080
-
-# View routing statistics
-npx @relayplane/proxy stats
-
-# View stats for last 30 days
-npx @relayplane/proxy stats --days 30
-
-# Show help
-npx @relayplane/proxy --help
-```
-
-## OpenClaw Slash Commands
-
-If you're using OpenClaw, these chat commands are available:
-
-| Command | Description |
-|---------|-------------|
-| `/relayplane stats` | Show usage statistics and cost savings |
-| `/relayplane status` | Show proxy health and configuration |
-| `/relayplane switch <mode>` | Change routing mode (auto\|cost\|fast\|quality) |
-| `/relayplane models` | List available routing models |
-
-Example:
-```
-/relayplane stats
-/relayplane switch cost
+npm install -g @relayplane/proxy
 ```
 
 ## Quick Start
 
-### 1. Set your API keys
-
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."
-export OPENAI_API_KEY="sk-..."
-# Optional: GEMINI_API_KEY, XAI_API_KEY, MOONSHOT_API_KEY
-```
+# Set your API keys
+export ANTHROPIC_API_KEY=your-key
+export OPENAI_API_KEY=your-key
 
-### 2. Start the proxy
+# Start the proxy
+relayplane-proxy
 
-```bash
-npx @relayplane/proxy --port 3001
-```
-
-### 3. Point your tools to the proxy
-
-```bash
+# Configure your tools to use the proxy
 export ANTHROPIC_BASE_URL=http://localhost:3001
 export OPENAI_BASE_URL=http://localhost:3001
 
-# Now run OpenClaw, Cursor, Aider, or any tool
-openclaw
+# Run your AI tools (Claude Code, Cursor, Aider, etc.)
 ```
 
-That's it. All API calls now route through RelayPlane for intelligent model selection.
+## Features
 
-## How It Works
-
-```
-Your Tool (OpenClaw, Cursor, etc.)
-         │
-         ▼
-    RelayPlane Proxy
-    ├── Infers task type (code_review, analysis, etc.)
-    ├── Checks routing rules
-    ├── Selects optimal model (Haiku for simple, Opus for complex)
-    ├── Tracks outcomes (success/failure/latency)
-    └── Learns patterns → improves over time
-         │
-         ▼
-    Provider (Anthropic, OpenAI, etc.)
-```
-
-## Learning & Adaptation
-
-RelayPlane doesn't just route — it **learns from every request**:
-
-- **Outcome Tracking** — Records success/failure for each route decision
-- **Pattern Detection** — Identifies what works for your specific codebase
-- **Continuous Improvement** — Routing gets smarter the more you use it
-- **Local Intelligence** — All learning happens in your local SQLite DB
-
-```bash
-# View your routing stats (last 7 days)
-npx @relayplane/proxy stats
-
-# View last 30 days
-npx @relayplane/proxy stats --days 30
-
-# Query the raw data directly
-sqlite3 ~/.relayplane/data.db "SELECT model, task_type, COUNT(*) FROM runs GROUP BY model, task_type"
-```
-
-Unlike static routing rules, RelayPlane adapts to **your** usage patterns.
-
-## Supported Providers
-
-| Provider | Models | Streaming | Tools |
-|----------|--------|-----------|-------|
-| **Anthropic** | Claude 3.5 Haiku, Sonnet 4, Opus 4.5 | ✓ | ✓ |
-| **OpenAI** | GPT-4o, GPT-4o-mini, GPT-4.1, o1, o3 | ✓ | ✓ |
-| **Google** | Gemini 1.5 Flash, Gemini 1.5 Pro | ✓ | ✓ |
-| **xAI** | Grok (grok-*) | ✓ | ✓ |
-| **Moonshot** | Moonshot v1 (8k, 32k, 128k) | ✓ | ✓ |
-
-## Routing Modes
-
-| Model | Description |
-|-------|-------------|
-| `relayplane:auto` | Infers task type, routes to optimal model |
-| `relayplane:cost` | Prioritizes cheapest models (maximum savings) |
-| `relayplane:quality` | Uses best available model |
-
-Or pass through explicit models: `claude-3-5-sonnet-latest`, `gpt-4o`, etc.
-
-## Why RelayPlane?
-
-| Without RelayPlane | With RelayPlane |
-|-------------------|-----------------|
-| Pay Opus token rates for simple tasks | Route simple tasks to Haiku (1/10 the cost) |
-| Static model selection | Learns from outcomes over time |
-| Manual optimization | Automatic cost-quality balance |
-| No visibility into spend | Built-in savings tracking |
-
-## Key Features
-
-- **100% Local** — All data in SQLite (`~/.relayplane/data.db`)
-- **Zero Friction** — Set 2 env vars, done
-- **Learning** — Improves routing based on outcomes
-- **Full Streaming** — SSE support for all providers
-- **Tool Calls** — Function calling across providers
-
-## Programmatic Usage
-
-```typescript
-import { startProxy, RelayPlane, calculateSavings } from '@relayplane/proxy';
-
-// Start the proxy
-await startProxy({ port: 3001, verbose: true });
-
-// Or use RelayPlane directly
-const relay = new RelayPlane({});
-const result = await relay.run({ prompt: 'Review this code...' });
-console.log(result.taskType); // 'code_review'
-console.log(result.model);    // 'anthropic:claude-3-5-haiku-latest'
-
-// Check savings
-const savings = calculateSavings(relay.store, 30);
-console.log(`Saved ${savings.savingsPercent}% this month`);
-
-relay.close();
-```
+- **Intelligent Routing**: Routes requests to the optimal model based on task type
+- **Cost Tracking**: Tracks and reports API costs across all providers
+- **Provider Agnostic**: Works with Anthropic, OpenAI, Gemini, xAI, and more
+- **Local Learning**: Learns from your usage patterns to improve routing
+- **Privacy First**: Never sees your prompts or responses
 
 ## CLI Options
 
 ```bash
-npx @relayplane/proxy [options]
+relayplane-proxy [command] [options]
+
+Commands:
+  (default)              Start the proxy server
+  telemetry [on|off|status]  Manage telemetry settings
+  stats                  Show usage statistics
+  config                 Show configuration
 
 Options:
   --port <number>    Port to listen on (default: 3001)
   --host <string>    Host to bind to (default: 127.0.0.1)
+  --offline          Disable all network calls except LLM endpoints
+  --audit            Show telemetry payloads before sending
   -v, --verbose      Enable verbose logging
-  -h, --help         Show help
+  -h, --help         Show this help message
+  --version          Show version
 ```
 
-## REST API
+## Telemetry
 
-The proxy exposes control endpoints for stats and monitoring:
+RelayPlane collects anonymous telemetry to improve model routing. This data helps us understand usage patterns and optimize routing decisions.
 
-### `GET /control/status`
-
-Proxy status and current configuration.
-
-```bash
-curl http://localhost:3001/control/status
-```
+### What We Collect (Exact Schema)
 
 ```json
 {
-  "enabled": true,
-  "mode": "cascade",
-  "modelOverrides": {}
+  "device_id": "anon_8f3a...",
+  "task_type": "code_review",
+  "model": "claude-3-5-haiku",
+  "tokens_in": 1847,
+  "tokens_out": 423,
+  "latency_ms": 2341,
+  "success": true,
+  "cost_usd": 0.02
 }
 ```
 
-### `GET /control/stats`
+### Field Descriptions
 
-Aggregated statistics and routing counts.
+| Field | Type | Description |
+|-------|------|-------------|
+| `device_id` | string | Anonymous random ID (not fingerprintable) |
+| `task_type` | string | Inferred from token patterns, NOT prompt content |
+| `model` | string | The model that handled the request |
+| `tokens_in` | number | Input token count |
+| `tokens_out` | number | Output token count |
+| `latency_ms` | number | Request latency in milliseconds |
+| `success` | boolean | Whether the request succeeded |
+| `cost_usd` | number | Estimated cost in USD |
 
-```bash
-curl http://localhost:3001/control/stats
-```
+### Task Types
 
-```json
-{
-  "uptimeMs": 3600000,
-  "uptimeFormatted": "60m 0s",
-  "totalRequests": 142,
-  "successfulRequests": 138,
-  "failedRequests": 4,
-  "successRate": "97.2%",
-  "avgLatencyMs": 1203,
-  "escalations": 12,
-  "routingCounts": {
-    "auto": 100,
-    "cost": 30,
-    "passthrough": 12
-  },
-  "modelCounts": {
-    "anthropic/claude-3-5-haiku-latest": 98,
-    "anthropic/claude-sonnet-4-20250514": 44
-  }
-}
-```
+Task types are inferred from request characteristics (token counts, ratios, etc.) - never from prompt content:
 
-### `POST /control/enable` / `POST /control/disable`
+- `quick_task` - Short input/output (< 500 tokens each)
+- `code_review` - Medium-long input, medium output
+- `generation` - High output/input ratio
+- `classification` - Low output/input ratio, short output
+- `long_context` - Input > 10,000 tokens
+- `content_generation` - Output > 1,000 tokens
+- `tool_use` - Request includes tool calls
+- `general` - Default classification
 
-Enable or disable routing (passthrough mode when disabled).
+### What We NEVER Collect
 
-```bash
-curl -X POST http://localhost:3001/control/enable
-curl -X POST http://localhost:3001/control/disable
-```
+- ❌ Your prompts
+- ❌ Model responses
+- ❌ File paths or contents
+- ❌ Anything that could identify you or your project
 
-### `POST /control/config`
+### Verification
 
-Update configuration (hot-reload, merges with existing).
+You can verify exactly what data is collected:
 
 ```bash
-curl -X POST http://localhost:3001/control/config \
-  -H "Content-Type: application/json" \
-  -d '{"routing": {"mode": "cascade"}}'
+# See telemetry payloads before they're sent
+relayplane-proxy --audit
+
+# Disable all telemetry transmission
+relayplane-proxy --offline
+
+# View the source code
+# https://github.com/RelayPlane/proxy
+```
+
+### Opt-Out
+
+To disable telemetry completely:
+
+```bash
+relayplane-proxy telemetry off
+```
+
+To re-enable:
+
+```bash
+relayplane-proxy telemetry on
+```
+
+Check current status:
+
+```bash
+relayplane-proxy telemetry status
 ```
 
 ## Configuration
 
-RelayPlane creates a config file on first run at `~/.relayplane/config.json`:
+Configuration is stored in `~/.relayplane/config.json`.
 
-```json
-{
-  "enabled": true,
-  "routing": {
-    "mode": "cascade",
-    "cascade": {
-      "enabled": true,
-      "models": [
-        "claude-3-haiku-20240307",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-opus-20240229"
-      ],
-      "escalateOn": "uncertainty",
-      "maxEscalations": 1
-    },
-    "complexity": {
-      "enabled": true,
-      "simple": "claude-3-haiku-20240307",
-      "moderate": "claude-3-5-sonnet-20241022",
-      "complex": "claude-3-opus-20240229"
-    }
-  },
-  "reliability": {
-    "cooldowns": {
-      "enabled": true,
-      "allowedFails": 3,
-      "windowSeconds": 60,
-      "cooldownSeconds": 120
-    }
-  },
-  "modelOverrides": {}
-}
-```
-
-**Edit and save — changes apply instantly** (hot-reload, no restart needed).
-
-### Configuration Options
-
-| Field | Description |
-|-------|-------------|
-| `enabled` | Enable/disable routing (false = passthrough mode) |
-| `routing.mode` | `"cascade"` or `"standard"` |
-| `routing.cascade.models` | Ordered list of models to try (cheapest first) |
-| `routing.cascade.escalateOn` | When to escalate: `"uncertainty"`, `"refusal"`, or `"error"` |
-| `routing.complexity.simple/moderate/complex` | Models for each complexity level |
-| `reliability.cooldowns` | Auto-disable failing providers temporarily |
-| `modelOverrides` | Map input model names to different targets |
-
-### Examples
-
-Use GPT-4o for complex tasks:
-```json
-{
-  "routing": {
-    "complexity": {
-      "complex": "gpt-4o"
-    }
-  }
-}
-```
-
-Override a specific model:
-```json
-{
-  "modelOverrides": {
-    "claude-3-opus": "claude-3-5-sonnet-20241022"
-  }
-}
-```
-
-## Data Storage
-
-All data stored locally at `~/.relayplane/data.db` (SQLite).
+### Set API Key (Pro Features)
 
 ```bash
-# View recent runs
-sqlite3 ~/.relayplane/data.db "SELECT * FROM runs ORDER BY created_at DESC LIMIT 10"
-
-# Check routing rules
-sqlite3 ~/.relayplane/data.db "SELECT * FROM routing_rules"
+relayplane-proxy config set-key your-api-key
 ```
 
-## Links
+### View Configuration
 
-**Website:** https://relayplane.com
+```bash
+relayplane-proxy config
+```
 
-**Integration Guide:** https://relayplane.com/integrations/openclaw
+## Usage Statistics
 
-**GitHub:** https://github.com/RelayPlane/proxy
+View your usage statistics:
 
-**npm:** https://www.npmjs.com/package/@relayplane/proxy
+```bash
+relayplane-proxy stats
+```
+
+This shows:
+- Total requests and cost
+- Success rate
+- Breakdown by model
+- Breakdown by task type
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `ANTHROPIC_API_KEY` | Anthropic API key |
+| `OPENAI_API_KEY` | OpenAI API key |
+| `GEMINI_API_KEY` | Google Gemini API key |
+| `XAI_API_KEY` | xAI/Grok API key |
+| `MOONSHOT_API_KEY` | Moonshot API key |
 
 ## License
 

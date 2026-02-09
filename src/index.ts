@@ -1,59 +1,67 @@
 /**
  * @relayplane/proxy
  *
- * Intelligent AI model routing for cost optimization.
- * 100% local, zero cloud dependency.
+ * RelayPlane Agent Ops Proxy Server
+ *
+ * Intelligent AI model routing with integrated observability.
+ * This is a standalone proxy that routes requests to optimal models
+ * based on task type and cost optimization.
  *
  * @example
  * ```typescript
  * import { startProxy } from '@relayplane/proxy';
  *
  * // Start the proxy server
- * await startProxy({ port: 3001, verbose: true });
- *
- * // Then set env vars:
- * // export ANTHROPIC_BASE_URL=http://localhost:3001
- * // export OPENAI_BASE_URL=http://localhost:3001
+ * await startProxy({ port: 3001 });
  * ```
  *
  * @packageDocumentation
  */
 
-// Main proxy server
-export { startProxy } from './proxy.js';
-export type { ProxyConfig, ProviderEndpoint } from './proxy.js';
-export { DEFAULT_ENDPOINTS, MODEL_MAPPING } from './proxy.js';
+// Standalone proxy (requires only @relayplane/core)
+export { startProxy } from './standalone-proxy.js';
+export type { ProxyConfig } from './standalone-proxy.js';
 
-// Core relay functionality
-export { RelayPlane } from './relay.js';
+// Configuration
+export {
+  loadConfig,
+  saveConfig,
+  updateConfig,
+  isFirstRun,
+  markFirstRunComplete,
+  isTelemetryEnabled,
+  enableTelemetry,
+  disableTelemetry,
+  getDeviceId,
+  setApiKey,
+  getApiKey,
+  getConfigDir,
+  getConfigPath,
+} from './config.js';
+export type { ProxyConfig as ProxyLocalConfig } from './config.js';
 
-// Types
-export type {
-  Provider,
-  TaskType,
-  RoutingRule,
-  RuleSource,
-  RunRecord,
-  Outcome,
-  OutcomeQuality,
-  Suggestion,
-  RelayPlaneConfig,
-} from './types.js';
-export { Providers, TaskTypes, TaskTypeSchema, ProviderSchema } from './types.js';
+// Telemetry
+export {
+  recordTelemetry,
+  inferTaskType,
+  estimateCost,
+  setAuditMode,
+  isAuditMode,
+  setOfflineMode,
+  isOfflineMode,
+  getAuditBuffer,
+  clearAuditBuffer,
+  getLocalTelemetry,
+  getTelemetryStats,
+  clearTelemetry,
+  getTelemetryPath,
+  printTelemetryDisclosure,
+} from './telemetry.js';
+export type { TelemetryEvent } from './telemetry.js';
 
-// Routing
-export { RoutingEngine } from './routing/engine.js';
-export { inferTaskType, getInferenceConfidence } from './routing/inference.js';
+// Re-export core types
+export type { Provider, TaskType } from '@relayplane/core';
 
-// Storage
-export { Store } from './storage/store.js';
-
-// Learning
-export { PatternDetector } from './learning/patterns.js';
-export { OutcomeRecorder } from './learning/outcomes.js';
-export { calculateSavings, calculateCost, getModelPricing, MODEL_PRICING } from './learning/savings.js';
-export type { SavingsReport, ModelCostBreakdown } from './learning/savings.js';
-
-// Config
-export { loadConfig, watchConfig, getStrategy, getConfigPath, DEFAULT_CONFIG } from './config.js';
-export type { Config, StrategyConfig } from './config.js';
+// Note: Advanced features (ProxyServer, streaming, etc.) require additional
+// dependencies. Install @relayplane/ledger, @relayplane/auth-gate, etc.
+// for full functionality. See documentation for details.
