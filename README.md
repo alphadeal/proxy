@@ -55,6 +55,12 @@ CLOSED (normal) → OPEN (after 3 failures) → HALF-OPEN (probe) → CLOSED (re
 
 Worst case: you pay what you would have paid anyway.
 
+## Supported providers
+
+Anthropic · OpenAI · Google Gemini · xAI/Grok · OpenRouter · DeepSeek · Groq · Mistral · Together · Fireworks · Perplexity
+
+Any OpenAI-compatible API works out of the box. Set the API key, RelayPlane detects it automatically.
+
 ## Quick start
 
 ### Option 1: npm (recommended)
