@@ -32,6 +32,19 @@ A policy engine classifies each task and routes it to the most cost-effective mo
 
 Opt into the collective mesh. Anonymized routing outcomes from thousands of agents improve everyone's routing. The network gets smarter without you doing anything.
 
+```bash
+# Enable mesh contribution (free, opt-in)
+relayplane mesh contribute on
+
+# Check status
+relayplane mesh contribute status
+
+# Disable anytime
+relayplane mesh contribute off
+```
+
+What gets shared: task type, model used, success/fail, token count, latency, cost. **Never shared:** prompts, responses, file paths, API keys.
+
 ## Safety first
 
 RelayPlane uses a circuit breaker architecture. If the proxy fails, all traffic automatically bypasses it and goes directly to your provider. Your agent doesn't notice.
