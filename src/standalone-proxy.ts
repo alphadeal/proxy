@@ -28,6 +28,14 @@ import type { Provider, TaskType } from '@relayplane/core';
 import { buildModelNotFoundError } from './utils/model-suggestions.js';
 import { recordTelemetry as recordCloudTelemetry, inferTaskType as inferTelemetryTaskType, estimateCost } from './telemetry.js';
 import { StatsCollector } from './stats.js';
+const PROXY_VERSION: string = (() => {
+  try {
+    const pkgPath = path.join(__dirname, '..', 'package.json');
+    return JSON.parse(fs.readFileSync(pkgPath, 'utf-8')).version;
+  } catch {
+    return '0.0.0';
+  }
+})();
 
 /** Shared stats collector instance for the proxy server */
 export const proxyStatsCollector = new StatsCollector();
@@ -60,9 +68,33 @@ export const DEFAULT_ENDPOINTS: Record<string, ProviderEndpoint> = {
     baseUrl: 'https://api.x.ai/v1',
     apiKeyEnv: 'XAI_API_KEY',
   },
-  moonshot: {
-    baseUrl: 'https://api.moonshot.cn/v1',
-    apiKeyEnv: 'MOONSHOT_API_KEY',
+  openrouter: {
+    baseUrl: 'https://openrouter.ai/api/v1',
+    apiKeyEnv: 'OPENROUTER_API_KEY',
+  },
+  deepseek: {
+    baseUrl: 'https://api.deepseek.com/v1',
+    apiKeyEnv: 'DEEPSEEK_API_KEY',
+  },
+  groq: {
+    baseUrl: 'https://api.groq.com/openai/v1',
+    apiKeyEnv: 'GROQ_API_KEY',
+  },
+  mistral: {
+    baseUrl: 'https://api.mistral.ai/v1',
+    apiKeyEnv: 'MISTRAL_API_KEY',
+  },
+  together: {
+    baseUrl: 'https://api.together.xyz/v1',
+    apiKeyEnv: 'TOGETHER_API_KEY',
+  },
+  fireworks: {
+    baseUrl: 'https://api.fireworks.ai/inference/v1',
+    apiKeyEnv: 'FIREWORKS_API_KEY',
+  },
+  perplexity: {
+    baseUrl: 'https://api.perplexity.ai',
+    apiKeyEnv: 'PERPLEXITY_API_KEY',
   },
 };
 
@@ -380,6 +412,137 @@ const globalStats: RequestStats = {
   startedAt: Date.now(),
 };
 
+/** Rolling request history for telemetry endpoints (max 10000 entries) */
+interface RequestHistoryEntry {
+  id: string;
+  originalModel: string;
+  targetModel: string;
+  provider: string;
+  latencyMs: number;
+  success: boolean;
+  mode: string;
+  escalated: boolean;
+  timestamp: string;
+  tokensIn: number;
+  tokensOut: number;
+  costUsd: number;
+  taskType?: string;
+  complexity?: string;
+}
+const requestHistory: RequestHistoryEntry[] = [];
+const MAX_HISTORY = 10000;
+const HISTORY_RETENTION_DAYS = 7;
+let requestIdCounter = 0;
+
+// --- Persistent history (JSONL) ---
+const HISTORY_DIR = path.join(os.homedir(), '.relayplane');
+const HISTORY_FILE = path.join(HISTORY_DIR, 'history.jsonl');
+let historyWriteBuffer: RequestHistoryEntry[] = [];
+let historyFlushTimer: NodeJS.Timeout | null = null;
+let historyRequestsSinceLastPrune = 0;
+
+function pruneOldEntries(): void {
+  const cutoff = Date.now() - HISTORY_RETENTION_DAYS * 86400000;
+  // Remove old entries from in-memory array
+  while (requestHistory.length > 0 && new Date(requestHistory[0]!.timestamp).getTime() < cutoff) {
+    requestHistory.shift();
+  }
+  // Cap at MAX_HISTORY
+  while (requestHistory.length > MAX_HISTORY) {
+    requestHistory.shift();
+  }
+}
+
+function loadHistoryFromDisk(): void {
+  try {
+    if (!fs.existsSync(HISTORY_FILE)) return;
+    const content = fs.readFileSync(HISTORY_FILE, 'utf-8');
+    const cutoff = Date.now() - HISTORY_RETENTION_DAYS * 86400000;
+    const lines = content.split('\n');
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const entry = JSON.parse(trimmed) as RequestHistoryEntry;
+        if (new Date(entry.timestamp).getTime() >= cutoff) {
+          requestHistory.push(entry);
+        }
+      } catch {
+        // Skip corrupt lines
+      }
+    }
+    // Cap at MAX_HISTORY (keep most recent)
+    while (requestHistory.length > MAX_HISTORY) {
+      requestHistory.shift();
+    }
+    // Update requestIdCounter based on loaded entries
+    for (const entry of requestHistory) {
+      const match = entry.id.match(/^req-(\d+)$/);
+      if (match) {
+        const num = parseInt(match[1]!, 10);
+        if (num > requestIdCounter) requestIdCounter = num;
+      }
+    }
+    // Rewrite file with only valid/recent entries
+    rewriteHistoryFile();
+    console.log(`[RelayPlane] Loaded ${requestHistory.length} history entries from disk`);
+  } catch (err) {
+    console.log(`[RelayPlane] Could not load history: ${(err as Error).message}`);
+  }
+}
+
+function rewriteHistoryFile(): void {
+  try {
+    fs.mkdirSync(HISTORY_DIR, { recursive: true });
+    const data = requestHistory.map(e => JSON.stringify(e)).join('\n') + (requestHistory.length ? '\n' : '');
+    fs.writeFileSync(HISTORY_FILE, data, 'utf-8');
+  } catch (err) {
+    console.log(`[RelayPlane] Could not rewrite history file: ${(err as Error).message}`);
+  }
+}
+
+function flushHistoryBuffer(): void {
+  if (historyWriteBuffer.length === 0) return;
+  try {
+    fs.mkdirSync(HISTORY_DIR, { recursive: true });
+    const data = historyWriteBuffer.map(e => JSON.stringify(e)).join('\n') + '\n';
+    fs.appendFileSync(HISTORY_FILE, data, 'utf-8');
+  } catch (err) {
+    console.log(`[RelayPlane] Could not flush history: ${(err as Error).message}`);
+  }
+  historyWriteBuffer = [];
+}
+
+function scheduleHistoryFlush(): void {
+  if (historyFlushTimer) return;
+  historyFlushTimer = setTimeout(() => {
+    historyFlushTimer = null;
+    flushHistoryBuffer();
+  }, 10000);
+}
+
+function bufferHistoryEntry(entry: RequestHistoryEntry): void {
+  historyWriteBuffer.push(entry);
+  historyRequestsSinceLastPrune++;
+  if (historyWriteBuffer.length >= 20) {
+    if (historyFlushTimer) { clearTimeout(historyFlushTimer); historyFlushTimer = null; }
+    flushHistoryBuffer();
+  } else {
+    scheduleHistoryFlush();
+  }
+  // Prune every 100 requests
+  if (historyRequestsSinceLastPrune >= 100) {
+    historyRequestsSinceLastPrune = 0;
+    pruneOldEntries();
+    rewriteHistoryFile();
+  }
+}
+
+function shutdownHistory(): void {
+  if (historyFlushTimer) { clearTimeout(historyFlushTimer); historyFlushTimer = null; }
+  flushHistoryBuffer();
+}
+
 function logRequest(
   originalModel: string,
   targetModel: string,
@@ -387,7 +550,9 @@ function logRequest(
   latencyMs: number,
   success: boolean,
   mode: string,
-  escalated?: boolean
+  escalated?: boolean,
+  taskType?: string,
+  complexity?: string
 ): void {
   const timestamp = new Date().toISOString();
   const status = success ? '✓' : '✗';
@@ -418,6 +583,39 @@ function logRequest(
     viaProxy: true,
     success,
   });
+
+  // Record to request history for telemetry endpoints
+  const entry: RequestHistoryEntry = {
+    id: `req-${++requestIdCounter}`,
+    originalModel,
+    targetModel,
+    provider,
+    latencyMs,
+    success,
+    mode,
+    escalated: !!escalated,
+    timestamp,
+    tokensIn: 0,
+    tokensOut: 0,
+    costUsd: 0,
+    taskType: taskType || 'general',
+    complexity: complexity || 'simple',
+  };
+  requestHistory.push(entry);
+  if (requestHistory.length > MAX_HISTORY) {
+    requestHistory.shift();
+  }
+  bufferHistoryEntry(entry);
+}
+
+/** Update the most recent history entry with token/cost info */
+function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number): void {
+  if (requestHistory.length > 0) {
+    const last = requestHistory[requestHistory.length - 1]!;
+    last.tokensIn = tokensIn;
+    last.tokensOut = tokensOut;
+    last.costUsd = costUsd;
+  }
 }
 
 const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
@@ -1077,52 +1275,54 @@ async function forwardToXAIStream(
 }
 
 /**
- * Forward non-streaming request to Moonshot API (OpenAI-compatible)
+ * Forward non-streaming request to OpenAI-compatible provider (OpenRouter, DeepSeek, Groq)
  */
-async function forwardToMoonshot(
+async function forwardToOpenAICompatible(
   request: ChatRequest,
   targetModel: string,
-  apiKey: string
+  apiKey: string,
+  provider: string = 'openrouter'
 ): Promise<Response> {
-  const moonshotBody = {
+  const compatBody = {
     ...request,
     model: targetModel,
     stream: false,
   };
 
-  const response = await fetch('https://api.moonshot.cn/v1/chat/completions', {
+  const response = await fetch(`${DEFAULT_ENDPOINTS[provider]?.baseUrl || "https://openrouter.ai/api/v1"}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify(moonshotBody),
+    body: JSON.stringify(compatBody),
   });
 
   return response;
 }
 
 /**
- * Forward streaming request to Moonshot API (OpenAI-compatible)
+ * Forward streaming request to OpenAI-compatible provider (OpenRouter, DeepSeek, Groq)
  */
-async function forwardToMoonshotStream(
+async function forwardToOpenAICompatibleStream(
   request: ChatRequest,
   targetModel: string,
-  apiKey: string
+  apiKey: string,
+  provider: string = 'openrouter'
 ): Promise<Response> {
-  const moonshotBody = {
+  const compatBody = {
     ...request,
     model: targetModel,
     stream: true,
   };
 
-  const response = await fetch('https://api.moonshot.cn/v1/chat/completions', {
+  const response = await fetch(`${DEFAULT_ENDPOINTS[provider]?.baseUrl || "https://openrouter.ai/api/v1"}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       Authorization: `Bearer ${apiKey}`,
     },
-    body: JSON.stringify(moonshotBody),
+    body: JSON.stringify(compatBody),
   });
 
   return response;
@@ -1206,6 +1406,16 @@ async function forwardToGemini(
     };
   }
 
+  if (request.tools && request.tools.length > 0) {
+    geminiBody["tools"] = [{
+      functionDeclarations: request.tools.map((t: any) => ({
+        name: t.function.name,
+        description: t.function.description || "",
+        parameters: t.function.parameters || {}
+      }))
+    }];
+  }
+
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:generateContent?key=${apiKey}`,
     {
@@ -1248,6 +1458,16 @@ async function forwardToGeminiStream(
     };
   }
 
+  if (request.tools && request.tools.length > 0) {
+    geminiBody["tools"] = [{
+      functionDeclarations: request.tools.map((t: any) => ({
+        name: t.function.name,
+        description: t.function.description || "",
+        parameters: t.function.parameters || {}
+      }))
+    }];
+  }
+
   const response = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${targetModel}:streamGenerateContent?alt=sse&key=${apiKey}`,
     {
@@ -1267,7 +1487,7 @@ async function forwardToGeminiStream(
  */
 interface GeminiResponse {
   candidates?: Array<{
-    content?: { parts?: Array<{ text?: string }> };
+    content?: { parts?: Array<{ text?: string; functionCall?: { name: string; args?: Record<string, unknown> } }> };
     finishReason?: string;
   }>;
   usageMetadata?: {
@@ -1281,13 +1501,29 @@ interface GeminiResponse {
  */
 function convertGeminiResponse(geminiData: GeminiResponse, model: string): Record<string, unknown> {
   const candidate = geminiData.candidates?.[0];
-  const text = candidate?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
+  const parts = candidate?.content?.parts ?? [];
+  const text = parts.map((p) => p.text ?? '').join('');
+  const functionCalls = parts.filter((p) => p.functionCall);
   
   let finishReason = 'stop';
-  if (candidate?.finishReason === 'MAX_TOKENS') {
+  if (functionCalls.length > 0) {
+    finishReason = 'tool_calls';
+  } else if (candidate?.finishReason === 'MAX_TOKENS') {
     finishReason = 'length';
   } else if (candidate?.finishReason === 'SAFETY') {
     finishReason = 'content_filter';
+  }
+
+  const message: Record<string, unknown> = { role: 'assistant', content: text || null };
+  if (functionCalls.length > 0) {
+    message['tool_calls'] = functionCalls.map((p, i) => ({
+      id: `call_${Date.now()}_${i}`,
+      type: 'function',
+      function: {
+        name: p.functionCall!.name,
+        arguments: JSON.stringify(p.functionCall!.args || {})
+      }
+    }));
   }
 
   return {
@@ -1298,10 +1534,7 @@ function convertGeminiResponse(geminiData: GeminiResponse, model: string): Recor
     choices: [
       {
         index: 0,
-        message: {
-          role: 'assistant',
-          content: text,
-        },
+        message,
         finish_reason: finishReason,
       },
     ],
@@ -1325,7 +1558,9 @@ function convertGeminiStreamEvent(
   isFirst: boolean
 ): string | null {
   const candidate = eventData.candidates?.[0];
-  const text = candidate?.content?.parts?.map((p) => p.text ?? '').join('') ?? '';
+  const parts = candidate?.content?.parts ?? [];
+  const text = parts.map((p) => p.text ?? '').join('');
+  const functionCalls = parts.filter((p) => p.functionCall);
   
   const choice: Record<string, unknown> = {
     index: 0,
@@ -1333,14 +1568,29 @@ function convertGeminiStreamEvent(
     finish_reason: null,
   };
   
+  const delta: Record<string, unknown> = {};
   if (isFirst) {
-    choice['delta'] = { role: 'assistant', content: text };
-  } else if (text) {
-    choice['delta'] = { content: text };
+    delta['role'] = 'assistant';
   }
+  if (text) {
+    delta['content'] = text;
+  }
+  if (functionCalls.length > 0) {
+    delta['tool_calls'] = functionCalls.map((p, i) => ({
+      index: i,
+      id: `call_${messageId}_${i}`,
+      type: 'function',
+      function: {
+        name: p.functionCall!.name,
+        arguments: JSON.stringify(p.functionCall!.args || {})
+      }
+    }));
+    choice['finish_reason'] = 'tool_calls';
+  }
+  choice['delta'] = delta;
   
   // Check for finish
-  if (candidate?.finishReason) {
+  if (candidate?.finishReason && choice['finish_reason'] === null) {
     let finishReason = 'stop';
     if (candidate.finishReason === 'MAX_TOKENS') {
       finishReason = 'length';
@@ -1718,7 +1968,7 @@ function parsePreferredModel(
   if (!provider || !model) return null;
 
   // Validate provider
-  const validProviders: Provider[] = ['openai', 'anthropic', 'google', 'xai', 'moonshot', 'local'];
+  const validProviders: Provider[] = ['openai', 'anthropic', 'google', 'xai', 'openrouter', 'deepseek', 'groq', 'local'];
   if (!validProviders.includes(provider as Provider)) return null;
 
   return { provider: provider as Provider, model };
@@ -1778,15 +2028,15 @@ function resolveExplicitModel(
     return { provider: 'xai', model: modelName };
   }
 
-  // Moonshot models (moonshot-*)
-  if (modelName.startsWith('moonshot-')) {
-    return { provider: 'moonshot', model: modelName };
+  // OpenRouter/DeepSeek/Groq models
+  if (modelName.startsWith('openrouter/') || modelName.startsWith('deepseek-') || modelName.startsWith('groq-')) {
+    return { provider: 'openrouter', model: modelName };
   }
 
   // Provider-prefixed format: "anthropic/claude-3-5-sonnet-latest"
   if (modelName.includes('/')) {
     const [provider, model] = modelName.split('/');
-    const validProviders: Provider[] = ['openai', 'anthropic', 'google', 'xai', 'moonshot', 'local'];
+    const validProviders: Provider[] = ['openai', 'anthropic', 'google', 'xai', 'openrouter', 'deepseek', 'groq', 'local'];
     if (provider && model && validProviders.includes(provider as Provider)) {
       return { provider: provider as Provider, model };
     }
@@ -2011,6 +2261,79 @@ async function cascadeRequest(
   throw new Error('All cascade models exhausted');
 }
 
+function getDashboardHTML(): string {
+  return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RelayPlane Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0b0d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:1200px;margin:0 auto}
+a{color:#34d399}h1{font-size:1.5rem;font-weight:600}
+.header{display:flex;justify-content:space-between;align-items:center;padding:16px 0;border-bottom:1px solid #1e293b;margin-bottom:24px}
+.header .meta{font-size:.8rem;color:#64748b}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin-bottom:32px}
+.card{background:#111318;border:1px solid #1e293b;border-radius:12px;padding:20px}
+.card .label{font-size:.75rem;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.card .value{font-size:1.75rem;font-weight:700}.green{color:#34d399}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th{text-align:left;color:#64748b;font-weight:500;padding:8px 12px;border-bottom:1px solid #1e293b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
+td{padding:8px 12px;border-bottom:1px solid #111318}
+.section{margin-bottom:32px}.section h2{font-size:1rem;font-weight:600;margin-bottom:12px;color:#94a3b8}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.dot.up{background:#34d399}.dot.down{background:#ef4444}
+.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.75rem;font-weight:500}
+.badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}
+.badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
+.badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
+@media(max-width:768px){.col-tt,.col-cx{display:none}}
+.prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
+</style></head><body>
+<div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><span id="ver"></span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
+<div class="cards">
+  <div class="card"><div class="label">Total Requests</div><div class="value" id="totalReq">—</div></div>
+  <div class="card"><div class="label">Total Cost</div><div class="value" id="totalCost">—</div></div>
+  <div class="card"><div class="label">Savings</div><div class="value green" id="savings">—</div></div>
+  <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div></div>
+</div>
+<div class="section"><h2>Model Breakdown</h2>
+<table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
+<div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
+<div class="section"><h2>Recent Runs</h2>
+<table><thead><tr><th>Time</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
+<script>
+const $ = id => document.getElementById(id);
+function fmt(n,d=2){return typeof n==='number'?n.toFixed(d):'-'}
+function fmtTime(s){const d=new Date(s);return d.toLocaleTimeString()}
+function dur(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'h '+m+'m':m+'m'}
+async function load(){
+  try{
+    const [health,stats,runsR,sav,provH]=await Promise.all([
+      fetch('/health').then(r=>r.json()),
+      fetch('/v1/telemetry/stats').then(r=>r.json()),
+      fetch('/v1/telemetry/runs?limit=20').then(r=>r.json()),
+      fetch('/v1/telemetry/savings').then(r=>r.json()),
+      fetch('/v1/telemetry/health').then(r=>r.json())
+    ]);
+    $('ver').textContent='v'+health.version;
+    $('uptime').textContent=dur(health.uptime);
+    $('totalReq').textContent=health.requests??0;
+    $('totalCost').textContent='$'+fmt(stats.summary?.totalCostUsd??0,4);
+    $('savings').textContent=(sav.percentage??0)+'%';
+    $('avgLat').textContent=(stats.summary?.avgLatencyMs??0)+'ms';
+    const total=stats.summary?.totalEvents||1;
+    $('models').innerHTML=(stats.byModel||[]).map(m=>
+      '<tr><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(m.count/total*100,1)+'%</td></tr>'
+    ).join('')||'<tr><td colspan=4 style="color:#64748b">No data yet</td></tr>';
+    function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
+    function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
+    $('runs').innerHTML=(runsR.runs||[]).map(r=>
+      '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>'
+    ).join('')||'<tr><td colspan=9 style="color:#64748b">No runs yet</td></tr>';
+    $('providers').innerHTML=(provH.providers||[]).map(p=>
+      '<div class="prov-item"><span class="dot '+(p.status==='healthy'?'up':'down')+'"></span>'+p.provider+'</div>'
+    ).join('');
+  }catch(e){console.error(e)}
+}
+load();setInterval(load,5000);
+</script></body></html>`;
+}
+
 /**
  * Start the RelayPlane proxy server
  */
@@ -2023,6 +2346,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
   const log = (msg: string) => {
     if (verbose) console.log(`[relayplane] ${msg}`);
   };
+
+  // Load persistent history from disk
+  loadHistoryFromDisk();
+
+  // Flush history on shutdown
+  const handleShutdown = () => {
+    shutdownHistory();
+    process.exit(0);
+  };
+  process.on('SIGINT', handleShutdown);
+  process.on('SIGTERM', handleShutdown);
 
   const configPath = getProxyConfigPath();
   let proxyConfig = await loadProxyConfig(configPath, log);
@@ -2090,7 +2424,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'ok',
-        version: '1.1.3',
+        version: PROXY_VERSION,
         uptime: Math.floor(uptimeMs / 1000),
         uptimeMs,
         requests: globalStats.totalRequests,
@@ -2181,6 +2515,132 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         }
         return;
       }
+    }
+
+    // === Telemetry endpoints for dashboard ===
+    if (pathname.startsWith('/v1/telemetry/')) {
+      const telemetryPath = pathname.replace('/v1/telemetry/', '');
+      const queryString = url.includes('?') ? url.split('?')[1] ?? '' : '';
+      const params = new URLSearchParams(queryString);
+
+      if (req.method === 'GET' && telemetryPath === 'stats') {
+        const days = parseInt(params.get('days') || '7', 10);
+        const cutoff = Date.now() - days * 86400000;
+        const recent = requestHistory.filter(r => new Date(r.timestamp).getTime() >= cutoff);
+        
+        // Model breakdown
+        const modelMap = new Map<string, { count: number; cost: number }>();
+        for (const r of recent) {
+          const key = r.targetModel;
+          const cur = modelMap.get(key) || { count: 0, cost: 0 };
+          cur.count++;
+          cur.cost += r.costUsd;
+          modelMap.set(key, cur);
+        }
+        
+        // Daily stats
+        const dailyMap = new Map<string, { requests: number; cost: number }>();
+        for (const r of recent) {
+          const date = r.timestamp.slice(0, 10);
+          const cur = dailyMap.get(date) || { requests: 0, cost: 0 };
+          cur.requests++;
+          cur.cost += r.costUsd;
+          dailyMap.set(date, cur);
+        }
+
+        const totalCost = recent.reduce((s, r) => s + r.costUsd, 0);
+        const totalLatency = recent.reduce((s, r) => s + r.latencyMs, 0);
+        
+        const result = {
+          summary: {
+            totalCostUsd: totalCost,
+            totalEvents: recent.length,
+            avgLatencyMs: recent.length ? Math.round(totalLatency / recent.length) : 0,
+            successRate: recent.length ? recent.filter(r => r.success).length / recent.length : 0,
+          },
+          byModel: Array.from(modelMap.entries()).map(([model, v]) => ({ model, count: v.count, costUsd: v.cost, savings: 0 })),
+          dailyCosts: Array.from(dailyMap.entries()).map(([date, v]) => ({ date, costUsd: v.cost, requests: v.requests })),
+        };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        return;
+      }
+
+      if (req.method === 'GET' && telemetryPath === 'runs') {
+        const limit = parseInt(params.get('limit') || '50', 10);
+        const offset = parseInt(params.get('offset') || '0', 10);
+        const sorted = [...requestHistory].reverse();
+        const runs = sorted.slice(offset, offset + limit).map(r => ({
+          id: r.id,
+          workflow_name: r.mode,
+          status: r.success ? 'success' : 'error',
+          started_at: r.timestamp,
+          model: r.targetModel,
+          routed_to: `${r.provider}/${r.targetModel}`,
+          taskType: r.taskType || 'general',
+          complexity: r.complexity || 'simple',
+          costUsd: r.costUsd,
+          latencyMs: r.latencyMs,
+          tokensIn: r.tokensIn,
+          tokensOut: r.tokensOut,
+          savings: 0,
+          original_model: r.originalModel,
+        }));
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ runs, pagination: { total: requestHistory.length } }));
+        return;
+      }
+
+      if (req.method === 'GET' && telemetryPath === 'savings') {
+        // Calculate savings: difference between cost if all requests used opus vs actual cost
+        const opusCostPer1kIn = 0.015;
+        const opusCostPer1kOut = 0.075;
+        let potentialCost = 0;
+        let actualCost = 0;
+        for (const r of requestHistory) {
+          potentialCost += (r.tokensIn / 1000) * opusCostPer1kIn + (r.tokensOut / 1000) * opusCostPer1kOut;
+          actualCost += r.costUsd;
+        }
+        const saved = potentialCost - actualCost;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          total: potentialCost,
+          savings: Math.max(0, saved),
+          savedAmount: Math.max(0, saved),
+          potentialSavings: potentialCost,
+          percentage: potentialCost > 0 ? Math.round((saved / potentialCost) * 100) : 0,
+          byDay: [],
+        }));
+        return;
+      }
+
+      if (req.method === 'GET' && telemetryPath === 'health') {
+        const providers: Array<{ provider: string; status: string; latency: number; successRate: number; lastChecked: string }> = [];
+        for (const [name, ep] of Object.entries(DEFAULT_ENDPOINTS)) {
+          const hasKey = !!process.env[ep.apiKeyEnv];
+          providers.push({
+            provider: name,
+            status: hasKey ? 'healthy' : 'down',
+            latency: 0,
+            successRate: hasKey ? 1 : 0,
+            lastChecked: new Date().toISOString(),
+          });
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ providers }));
+        return;
+      }
+
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not found' }));
+      return;
+    }
+
+    // === Dashboard ===
+    if (req.method === 'GET' && (pathname === '/' || pathname === '/dashboard')) {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(getDashboardHTML());
+      return;
     }
 
     // Extract auth context from incoming request
@@ -2465,6 +2925,17 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             if (proxyConfig.reliability?.cooldowns?.enabled) {
               cooldownManager.recordFailure(targetProvider, JSON.stringify(errorPayload));
             }
+            const durationMs = Date.now() - startTime;
+            logRequest(
+              originalModel ?? 'unknown',
+              targetModel || requestedModel,
+              targetProvider,
+              durationMs,
+              false,
+              routingMode,
+              undefined,
+              taskType, complexity
+            );
             res.writeHead(providerResponse.status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(errorPayload));
             return;
@@ -2540,7 +3011,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           durationMs,
           true,
           routingMode,
-          useCascade && cascadeConfig ? undefined : false
+          useCascade && cascadeConfig ? undefined : false,
+          taskType, complexity
         );
 
         if (recordTelemetry) {
@@ -2564,7 +3036,9 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           targetProvider,
           durationMs,
           false,
-          routingMode
+          routingMode,
+          undefined,
+          taskType, complexity
         );
         if (err instanceof ProviderResponseError) {
           res.writeHead(err.status, { 'Content-Type': 'application/json' });
@@ -2880,7 +3354,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         startTime,
         log,
         cooldownManager,
-        cooldownsEnabled
+        cooldownsEnabled,
+        complexity
       );
     } else {
       if (useCascade && cascadeConfig) {
@@ -2923,6 +3398,23 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           const durationMs = Date.now() - startTime;
           let responseData = cascadeResult.responseData;
 
+          // Log cascade request for stats tracking
+          logRequest(
+            originalRequestedModel ?? 'unknown',
+            cascadeResult.model,
+            cascadeResult.provider,
+            durationMs,
+            true,
+            'cascade',
+            cascadeResult.escalations > 0,
+            taskType, complexity
+          );
+          const cascadeUsage = (responseData as any)?.usage;
+          const cascadeTokensIn = cascadeUsage?.input_tokens ?? cascadeUsage?.prompt_tokens ?? 0;
+          const cascadeTokensOut = cascadeUsage?.output_tokens ?? cascadeUsage?.completion_tokens ?? 0;
+          const cascadeCost = estimateCost(cascadeResult.model, cascadeTokensIn, cascadeTokensOut);
+          updateLastHistoryEntry(cascadeTokensIn, cascadeTokensOut, cascadeCost);
+
           if (recordTelemetry) {
             try {
               const runResult = await relay.run({
@@ -2943,15 +3435,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             } catch (err) {
               log(`Failed to record run: ${err}`);
             }
-            const usage = (responseData as any)?.usage;
-            const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
-            const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
-            sendCloudTelemetry(taskType, cascadeResult.model, tokensIn, tokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined);
+            sendCloudTelemetry(taskType, cascadeResult.model, cascadeTokensIn, cascadeTokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined);
           }
 
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(responseData));
         } catch (err) {
+          const durationMs = Date.now() - startTime;
+          logRequest(originalRequestedModel ?? 'unknown', targetModel || 'unknown', targetProvider, durationMs, false, 'cascade', undefined, taskType, complexity);
           if (err instanceof ProviderResponseError) {
             res.writeHead(err.status, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify(err.payload));
@@ -2978,7 +3469,8 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           startTime,
           log,
           cooldownManager,
-          cooldownsEnabled
+          cooldownsEnabled,
+          complexity
         );
       }
     }
@@ -3041,8 +3533,8 @@ async function executeNonStreamingProviderRequest(
       }
       break;
     }
-    case 'moonshot': {
-      providerResponse = await forwardToMoonshot(request, targetModel, apiKey!);
+    case 'openrouter': case 'deepseek': case 'groq': {
+      providerResponse = await forwardToOpenAICompatible(request, targetModel, apiKey!);
       responseData = (await providerResponse.json()) as Record<string, unknown>;
       if (!providerResponse.ok) {
         return { responseData, ok: false, status: providerResponse.status };
@@ -3077,7 +3569,8 @@ async function handleStreamingRequest(
   startTime: number,
   log: (msg: string) => void,
   cooldownManager: CooldownManager,
-  cooldownsEnabled: boolean
+  cooldownsEnabled: boolean,
+  complexity: Complexity = 'simple'
 ): Promise<void> {
   let providerResponse: Response;
 
@@ -3093,8 +3586,8 @@ async function handleStreamingRequest(
       case 'xai':
         providerResponse = await forwardToXAIStream(request, targetModel, apiKey!);
         break;
-      case 'moonshot':
-        providerResponse = await forwardToMoonshotStream(request, targetModel, apiKey!);
+      case 'openrouter': case 'deepseek': case 'groq':
+        providerResponse = await forwardToOpenAICompatibleStream(request, targetModel, apiKey!);
         break;
       default:
         providerResponse = await forwardToOpenAIStream(request, targetModel, apiKey!);
@@ -3105,6 +3598,8 @@ async function handleStreamingRequest(
       if (cooldownsEnabled) {
         cooldownManager.recordFailure(targetProvider, JSON.stringify(errorData));
       }
+      const durationMs = Date.now() - startTime;
+      logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity);
       res.writeHead(providerResponse.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(errorData));
       return;
@@ -3114,6 +3609,8 @@ async function handleStreamingRequest(
     if (cooldownsEnabled) {
       cooldownManager.recordFailure(targetProvider, errorMsg);
     }
+    const durationMs = Date.now() - startTime;
+    logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity);
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
     return;
@@ -3171,7 +3668,7 @@ async function handleStreamingRequest(
         }
         break;
       default:
-        // xAI, Moonshot, OpenAI all use OpenAI-compatible streaming format
+        // xAI, OpenRouter, DeepSeek, Groq, OpenAI all use OpenAI-compatible streaming format
         for await (const chunk of pipeOpenAIStream(providerResponse)) {
           res.write(chunk);
           try {
@@ -3197,6 +3694,21 @@ async function handleStreamingRequest(
   }
 
   const durationMs = Date.now() - startTime;
+
+  // Always log the request for stats/telemetry tracking
+  logRequest(
+    request.model ?? 'unknown',
+    targetModel,
+    targetProvider,
+    durationMs,
+    true,
+    routingMode,
+    undefined,
+    taskType, complexity
+  );
+  // Update token/cost info on the history entry
+  const streamCost = estimateCost(targetModel, streamTokensIn, streamTokensOut);
+  updateLastHistoryEntry(streamTokensIn, streamTokensOut, streamCost);
 
   if (recordTelemetry) {
     // Record the run (non-blocking)
@@ -3237,7 +3749,8 @@ async function handleNonStreamingRequest(
   startTime: number,
   log: (msg: string) => void,
   cooldownManager: CooldownManager,
-  cooldownsEnabled: boolean
+  cooldownsEnabled: boolean,
+  complexity: Complexity = 'simple'
 ): Promise<void> {
   let responseData: Record<string, unknown>;
 
@@ -3254,6 +3767,8 @@ async function handleNonStreamingRequest(
       if (cooldownsEnabled) {
         cooldownManager.recordFailure(targetProvider, JSON.stringify(responseData));
       }
+      const durationMs = Date.now() - startTime;
+      logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity);
       res.writeHead(result.status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(responseData));
       return;
@@ -3263,6 +3778,8 @@ async function handleNonStreamingRequest(
     if (cooldownsEnabled) {
       cooldownManager.recordFailure(targetProvider, errorMsg);
     }
+    const durationMs = Date.now() - startTime;
+    logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, false, routingMode, undefined, taskType, complexity);
     res.writeHead(500, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
     return;
@@ -3273,6 +3790,15 @@ async function handleNonStreamingRequest(
   }
 
   const durationMs = Date.now() - startTime;
+
+  // Log the successful request
+  logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, undefined, taskType, complexity);
+  // Update token/cost info
+  const usage = (responseData as any)?.usage;
+  const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
+  const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
+  const cost = estimateCost(targetModel, tokensIn, tokensOut);
+  updateLastHistoryEntry(tokensIn, tokensOut, cost);
 
   if (recordTelemetry) {
     // Record the run in RelayPlane

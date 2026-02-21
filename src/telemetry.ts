@@ -423,8 +423,17 @@ export async function flushTelemetryToCloud(): Promise<void> {
 
 /**
  * Get configured API key
+ * Checks: 1) credentials.json (from `relayplane login`), 2) config.json, 3) env var
  */
 function getApiKey(): string | null {
+  try {
+    // Check credentials file first (from `relayplane login`)
+    const credPath = path.join(getConfigDir(), 'credentials.json');
+    if (fs.existsSync(credPath)) {
+      const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8'));
+      if (creds.apiKey) return creds.apiKey;
+    }
+  } catch {}
   try {
     const configPath = path.join(getConfigDir(), 'config.json');
     if (fs.existsSync(configPath)) {

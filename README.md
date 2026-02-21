@@ -1,151 +1,287 @@
-# RelayPlane
+# @relayplane/proxy
 
-**Stop paying for your agent's mistakes.**
+[![npm](https://img.shields.io/npm/v/@relayplane/proxy)](https://www.npmjs.com/package/@relayplane/proxy)
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/RelayPlane/proxy/blob/main/LICENSE)
 
-RelayPlane is an open source proxy that sits between your AI agents and LLM providers. It tracks every dollar, routes to the cheapest effective model, and learns from every agent on the network.
+An open-source LLM proxy that sits between your AI agents and providers. Tracks every request, shows where the money goes, and routes tasks to the right model — all running locally.
 
-77% cost reduction. One install. Zero risk.
-
-```bash
-npm install -g @relayplane/proxy && relayplane init
-```
-
-## Why now
-
-On February 18, 2026, Anthropic banned subscription OAuth tokens in OpenClaw and similar tools. Users who were paying $200/month now face $600–2,000+ in API costs for the same usage.
-
-But the cost crisis started before the ban. The real problem: **your agent uses the most expensive model for everything.** Code formatting? Opus. Reading a file? Opus. Simple questions? Opus.
-
-73% of typical agent spend is on the wrong model for the task.
-
-## Three pillars
-
-### 1. Observe — See where every dollar goes
-
-Every LLM request flows through RelayPlane. Cost per request, model used, task type, tokens consumed — all tracked automatically.
-
-### 2. Govern — Route to the cheapest model that works
-
-A policy engine classifies each task and routes it to the most cost-effective model. Simple file reads → Haiku ($0.25/MTok). Complex architecture → Opus ($15/MTok). You set the rules or use defaults.
-
-### 3. Learn — Every agent makes yours smarter *(coming soon)*
-
-Opt into the collective mesh. As more agents join, anonymized routing outcomes improve everyone's routing. The network gets smarter without you doing anything. This feature is in development — the infrastructure is built, and early contributors will benefit first when it goes live.
-
-```bash
-# Enable mesh contribution (free, opt-in)
-relayplane mesh contribute on
-
-# Check status
-relayplane mesh contribute status
-
-# Disable anytime
-relayplane mesh contribute off
-```
-
-What gets shared: task type, model used, success/fail, token count, latency, cost. **Never shared:** prompts, responses, file paths, API keys.
-
-## Safety first
-
-RelayPlane uses a circuit breaker architecture. If the proxy fails, all traffic automatically bypasses it and goes directly to your provider. Your agent doesn't notice.
-
-```
-CLOSED (normal) → OPEN (after 3 failures) → HALF-OPEN (probe) → CLOSED (recovered)
-```
-
-Worst case: you pay what you would have paid anyway.
-
-## Supported providers
-
-Anthropic · OpenAI · Google Gemini · xAI/Grok · OpenRouter · DeepSeek · Groq · Mistral · Together · Fireworks · Perplexity
-
-Any OpenAI-compatible API works out of the box. Set the API key, RelayPlane detects it automatically.
-
-## Quick start
-
-### Option 1: npm (recommended)
+## Quick Start
 
 ```bash
 npm install -g @relayplane/proxy
 relayplane init
 relayplane start
+# Dashboard at http://localhost:4100
 ```
 
-Dashboard at `http://localhost:4100`. See your costs within the first hour.
+Works with any agent framework that talks to OpenAI or Anthropic APIs. Point your client at `http://localhost:4100` and the proxy handles the rest.
 
-### Option 2: OpenClaw config
+## Supported Providers
+
+**Anthropic** · **OpenAI** · **Google Gemini** · **xAI/Grok** · **OpenRouter** · **DeepSeek** · **Groq** · **Mistral** · **Together** · **Fireworks** · **Perplexity**
+
+## Configuration
+
+RelayPlane reads configuration from `~/.relayplane/config.json`. Override the path with the `RELAYPLANE_CONFIG_PATH` environment variable.
+
+```bash
+# Default location
+~/.relayplane/config.json
+
+# Override with env var
+RELAYPLANE_CONFIG_PATH=/path/to/config.json relayplane start
+```
+
+A minimal config file:
 
 ```json
 {
-  "relayplane": {
-    "enabled": true
+  "enabled": true,
+  "modelOverrides": {},
+  "routing": {
+    "mode": "cascade",
+    "cascade": { "enabled": true },
+    "complexity": { "enabled": true }
   }
 }
 ```
 
-### Option 3: ClawHub skill
+All configuration is optional — sensible defaults are applied for every field. The proxy merges your config with its defaults via deep merge, so you only need to specify what you want to change.
+
+## Complexity-Based Routing
+
+The proxy classifies incoming requests by complexity (simple, moderate, complex) based on prompt length, token patterns, and the presence of tools. Each tier maps to a different model.
+
+```json
+{
+  "routing": {
+    "complexity": {
+      "enabled": true,
+      "simple": "claude-3-5-haiku-latest",
+      "moderate": "claude-sonnet-4-20250514",
+      "complex": "claude-opus-4-20250514"
+    }
+  }
+}
+```
+
+**How classification works:**
+
+- **Simple** — Short prompts, straightforward Q&A, basic code tasks
+- **Moderate** — Multi-step reasoning, code review, analysis with context
+- **Complex** — Architecture decisions, large codebases, tasks with many tools, long prompts with evaluation/comparison language
+
+The classifier scores requests based on message count, total token length, tool usage, and content patterns (e.g., words like "analyze", "compare", "evaluate" increase the score). This happens locally — no prompt content is sent anywhere.
+
+## Model Overrides
+
+Map any model name to a different one. Useful for silently redirecting expensive models to cheaper alternatives without changing your agent configuration:
+
+```json
+{
+  "modelOverrides": {
+    "claude-opus-4-5": "claude-3-5-haiku",
+    "gpt-4o": "gpt-4o-mini"
+  }
+}
+```
+
+Overrides are applied before any other routing logic. The original requested model is logged for tracking.
+
+## Cascade Mode
+
+Start with the cheapest model and escalate only when the response shows uncertainty or refusal. This gives you the cost savings of a cheap model with a safety net.
+
+```json
+{
+  "routing": {
+    "mode": "cascade",
+    "cascade": {
+      "enabled": true,
+      "models": [
+        "claude-3-5-haiku-latest",
+        "claude-sonnet-4-20250514",
+        "claude-opus-4-20250514"
+      ],
+      "escalateOn": "uncertainty",
+      "maxEscalations": 2
+    }
+  }
+}
+```
+
+**`escalateOn` options:**
+
+| Value | Triggers escalation when... |
+|-------|----------------------------|
+| `uncertainty` | Response contains hedging language ("I'm not sure", "it's hard to say", "this is just a guess") |
+| `refusal` | Model refuses to help ("I can't assist with that", "as an AI") |
+| `error` | The request fails outright |
+
+**`maxEscalations`** caps how many times the proxy will retry with a more expensive model. Default: `1`.
+
+The cascade walks through the `models` array in order, starting from the first. Each escalation moves to the next model in the list.
+
+## Smart Aliases
+
+Use semantic model names instead of provider-specific IDs:
+
+| Alias | Resolves to |
+|-------|------------|
+| `rp:best` | `anthropic/claude-sonnet-4-20250514` |
+| `rp:fast` | `anthropic/claude-3-5-haiku-20241022` |
+| `rp:cheap` | `openai/gpt-4o-mini` |
+| `rp:balanced` | `anthropic/claude-3-5-haiku-20241022` |
+| `relayplane:auto` | Same as `rp:balanced` |
+| `rp:auto` | Same as `rp:balanced` |
+
+Use these as the `model` field in your API requests:
+
+```json
+{
+  "model": "rp:fast",
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
+
+## Routing Suffixes
+
+Append `:cost`, `:fast`, or `:quality` to any model name to hint at routing preference:
+
+```json
+{
+  "model": "claude-sonnet-4:cost",
+  "messages": [{"role": "user", "content": "Summarize this"}]
+}
+```
+
+| Suffix | Behavior |
+|--------|----------|
+| `:cost` | Optimize for lowest cost |
+| `:fast` | Optimize for lowest latency |
+| `:quality` | Optimize for best output quality |
+
+The suffix is stripped before provider lookup — the base model must still be valid. Suffixes influence routing decisions when the proxy has multiple options.
+
+## Provider Cooldowns / Reliability
+
+When a provider starts failing, the proxy automatically cools it down to avoid hammering a broken endpoint:
+
+```json
+{
+  "reliability": {
+    "cooldowns": {
+      "enabled": true,
+      "allowedFails": 3,
+      "windowSeconds": 60,
+      "cooldownSeconds": 120
+    }
+  }
+}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `true` | Enable/disable cooldown tracking |
+| `allowedFails` | `3` | Failures within the window before cooldown triggers |
+| `windowSeconds` | `60` | Rolling window for counting failures |
+| `cooldownSeconds` | `120` | How long to avoid the provider after cooldown triggers |
+
+After cooldown expires, the provider is automatically retried. Successful requests clear the failure counter.
+
+## Hybrid Auth
+
+Use your Anthropic MAX subscription token for expensive models (Opus) while using standard API keys for cheaper models (Haiku, Sonnet). This lets you leverage MAX plan pricing where it matters most.
+
+```json
+{
+  "auth": {
+    "anthropicMaxToken": "sk-ant-oat-...",
+    "useMaxForModels": ["opus", "claude-opus"]
+  }
+}
+```
+
+**How it works:**
+
+- When a request targets a model matching any pattern in `useMaxForModels`, the proxy uses `anthropicMaxToken` with `Authorization: Bearer` header (OAuth-style)
+- All other Anthropic requests use the standard `ANTHROPIC_API_KEY` env var with `x-api-key` header
+- Pattern matching is case-insensitive substring match — `"opus"` matches `claude-opus-4-20250514`
+
+Set your standard key in the environment as usual:
 
 ```bash
-clawhub install relayplane
+export ANTHROPIC_API_KEY="sk-ant-api03-..."
 ```
 
-## How routing works
+## Telemetry
 
-| Task type | Before | After | Savings |
-|-----------|--------|-------|---------|
-| File reads, edits | Opus ($15/MTok) | Haiku ($0.25/MTok) | 98% |
-| Code generation | Opus ($15/MTok) | Sonnet ($3/MTok) | 80% |
-| Complex architecture | Opus ($15/MTok) | Opus ($15/MTok) | 0% |
-| Retried failures | Wasted spend | Eliminated | 100% |
+The proxy collects anonymized telemetry to improve routing decisions. Here's exactly what's collected:
 
-## Programmatic API
+- **device_id** — Random anonymous ID (no PII)
+- **task_type** — Inferred from token patterns, NOT from prompt content
+- **model** — Which model was used
+- **tokens_in/out** — Token counts
+- **latency_ms** — Response time
+- **cost_usd** — Estimated cost
 
-```typescript
-import {
-  RelayPlaneMiddleware,
-  CircuitBreaker,
-  HealthMonitor,
-  loadRelayConfig,
-} from '@relayplane/proxy';
+**Never collected:** prompts, responses, file paths, or anything that could identify you or your project.
 
-const config = loadRelayConfig();
-const breaker = new CircuitBreaker({ failureThreshold: 3, resetTimeoutMs: 30000 });
-const middleware = new RelayPlaneMiddleware({ config, circuitBreaker: breaker });
-```
-
-## CLI
+### Disabling telemetry
 
 ```bash
-relayplane start                    # Start proxy (port 4100)
-relayplane stats                    # View usage and savings
-relayplane config                   # Show configuration
-relayplane doctor                   # Diagnose issues
-relayplane telemetry off            # Disable telemetry
+# Via environment variable
+RELAYPLANE_TELEMETRY=0 relayplane start
+
+# Or in config — telemetry can be disabled programmatically via the config module
 ```
 
-## Privacy
+### Audit mode
 
-Your prompts never leave your machine. Only anonymized metadata is shared (if you opt in):
+Audit mode buffers telemetry events in memory so you can inspect exactly what would be sent before it goes anywhere. Useful for compliance review.
 
-- Task type, token count, model used, success/fail
-- **Never:** prompts, responses, code, file paths, anything identifying
+### Offline mode
 
-Free tier: nothing leaves your machine. Everything runs locally.
+```bash
+relayplane start --offline
+```
 
-## Pricing
+Disables all network calls except the actual LLM requests. No telemetry transmission, no cloud features. The proxy still tracks everything locally for your dashboard.
 
-| Tier | Price | What you get |
-|------|-------|-------------|
-| **Free** | $0 forever | Full proxy, dashboard, smart routing, policy engine |
-| **Contributor** | $0 forever | Share anonymized data, get mesh-enhanced routing (coming soon) |
-| **Pro** | $25/mo | Analytics, alerts, team features, private mesh |
+## Dashboard
 
-## Links
+The built-in dashboard runs at [http://localhost:4100](http://localhost:4100) (or `/dashboard`). It shows:
 
-- **Website:** [relayplane.com](https://relayplane.com)
-- **Docs:** [relayplane.com/docs](https://relayplane.com/docs)
-- **ClawHub:** [clawhub.com/skills/relayplane](https://clawhub.com/skills/relayplane)
+- Total requests, success rate, average latency
+- Cost breakdown by model and provider
+- Recent request history with routing decisions
+- Savings from routing optimizations
+- Provider health status
+
+### API Endpoints
+
+The dashboard is powered by JSON endpoints you can use directly:
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /v1/telemetry/stats` | Aggregate statistics (total requests, costs, model counts) |
+| `GET /v1/telemetry/runs?limit=N` | Recent request history |
+| `GET /v1/telemetry/savings` | Cost savings from smart routing |
+| `GET /v1/telemetry/health` | Provider health and cooldown status |
+
+## Circuit Breaker
+
+If the proxy ever fails, all traffic automatically bypasses it — your agent talks directly to the provider. When RelayPlane recovers, traffic resumes. No manual intervention needed.
+
+## Your Keys Stay Yours
+
+RelayPlane requires your own provider API keys. We never see your prompts, keys, or data. All execution is local.
 
 ## License
 
-MIT — free forever, self-host, fork, do whatever you want.
+[MIT](https://github.com/RelayPlane/proxy/blob/main/LICENSE)
+
+---
+
+[relayplane.com](https://relayplane.com) · [GitHub](https://github.com/RelayPlane/proxy)
+

@@ -3,6 +3,30 @@
  * @packageDocumentation
  */
 
+export interface MeshConfig {
+  /** Enable local knowledge capture (default: true) */
+  enabled: boolean;
+  /** Opt-in to share knowledge with mesh (default: false) */
+  contribute: boolean;
+  /** Mesh server URL */
+  meshUrl: string;
+  /** Sync interval in ms (default: 300000 = 5 min) */
+  syncIntervalMs: number;
+  /** Context injection interval in ms (default: 900000 = 15 min) */
+  injectIntervalMs: number;
+  /** Data directory for mesh SQLite DB */
+  dataDir: string;
+}
+
+export const DEFAULT_MESH_CONFIG: MeshConfig = {
+  enabled: true,
+  contribute: false,
+  meshUrl: 'https://osmosis-mesh-dev.fly.dev',
+  syncIntervalMs: 300_000,
+  injectIntervalMs: 900_000,
+  dataDir: `${process.env.HOME ?? '/root'}/.relayplane/mesh`,
+};
+
 export interface RelayPlaneConfig {
   enabled: boolean;
   /** Proxy URL (default: http://127.0.0.1:4100) */
@@ -14,6 +38,8 @@ export interface RelayPlaneConfig {
   };
   /** Auto-start proxy process (Phase 2, default: true) */
   autoStart?: boolean;
+  /** Mesh learning layer config */
+  mesh?: Partial<MeshConfig>;
 }
 
 export const DEFAULT_RELAY_CONFIG: Required<RelayPlaneConfig> = {
@@ -25,6 +51,7 @@ export const DEFAULT_RELAY_CONFIG: Required<RelayPlaneConfig> = {
     requestTimeoutMs: 3_000,
   },
   autoStart: true,
+  mesh: { ...DEFAULT_MESH_CONFIG },
 };
 
 export function resolveConfig(partial?: Partial<RelayPlaneConfig>): Required<RelayPlaneConfig> {
@@ -37,5 +64,10 @@ export function resolveConfig(partial?: Partial<RelayPlaneConfig>): Required<Rel
       ...partial.circuitBreaker,
     },
     autoStart: partial.autoStart ?? DEFAULT_RELAY_CONFIG.autoStart,
+    mesh: { ...DEFAULT_MESH_CONFIG, ...partial.mesh },
   };
+}
+
+export function resolveMeshConfig(partial?: Partial<MeshConfig>): MeshConfig {
+  return { ...DEFAULT_MESH_CONFIG, ...partial };
 }

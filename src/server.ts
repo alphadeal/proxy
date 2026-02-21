@@ -56,7 +56,8 @@ import {
   type LearningEngineConfig,
 } from '@relayplane/learning-engine';
 import { RelayPlaneMiddleware } from './middleware.js';
-import { type RelayPlaneConfig, resolveConfig } from './relay-config.js';
+import { type RelayPlaneConfig, type MeshConfig, resolveConfig, resolveMeshConfig } from './relay-config.js';
+import { initMesh, type MeshHandle } from './mesh.js';
 
 /**
  * Proxy server configuration
@@ -90,6 +91,12 @@ export interface ProxyServerConfig {
   /** Enable learning engine analytics and suggestions (default: false) */
   enableLearning?: boolean;
   learningConfig?: LearningEngineConfig;
+
+  // Mesh learning layer (Phase 6)
+  /** Mesh config overrides */
+  meshConfig?: Partial<MeshConfig>;
+  /** Enable mesh learning layer (default: true) */
+  enableMesh?: boolean;
 
   // Provider configuration (legacy, used when routing disabled)
   providers?: {
@@ -174,6 +181,8 @@ export class ProxyServer {
   private comparator: RunComparator;
   private simulator: Simulator;
   private learningEngine: LearningEngine | null = null;
+  private meshHandle: MeshHandle | null = null;
+  private meshConfig: MeshConfig;
   private config: Required<
     Pick<ProxyServerConfig, 'port' | 'host' | 'verbose' | 'defaultWorkspaceId' | 'defaultAgentId' | 'defaultAuthEnforcementMode' | 'enforcePolicies' | 'enableRouting' | 'enableLearning'>
   > &
@@ -190,8 +199,12 @@ export class ProxyServer {
       enforcePolicies: config.enforcePolicies ?? true,
       enableRouting: config.enableRouting ?? true,
       enableLearning: config.enableLearning ?? false,
+      enableMesh: config.enableMesh ?? true,
       ...config,
     };
+
+    // Initialize mesh config
+    this.meshConfig = resolveMeshConfig(config.meshConfig);
 
     // Initialize ledger
     this.ledger = config.ledger ?? createLedger();
@@ -334,6 +347,16 @@ export class ProxyServer {
    * Start the proxy server
    */
   async start(): Promise<void> {
+    // Initialize mesh learning layer (non-blocking, graceful degradation)
+    if (this.config.enableMesh && this.meshConfig.enabled) {
+      try {
+        this.meshHandle = await initMesh(this.meshConfig);
+        this.log('info', 'Mesh learning layer initialized');
+      } catch (err) {
+        this.log('error', `Mesh init failed (continuing without): ${err}`);
+      }
+    }
+
     return new Promise((resolve) => {
       this.server = http.createServer((req, res) => {
         this.handleRequest(req, res).catch((err) => {
@@ -353,6 +376,12 @@ export class ProxyServer {
    * Stop the proxy server
    */
   async stop(): Promise<void> {
+    // Stop mesh learning layer
+    if (this.meshHandle) {
+      try { this.meshHandle.stop(); } catch { /* ignore */ }
+      this.meshHandle = null;
+    }
+
     return new Promise((resolve) => {
       if (this.server) {
         this.server.close(() => {
@@ -561,6 +590,31 @@ export class ProxyServer {
         await this.handleRuleEffectiveness(res, id);
         return;
       }
+    }
+
+    // ========================================================================
+    // Mesh Learning Layer API (Phase 6)
+    // ========================================================================
+
+    if (url.pathname === '/v1/mesh/status' && req.method === 'GET') {
+      const status = this.meshHandle?.getStatus() ?? { available: false, enabled: false, atomCount: 0, contributing: false, meshUrl: '', dataDir: '' };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ mesh: status }));
+      return;
+    }
+
+    if (url.pathname === '/v1/mesh/tips' && req.method === 'GET') {
+      const tips = this.meshHandle?.getTips(20) ?? [];
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ tips }));
+      return;
+    }
+
+    if (url.pathname === '/v1/mesh/sync' && req.method === 'POST') {
+      const result = await (this.meshHandle?.sync() ?? Promise.resolve(null));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ sync: result ?? { error: 'Mesh not available or not contributing' } }));
+      return;
     }
 
     // 404 for unknown routes
@@ -875,7 +929,7 @@ export class ProxyServer {
    */
   private async handleChatCompletions(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const startTime = Date.now();
-    let runId: string | null = null;
+    let runId: string = '';
 
     try {
       // Parse request body
@@ -941,7 +995,7 @@ export class ProxyServer {
           },
         });
 
-        this.sendError(res, 403, 'auth_denied', authResult.reason ?? 'Authentication denied', runId, authResult.guidance_url);
+        this.sendError(res, 403, 'auth_denied', authResult.reason ?? 'Authentication denied', runId, authResult.guidance_url ?? undefined);
         return;
       }
 
@@ -972,7 +1026,7 @@ export class ProxyServer {
         // Record policy evaluation in ledger
         await this.ledger.recordPolicyEvaluation(
           runId,
-          policyDecision.policies_evaluated.map((p) => ({
+          policyDecision.policies_evaluated.map((p: any) => ({
             policy_id: p.policy_id,
             policy_name: p.policy_name,
             matched: p.matched,
@@ -1070,6 +1124,21 @@ export class ProxyServer {
           await this.policyEngine.recordSpend(workspaceId, agentId, runId, costUsd);
         }
 
+        // Capture to mesh learning layer (Phase 6)
+        if (this.meshHandle) {
+          this.meshHandle.captureRequest({
+            toolName: 'chat_completion',
+            model: request.model,
+            provider,
+            success: true,
+            costUsd,
+            latencyMs,
+            inputTokens: providerResponse.usage?.prompt_tokens ?? 0,
+            outputTokens: providerResponse.usage?.completion_tokens ?? 0,
+            taskType: request.tools?.length ? 'tool_use' : 'chat',
+          });
+        }
+
         // Add run_id to response
         const responseData = providerResponse.data as Record<string, unknown>;
         const responseWithMeta = {
@@ -1099,6 +1168,22 @@ export class ProxyServer {
             retryable: providerResponse.error?.retryable ?? false,
           },
         });
+
+        // Capture failed request to mesh (Phase 6)
+        if (this.meshHandle) {
+          this.meshHandle.captureRequest({
+            toolName: 'chat_completion',
+            model: request.model,
+            provider,
+            success: false,
+            costUsd: 0,
+            latencyMs,
+            inputTokens: 0,
+            outputTokens: 0,
+            taskType: request.tools?.length ? 'tool_use' : 'chat',
+            errorCode: providerResponse.error?.code,
+          });
+        }
 
         this.sendError(
           res,
@@ -1506,6 +1591,13 @@ export class ProxyServer {
    */
   getLearningEngine(): LearningEngine | null {
     return this.learningEngine;
+  }
+
+  /**
+   * Get the mesh handle instance (Phase 6)
+   */
+  getMeshHandle(): MeshHandle | null {
+    return this.meshHandle;
   }
 }
 
