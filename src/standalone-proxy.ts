@@ -130,13 +130,13 @@ export const RELAYPLANE_ALIASES: Record<string, string> = {
  * These provide semantic shortcuts for common use cases
  */
 export const SMART_ALIASES: Record<string, { provider: Provider; model: string }> = {
-  // Best quality model (current flagship)
-  'rp:best': { provider: 'anthropic', model: 'claude-sonnet-4-20250514' },
+  // Best quality model — via OpenRouter (no separate Anthropic key needed)
+  'rp:best': { provider: 'openrouter', model: 'anthropic/claude-sonnet-4-5' },
   // Fast/cheap model for simple tasks
-  'rp:fast': { provider: 'anthropic', model: 'claude-3-5-haiku-20241022' },
-  'rp:cheap': { provider: 'openai', model: 'gpt-4o-mini' },
-  // Balanced model for general use (good quality/cost tradeoff)
-  'rp:balanced': { provider: 'anthropic', model: 'claude-3-5-haiku-20241022' },
+  'rp:fast': { provider: 'openrouter', model: 'anthropic/claude-3-5-haiku' },
+  'rp:cheap': { provider: 'openrouter', model: 'google/gemini-2.0-flash-001' },
+  // Balanced model for general use
+  'rp:balanced': { provider: 'openrouter', model: 'anthropic/claude-3-5-haiku' },
 };
 
 /**
@@ -2280,7 +2280,7 @@ table{width:100%;border-collapse:collapse;font-size:.85rem}
 th{text-align:left;color:#64748b;font-weight:500;padding:8px 12px;border-bottom:1px solid #1e293b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
 td{padding:8px 12px;border-bottom:1px solid #111318}
 .section{margin-bottom:32px}.section h2{font-size:1rem;font-weight:600;margin-bottom:12px;color:#94a3b8}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.dot.up{background:#34d399}.dot.down{background:#ef4444}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.dot.up{background:#34d399}.dot.warn{background:#fbbf24}.dot.down{background:#ef4444}
 .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.75rem;font-weight:500}
 .badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}
 .badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
@@ -2329,9 +2329,11 @@ async function load(){
     $('runs').innerHTML=(runsR.runs||[]).map(r=>
       '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>'
     ).join('')||'<tr><td colspan=9 style="color:#64748b">No runs yet</td></tr>';
-    $('providers').innerHTML=(provH.providers||[]).map(p=>
-      '<div class="prov-item"><span class="dot '+(p.status==='healthy'?'up':'down')+'"></span>'+p.provider+'</div>'
-    ).join('');
+    $('providers').innerHTML=(provH.providers||[]).map(p=>{
+      const dotClass = p.status==='healthy'?'up':(p.status==='degraded'?'warn':'down');
+      const rate = p.successRate!==undefined?(' '+Math.round(p.successRate*100)+'%'):'';
+      return '<div class="prov-item"><span class="dot '+dotClass+'"></span>'+p.provider+rate+'</div>';
+    }).join('');
   }catch(e){console.error(e)}
 }
 load();setInterval(load,5000);
@@ -2575,7 +2577,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
         const offset = parseInt(params.get('offset') || '0', 10);
         const sorted = [...requestHistory].reverse();
         const runs = sorted.slice(offset, offset + limit).map(r => {
-          const origCost = estimateCost(r.originalModel, r.tokensIn, r.tokensOut);
+          const origCost = estimateCost('claude-opus-4-20250514', r.tokensIn, r.tokensOut);
           const perRunSavings = Math.max(0, origCost - r.costUsd);
           return {
             id: r.id,
@@ -2605,16 +2607,16 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
 
       if (req.method === 'GET' && telemetryPath === 'savings') {
-        // Savings = cost(original requested model) - cost(actual routed-to model)
-        // If no routing happened (same model) → savings = 0
-        // Uses actual token counts from the response, so zeroed tokens produce zero savings.
+        // Savings = cost if everything ran on Opus - actual cost
+        // Always compare against Opus as the baseline
+        const OPUS_BASELINE = 'claude-opus-4-20250514';
         let totalOriginalCost = 0;
         let totalActualCost = 0;
         let totalSavedAmount = 0;
         const byDayMap = new Map<string, { savedAmount: number; originalCost: number; actualCost: number }>();
 
         for (const r of requestHistory) {
-          const origCost = estimateCost(r.originalModel, r.tokensIn, r.tokensOut);
+          const origCost = estimateCost(OPUS_BASELINE, r.tokensIn, r.tokensOut);
           const actualCost = r.costUsd;
           const saved = Math.max(0, origCost - actualCost);
 
@@ -2655,14 +2657,43 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
       }
 
       if (req.method === 'GET' && telemetryPath === 'health') {
+        // Calculate per-provider success rates from recent history (last 50 requests per provider)
+        const providerStats: Record<string, { success: number; total: number }> = {};
+        const recentHistory = requestHistory.slice(-200); // Look at last 200 requests
+        
+        for (const r of recentHistory) {
+          const provider = r.provider || 'unknown';
+          if (!providerStats[provider]) {
+            providerStats[provider] = { success: 0, total: 0 };
+          }
+          providerStats[provider].total++;
+          if (r.success) {
+            providerStats[provider].success++;
+          }
+        }
+        
+        // Debug: log provider stats
+        console.log('[RelayPlane Health] Provider stats:', JSON.stringify(providerStats));
+        
         const providers: Array<{ provider: string; status: string; latency: number; successRate: number; lastChecked: string }> = [];
         for (const [name, ep] of Object.entries(DEFAULT_ENDPOINTS)) {
           const hasKey = !!process.env[ep.apiKeyEnv];
+          const stats = providerStats[name.toLowerCase()];
+          const successRate = stats && stats.total > 0 ? stats.success / stats.total : (hasKey ? 1 : 0);
+          
+          // Mark as unhealthy if success rate < 80% and has had requests
+          let status = 'healthy';
+          if (!hasKey) {
+            status = 'down';
+          } else if (stats && stats.total >= 5 && successRate < 0.8) {
+            status = 'degraded';
+          }
+          
           providers.push({
             provider: name,
-            status: hasKey ? 'healthy' : 'down',
+            status,
             latency: 0,
-            successRate: hasKey ? 1 : 0,
+            successRate: Math.round(successRate * 100) / 100,
             lastChecked: new Date().toISOString(),
           });
         }

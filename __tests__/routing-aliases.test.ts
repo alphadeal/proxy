@@ -20,7 +20,7 @@ describe('RELAYPLANE_ALIASES', () => {
 describe('SMART_ALIASES', () => {
   it('should have rp:best pointing to a valid model', () => {
     expect(SMART_ALIASES['rp:best']).toBeDefined();
-    expect(SMART_ALIASES['rp:best'].provider).toBe('anthropic');
+    expect(SMART_ALIASES['rp:best'].provider).toBe('openrouter');
     expect(SMART_ALIASES['rp:best'].model).toContain('claude');
   });
 
@@ -31,18 +31,18 @@ describe('SMART_ALIASES', () => {
 
   it('should have rp:cheap pointing to a cheap model', () => {
     expect(SMART_ALIASES['rp:cheap']).toBeDefined();
-    expect(SMART_ALIASES['rp:cheap'].model).toContain('mini');
+    expect(SMART_ALIASES['rp:cheap'].model).toContain('gemini');
   });
 
   it('should have rp:balanced pointing to a balanced model', () => {
     expect(SMART_ALIASES['rp:balanced']).toBeDefined();
   });
 
-  it('should point to existing models', () => {
-    // Verify model names are valid API model IDs
-    expect(SMART_ALIASES['rp:best'].model).toMatch(/claude-.*-\d{8}$/);
-    expect(SMART_ALIASES['rp:fast'].model).toMatch(/claude-.*-\d{8}$/);
-    expect(SMART_ALIASES['rp:balanced'].model).toMatch(/claude-.*-\d{8}$/);
+  it('should point to valid OpenRouter models', () => {
+    // OpenRouter format: provider/model-name
+    expect(SMART_ALIASES['rp:best'].model).toMatch(/^[a-z]+\//);
+    expect(SMART_ALIASES['rp:fast'].model).toMatch(/^[a-z]+\//);
+    expect(SMART_ALIASES['rp:balanced'].model).toMatch(/^[a-z]+\//);
   });
 });
 

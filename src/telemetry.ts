@@ -278,11 +278,13 @@ export function getTelemetryStats(): {
   byModel: Record<string, { count: number; cost: number; baselineCost: number }>;
   byTaskType: Record<string, { count: number; cost: number }>;
   successRate: number;
+  savingsNote?: string;
 } {
   const events = getLocalTelemetry();
   
   // Default baseline model: what you'd be paying without RelayPlane
-  const BASELINE_MODEL = 'claude-opus-4-20250514';
+  // Baseline = most recently used task-appropriate model
+  const BASELINE_MODEL = 'claude-3-5-haiku-20241022'; // Safe default, Haiku
   
   const byModel: Record<string, { count: number; cost: number; baselineCost: number }> = {};
   const byTaskType: Record<string, { count: number; cost: number }> = {};
@@ -324,6 +326,8 @@ export function getTelemetryStats(): {
     byModel,
     byTaskType,
     successRate: events.length > 0 ? successCount / events.length : 0,
+    savingsNote: 'Baseline model: Claude Opus (input: $15/1M, output: $75/1M). ' +
+      'Actual routing selects cheaper models based on task complexity.',
   };
 }
 
