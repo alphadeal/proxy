@@ -1,6 +1,6 @@
 {
   "name": "@relayplane/proxy",
-  "version": "1.5.26",
+  "version": "1.5.29",
   "description": "Open source cost intelligence proxy for AI agents. Cut LLM costs ~80% with smart model routing. Dashboard, policy engine, 11 providers. MIT licensed.",
   "homepage": "https://relayplane.com",
   "repository": {
@@ -37,7 +37,7 @@
   "author": "RelayPlane",
   "license": "MIT",
   "dependencies": {
-    "@relayplane/core": "^0.1.2",
+    "@relayplane/core": "^0.1.3",
     "fastest-levenshtein": "^1.0.16",
     "@relayplane/learning-engine": "^0.1.0"
   },
