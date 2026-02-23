@@ -429,6 +429,7 @@ interface RequestHistoryEntry {
   costUsd: number;
   taskType?: string;
   complexity?: string;
+  responseModel?: string;
 }
 const requestHistory: RequestHistoryEntry[] = [];
 const MAX_HISTORY = 10000;
@@ -610,12 +611,15 @@ function logRequest(
 }
 
 /** Update the most recent history entry with token/cost info */
-function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number): void {
+function updateLastHistoryEntry(tokensIn: number, tokensOut: number, costUsd: number, responseModel?: string): void {
   if (requestHistory.length > 0) {
     const last = requestHistory[requestHistory.length - 1]!;
     last.tokensIn = tokensIn;
     last.tokensOut = tokensOut;
     last.costUsd = costUsd;
+    if (responseModel) {
+      last.responseModel = responseModel;
+    }
   }
 }
 
@@ -2096,6 +2100,42 @@ function extractResponseText(responseData: Record<string, unknown>): string {
   return '';
 }
 
+/**
+ * Build x-relayplane-* response headers for routing transparency
+ */
+function buildRelayPlaneResponseHeaders(
+  routedModel: string,
+  requestedModel: string,
+  complexity: string,
+  provider: string,
+  routingMode: string
+): Record<string, string> {
+  return {
+    'x-relayplane-routed-model': routedModel,
+    'x-relayplane-requested-model': requestedModel,
+    'x-relayplane-complexity': complexity,
+    'x-relayplane-provider': provider,
+    'x-relayplane-routing-mode': routingMode,
+  };
+}
+
+/**
+ * Check if the upstream response body contains a model field that differs from what we requested.
+ * Logs a warning if a mismatch is detected.
+ */
+function checkResponseModelMismatch(
+  responseData: Record<string, unknown>,
+  requestedModel: string,
+  provider: string,
+  log: (msg: string) => void
+): string | undefined {
+  const responseModel = responseData['model'] as string | undefined;
+  if (responseModel && responseModel !== requestedModel) {
+    log(`[RelayPlane] ⚠️ Model mismatch: requested "${requestedModel}" from ${provider}, but response contains model "${responseModel}"`);
+  }
+  return responseModel;
+}
+
 class ProviderResponseError extends Error {
   status: number;
   payload: Record<string, unknown>;
@@ -2430,6 +2470,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
     res.setHeader(
       'Access-Control-Allow-Headers',
       'Content-Type, Authorization, x-api-key, anthropic-beta, anthropic-version, X-RelayPlane-Bypass, X-RelayPlane-Model'
+    );
+    res.setHeader(
+      'Access-Control-Expose-Headers',
+      'x-relayplane-routed-model, x-relayplane-requested-model, x-relayplane-complexity, x-relayplane-provider, x-relayplane-routing-mode'
     );
 
     if (req.method === 'OPTIONS') {
@@ -3009,7 +3053,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             log
           );
 
-          res.writeHead(200, { 'Content-Type': 'application/json' });
+          const cascadeResponseModel = checkResponseModelMismatch(cascadeResult.responseData, cascadeResult.model, cascadeResult.provider, log);
+          const cascadeRpHeaders = buildRelayPlaneResponseHeaders(
+            cascadeResult.model, originalModel ?? 'unknown', complexity, cascadeResult.provider, 'cascade'
+          );
+          res.writeHead(200, { 'Content-Type': 'application/json', ...cascadeRpHeaders });
           res.end(JSON.stringify(cascadeResult.responseData));
           targetProvider = cascadeResult.provider;
           targetModel = cascadeResult.model;
@@ -3051,10 +3099,14 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           }
 
           if (isStreaming) {
+            const nativeStreamRpHeaders = buildRelayPlaneResponseHeaders(
+              targetModel || requestedModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
+            );
             res.writeHead(providerResponse.status, {
               'Content-Type': 'text/event-stream',
               'Cache-Control': 'no-cache',
               'Connection': 'keep-alive',
+              ...nativeStreamRpHeaders,
             });
             const reader = providerResponse.body?.getReader();
             let streamTokensIn = 0;
@@ -3104,7 +3156,11 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             res.end();
           } else {
             nativeResponseData = await providerResponse.json() as Record<string, unknown>;
-            res.writeHead(providerResponse.status, { 'Content-Type': 'application/json' });
+            const nativeRespModel = checkResponseModelMismatch(nativeResponseData, targetModel || requestedModel, targetProvider, log);
+            const nativeRpHeaders = buildRelayPlaneResponseHeaders(
+              targetModel || requestedModel, originalModel ?? 'unknown', complexity, targetProvider, routingMode
+            );
+            res.writeHead(providerResponse.status, { 'Content-Type': 'application/json', ...nativeRpHeaders });
             res.end(JSON.stringify(nativeResponseData));
           }
         }
@@ -3519,6 +3575,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
 
           const durationMs = Date.now() - startTime;
           let responseData = cascadeResult.responseData;
+          const chatCascadeRespModel = checkResponseModelMismatch(responseData, cascadeResult.model, cascadeResult.provider, log);
 
           // Log cascade request for stats tracking
           logRequest(
@@ -3535,7 +3592,7 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
           const cascadeTokensIn = cascadeUsage?.input_tokens ?? cascadeUsage?.prompt_tokens ?? 0;
           const cascadeTokensOut = cascadeUsage?.output_tokens ?? cascadeUsage?.completion_tokens ?? 0;
           const cascadeCost = estimateCost(cascadeResult.model, cascadeTokensIn, cascadeTokensOut);
-          updateLastHistoryEntry(cascadeTokensIn, cascadeTokensOut, cascadeCost);
+          updateLastHistoryEntry(cascadeTokensIn, cascadeTokensOut, cascadeCost, chatCascadeRespModel);
 
           if (recordTelemetry) {
             try {
@@ -3560,7 +3617,10 @@ export async function startProxy(config: ProxyConfig = {}): Promise<http.Server>
             sendCloudTelemetry(taskType, cascadeResult.model, cascadeTokensIn, cascadeTokensOut, durationMs, true, undefined, originalRequestedModel ?? undefined);
           }
 
-          res.writeHead(200, { 'Content-Type': 'application/json' });
+          const chatCascadeRpHeaders = buildRelayPlaneResponseHeaders(
+            cascadeResult.model, originalRequestedModel ?? 'unknown', complexity, cascadeResult.provider, 'cascade'
+          );
+          res.writeHead(200, { 'Content-Type': 'application/json', ...chatCascadeRpHeaders });
           res.end(JSON.stringify(responseData));
         } catch (err) {
           const durationMs = Date.now() - startTime;
@@ -3738,11 +3798,15 @@ async function handleStreamingRequest(
     return;
   }
 
-  // Set SSE headers
+  // Set SSE headers with RelayPlane routing metadata
+  const streamRpHeaders = buildRelayPlaneResponseHeaders(
+    targetModel, request.model ?? 'unknown', complexity, targetProvider, routingMode
+  );
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
+    ...streamRpHeaders,
   });
 
   // Track token usage from streaming events
@@ -3913,6 +3977,9 @@ async function handleNonStreamingRequest(
 
   const durationMs = Date.now() - startTime;
 
+  // Check for model mismatch in response
+  const nonStreamRespModel = checkResponseModelMismatch(responseData, targetModel, targetProvider, log);
+
   // Log the successful request
   logRequest(request.model ?? 'unknown', targetModel, targetProvider, durationMs, true, routingMode, undefined, taskType, complexity);
   // Update token/cost info
@@ -3920,7 +3987,7 @@ async function handleNonStreamingRequest(
   const tokensIn = usage?.input_tokens ?? usage?.prompt_tokens ?? 0;
   const tokensOut = usage?.output_tokens ?? usage?.completion_tokens ?? 0;
   const cost = estimateCost(targetModel, tokensIn, tokensOut);
-  updateLastHistoryEntry(tokensIn, tokensOut, cost);
+  updateLastHistoryEntry(tokensIn, tokensOut, cost, nonStreamRespModel);
 
   if (recordTelemetry) {
     // Record the run in RelayPlane
@@ -3952,8 +4019,11 @@ async function handleNonStreamingRequest(
     sendCloudTelemetry(taskType, targetModel, tokensIn, tokensOut, durationMs, true);
   }
 
-  // Send response
-  res.writeHead(200, { 'Content-Type': 'application/json' });
+  // Send response with RelayPlane routing headers
+  const nonStreamRpHeaders = buildRelayPlaneResponseHeaders(
+    targetModel, request.model ?? 'unknown', complexity, targetProvider, routingMode
+  );
+  res.writeHead(200, { 'Content-Type': 'application/json', ...nonStreamRpHeaders });
   res.end(JSON.stringify(responseData));
 }
 
