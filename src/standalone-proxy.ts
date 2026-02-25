@@ -3236,14 +3236,20 @@ export async function startProxy(
                 );
             }
 
+            const preStripModel = requestedModel;
             const parsedModel = parseModelSuffix(requestedModel);
             let routingSuffix = parsedModel.suffix;
             requestedModel = parsedModel.baseModel;
 
             if (relayplaneEnabled && !relayplaneBypass && requestedModel) {
-                const override = proxyConfig.modelOverrides?.[requestedModel];
+                // Check original model name (e.g. claude-opus-4-6[1m]) before the
+                // stripped name so config overrides for annotated variants take priority
+                // over overrides for the base model (e.g. claude-opus-4-6 → relayplane:auto).
+                const override =
+                    proxyConfig.modelOverrides?.[preStripModel] ??
+                    proxyConfig.modelOverrides?.[requestedModel];
                 if (override) {
-                    log(`Model override: ${requestedModel} → ${override}`);
+                    log(`Model override: ${preStripModel} → ${override}`);
                     const overrideParsed = parseModelSuffix(override);
                     if (!routingSuffix && overrideParsed.suffix) {
                         routingSuffix = overrideParsed.suffix;
@@ -3911,14 +3917,17 @@ export async function startProxy(
             return;
         }
 
+        const preStripModel = requestedModel;
         const parsedModel = parseModelSuffix(requestedModel);
         let routingSuffix = parsedModel.suffix;
         requestedModel = parsedModel.baseModel;
 
         if (!bypassRouting) {
-            const override = proxyConfig.modelOverrides?.[requestedModel];
+            const override =
+                proxyConfig.modelOverrides?.[preStripModel] ??
+                proxyConfig.modelOverrides?.[requestedModel];
             if (override) {
-                log(`Model override: ${requestedModel} → ${override}`);
+                log(`Model override: ${preStripModel} → ${override}`);
                 const overrideParsed = parseModelSuffix(override);
                 if (!routingSuffix && overrideParsed.suffix) {
                     routingSuffix = overrideParsed.suffix;
