@@ -890,12 +890,29 @@ export function parseModelSuffix(model: string): ParsedModel {
     for (const suffix of suffixes) {
         if (trimmed.endsWith(`:${suffix}`)) {
             return {
-                baseModel: trimmed.slice(0, -(suffix.length + 1)),
+                baseModel: stripContextAnnotation(trimmed.slice(0, -(suffix.length + 1))),
                 suffix,
             };
         }
     }
-    return { baseModel: trimmed, suffix: null };
+    return { baseModel: stripContextAnnotation(trimmed), suffix: null };
+}
+
+/**
+ * Strip Claude Code context-window annotations from model names.
+ *
+ * Claude Code appends bracket annotations like `[1m]` to model names in its
+ * UI and API requests to indicate the desired context window size
+ * (e.g. `claude-opus-4-6[1m]`). These are not valid Anthropic API model IDs
+ * and must be removed before forwarding requests upstream.
+ *
+ * @example
+ * stripContextAnnotation("claude-opus-4-6[1m]")   // → "claude-opus-4-6"
+ * stripContextAnnotation("claude-sonnet-4-6[1m]")  // → "claude-sonnet-4-6"
+ * stripContextAnnotation("claude-sonnet-4-6")       // → "claude-sonnet-4-6"
+ */
+function stripContextAnnotation(model: string): string {
+    return model.replace(/\[\d+[km]?\]$/i, "");
 }
 
 /**
