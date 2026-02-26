@@ -98,7 +98,66 @@ Map any model name to a different one. Useful for silently redirecting expensive
 }
 ```
 
+You can also route to OpenAI models using the `ad:auto` alias (see [AlphaDeal Routing](#alphadeal-routing) below):
+
+```json
+{
+  "modelOverrides": {
+    "claude-opus-4-5-20251101": "ad:auto"
+  }
+}
+```
+
+This works even for Claude Code clients using the native `/v1/messages` endpoint — the proxy transparently translates requests and responses between Anthropic and OpenAI formats.
+
 Overrides are applied before any other routing logic. The original requested model is logged for tracking.
+
+## AlphaDeal Routing
+
+AlphaDeal is an OpenAI-focused complexity-based routing strategy. When a model is overridden to `ad:auto`, the proxy classifies the request by complexity and routes to the appropriate OpenAI model tier.
+
+```json
+{
+  "routing": {
+    "alphadeal": {
+      "enabled": true,
+      "simple": "gpt-5-nano",
+      "moderate": "gpt-5.2",
+      "complex": "gpt-5.2"
+    }
+  }
+}
+```
+
+| Tier | Default model | When used |
+|------|--------------|-----------|
+| `simple` | `gpt-5-nano` | Short prompts, basic Q&A |
+| `moderate` | `gpt-5.2` | Multi-step reasoning, code review |
+| `complex` | `gpt-5.2` | Architecture, large context, many tools |
+
+**Supported `ad:*` aliases:**
+
+| Alias | Resolves to |
+|-------|------------|
+| `ad:auto` | Complexity-based routing (simple/moderate/complex tiers) |
+| `ad:fast` | `openai/gpt-5-nano` |
+| `ad:balanced` | `openai/gpt-5.2` |
+| `ad:best` | `openai/gpt-5.2-pro` |
+| `ad:analysis` | `openai/gpt-5.2-pro` |
+
+Set your OpenAI API key in the environment:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+Or if running as a systemd service:
+
+```bash
+systemctl --user set-environment OPENAI_API_KEY="sk-..."
+systemctl --user restart relayplane-proxy.service
+```
+
 
 ## Cascade Mode
 
