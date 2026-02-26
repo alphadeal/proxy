@@ -1011,6 +1011,22 @@ export function classifyComplexity(
         });
     if (hasTools) score += 2;
 
+    // Tool result turns: each turn where actual file/command output was returned.
+    // extractMessageText ignores tool_result blocks, so code content inside them
+    // never reaches the keyword detectors above. Counting these turns directly is
+    // the only reliable signal for "this is an agentic file-editing session".
+    const toolResultTurns = messages.filter((m) => {
+        const c = m.content;
+        return (
+            Array.isArray(c) &&
+            (c as Array<{ type?: string }>).some(
+                (p) => p.type === "tool_result",
+            )
+        );
+    }).length;
+    if (toolResultTurns >= 1) score += 1; // any file read → tip into complex with tools
+    if (toolResultTurns >= 4) score += 2; // deep multi-file session → firmly complex
+
     if (score >= 3) return "complex";
     if (score >= 2) return "moderate";
     return "simple";
@@ -4317,12 +4333,13 @@ export async function startProxy(
 
         if (useCascade && isStreaming) {
             log(
-                "Cascade disabled for streaming request; using first cascade model",
+                "Cascade disabled for streaming request; using complexity-based routing",
             );
             useCascade = false;
-            const fallbackModel =
-                getCascadeModels(proxyConfig)[0] || getCostModel(proxyConfig);
-            const resolvedFallback = resolveConfigModel(fallbackModel);
+            const streamingModel = proxyConfig.routing?.complexity?.enabled
+                ? proxyConfig.routing.complexity[complexity]
+                : getCascadeModels(proxyConfig)[0] || getCostModel(proxyConfig);
+            const resolvedFallback = resolveConfigModel(streamingModel);
             if (resolvedFallback) {
                 targetProvider = resolvedFallback.provider;
                 targetModel = resolvedFallback.model;
