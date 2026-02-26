@@ -251,12 +251,26 @@ function sendCloudTelemetry(
 /**
  * Get all available model names for error suggestions
  */
-export function getAvailableModelNames(): string[] {
+export function getAvailableModelNames(
+    config?: RelayPlaneProxyConfigFile,
+): string[] {
+    const profileEntries: string[] = [];
+    if (config?.profiles) {
+        for (const name of Object.keys(config.profiles)) {
+            profileEntries.push(
+                `${name}:auto`,
+                `${name}:cost`,
+                `${name}:fast`,
+                `${name}:quality`,
+            );
+        }
+    }
     return [
         ...Object.keys(MODEL_MAPPING),
         ...Object.keys(SMART_ALIASES),
         ...Object.keys(ALPHADEAL_ALIASES),
         ...Object.keys(RELAYPLANE_ALIASES),
+        ...profileEntries,
         // Add common model prefixes users might type
         "relayplane:auto",
         "relayplane:cost",
@@ -366,6 +380,21 @@ interface RoutingConfig {
 
 interface ReliabilityConfig {
     cooldowns: CooldownConfig;
+}
+
+/** Complexity-based auto-routing configuration for a profile */
+interface ProfileAutoConfig {
+    simple: string;
+    moderate: string;
+    complex: string;
+}
+
+/** A named routing profile mapping strategies to concrete model names */
+interface RoutingProfile {
+    cost: string;
+    fast: string;
+    quality: string;
+    auto: ProfileAutoConfig;
 }
 
 type Complexity = "simple" | "moderate" | "complex";
@@ -481,6 +510,7 @@ interface RelayPlaneProxyConfigFile {
     routing?: Partial<RoutingConfig>;
     reliability?: { cooldowns?: Partial<CooldownConfig> };
     auth?: HybridAuthConfig;
+    profiles?: Record<string, RoutingProfile>;
     [key: string]: unknown;
 }
 
@@ -758,6 +788,7 @@ function updateLastHistoryEntry(
 const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
     enabled: true,
     modelOverrides: {},
+    profiles: {},
     routing: {
         mode: "cascade",
         cascade: {
@@ -849,6 +880,7 @@ function normalizeProxyConfig(
         },
         routing,
         reliability,
+        profiles: (config?.profiles ?? {}) as Record<string, RoutingProfile>,
         enabled:
             config?.enabled !== undefined
                 ? !!config.enabled
@@ -2825,6 +2857,60 @@ function resolveConfigModel(
     return resolveExplicitModel(modelName) ?? parsePreferredModel(modelName);
 }
 
+const RESERVED_PROFILE_PREFIXES = new Set([
+    "rp",
+    "ad",
+    "relayplane",
+]);
+const VALID_PROFILE_STRATEGIES = new Set(["cost", "fast", "quality", "auto"]);
+
+/**
+ * Resolve a profile:strategy model reference to a concrete provider/model.
+ * Returns null if not a valid profile reference.
+ */
+function resolveProfileModel(
+    modelName: string,
+    config: RelayPlaneProxyConfigFile,
+    complexity: Complexity,
+): { provider: Provider; model: string; strategy: string } | null {
+    const colonIdx = modelName.indexOf(":");
+    if (colonIdx <= 0) return null;
+
+    const profileName = modelName.substring(0, colonIdx);
+    const strategy = modelName.substring(colonIdx + 1);
+
+    if (RESERVED_PROFILE_PREFIXES.has(profileName)) return null;
+    if (!VALID_PROFILE_STRATEGIES.has(strategy)) return null;
+
+    const profile = config.profiles?.[profileName];
+    if (!profile) return null;
+
+    let targetModelName: string | undefined;
+    switch (strategy) {
+        case "cost":
+            targetModelName = profile.cost;
+            break;
+        case "fast":
+            targetModelName = profile.fast;
+            break;
+        case "quality":
+            targetModelName = profile.quality;
+            break;
+        case "auto":
+            targetModelName = profile.auto?.[complexity];
+            break;
+        default:
+            return null;
+    }
+
+    if (!targetModelName) return null;
+
+    const resolved = resolveExplicitModel(targetModelName);
+    if (!resolved) return null;
+
+    return { provider: resolved.provider, model: resolved.model, strategy };
+}
+
 function extractResponseText(responseData: Record<string, unknown>): string {
     const openAiChoices = responseData["choices"] as
         | Array<Record<string, unknown>>
@@ -3666,31 +3752,55 @@ export async function startProxy(
                 );
             }
 
-            const parsedModel = parseModelSuffix(requestedModel);
-            let routingSuffix = parsedModel.suffix;
-            requestedModel = parsedModel.baseModel;
-
-            if (relayplaneEnabled && !relayplaneBypass && requestedModel) {
-                const override = proxyConfig.modelOverrides?.[requestedModel];
-                if (override) {
-                    log(`Model override: ${requestedModel} → ${override}`);
-                    const overrideParsed = parseModelSuffix(override);
-                    if (!routingSuffix && overrideParsed.suffix) {
-                        routingSuffix = overrideParsed.suffix;
+            // Check for profile:strategy before parseModelSuffix strips the colon
+            let profileMatch = false;
+            {
+                const colonIdx = requestedModel.indexOf(":");
+                if (colonIdx > 0) {
+                    const candidateName = requestedModel.substring(0, colonIdx);
+                    const candidateStrategy = requestedModel.substring(colonIdx + 1);
+                    if (
+                        proxyConfig.profiles?.[candidateName] &&
+                        VALID_PROFILE_STRATEGIES.has(candidateStrategy)
+                    ) {
+                        profileMatch = true;
                     }
-                    requestedModel = overrideParsed.baseModel;
                 }
             }
 
-            // Resolve aliases (e.g., relayplane:auto → rp:balanced)
-            const resolvedModel = resolveModelAlias(requestedModel);
-            if (resolvedModel !== requestedModel) {
-                log(`Alias resolution: ${requestedModel} → ${resolvedModel}`);
-                requestedModel = resolvedModel;
-            }
+            let routingSuffix: RoutingSuffix | null = null;
+            if (!profileMatch) {
+                const parsedModel = parseModelSuffix(requestedModel);
+                routingSuffix = parsedModel.suffix;
+                requestedModel = parsedModel.baseModel;
 
-            if (requestedModel && requestedModel !== originalModel) {
-                requestBody["model"] = requestedModel;
+                if (relayplaneEnabled && !relayplaneBypass && requestedModel) {
+                    const override =
+                        proxyConfig.modelOverrides?.[requestedModel];
+                    if (override) {
+                        log(
+                            `Model override: ${requestedModel} → ${override}`,
+                        );
+                        const overrideParsed = parseModelSuffix(override);
+                        if (!routingSuffix && overrideParsed.suffix) {
+                            routingSuffix = overrideParsed.suffix;
+                        }
+                        requestedModel = overrideParsed.baseModel;
+                    }
+                }
+
+                // Resolve aliases (e.g., relayplane:auto → rp:balanced)
+                const resolvedModel = resolveModelAlias(requestedModel);
+                if (resolvedModel !== requestedModel) {
+                    log(
+                        `Alias resolution: ${requestedModel} → ${resolvedModel}`,
+                    );
+                    requestedModel = resolvedModel;
+                }
+
+                if (requestedModel && requestedModel !== originalModel) {
+                    requestBody["model"] = requestedModel;
+                }
             }
 
             let routingMode:
@@ -3699,8 +3809,11 @@ export async function startProxy(
                 | "fast"
                 | "quality"
                 | "alphadeal"
+                | "profile"
                 | "passthrough" = "auto";
-            if (!relayplaneEnabled || relayplaneBypass) {
+            if (profileMatch) {
+                routingMode = "profile";
+            } else if (!relayplaneEnabled || relayplaneBypass) {
                 routingMode = "passthrough";
             } else if (routingSuffix) {
                 routingMode = routingSuffix;
@@ -3813,7 +3926,30 @@ export async function startProxy(
                 }
             }
 
-            if (routingMode === "passthrough") {
+            if (routingMode === "profile") {
+                const resolved = resolveProfileModel(
+                    requestedModel,
+                    proxyConfig,
+                    complexity,
+                );
+                if (!resolved) {
+                    res.writeHead(400, { "Content-Type": "application/json" });
+                    res.end(
+                        JSON.stringify(
+                            buildModelNotFoundError(
+                                requestedModel,
+                                getAvailableModelNames(proxyConfig),
+                            ),
+                        ),
+                    );
+                    return;
+                }
+                targetProvider = resolved.provider;
+                targetModel = resolved.model;
+                log(
+                    `Profile routing (messages): ${requestedModel} → ${targetProvider}/${targetModel} (strategy: ${resolved.strategy}, complexity: ${complexity})`,
+                );
+            } else if (routingMode === "passthrough") {
                 const resolved = resolveExplicitModel(requestedModel);
                 if (!resolved) {
                     res.writeHead(400, { "Content-Type": "application/json" });
@@ -3821,7 +3957,7 @@ export async function startProxy(
                         JSON.stringify(
                             buildModelNotFoundError(
                                 requestedModel,
-                                getAvailableModelNames(),
+                                getAvailableModelNames(proxyConfig),
                             ),
                         ),
                     );
@@ -4311,6 +4447,14 @@ export async function startProxy(
 
         // === Model list endpoint ===
         if (req.method === "GET" && url.includes("/models")) {
+            const profileModels = Object.keys(
+                proxyConfig.profiles ?? {},
+            ).flatMap((name) => [
+                { id: `${name}:auto`, object: "model", owned_by: name },
+                { id: `${name}:cost`, object: "model", owned_by: name },
+                { id: `${name}:fast`, object: "model", owned_by: name },
+                { id: `${name}:quality`, object: "model", owned_by: name },
+            ]);
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
                 JSON.stringify({
@@ -4336,6 +4480,7 @@ export async function startProxy(
                             object: "model",
                             owned_by: "relayplane",
                         },
+                        ...profileModels,
                     ],
                 }),
             );
@@ -4398,27 +4543,53 @@ export async function startProxy(
             return;
         }
 
-        const parsedModel = parseModelSuffix(requestedModel);
-        let routingSuffix = parsedModel.suffix;
-        requestedModel = parsedModel.baseModel;
-
-        if (!bypassRouting) {
-            const override = proxyConfig.modelOverrides?.[requestedModel];
-            if (override) {
-                log(`Model override: ${requestedModel} → ${override}`);
-                const overrideParsed = parseModelSuffix(override);
-                if (!routingSuffix && overrideParsed.suffix) {
-                    routingSuffix = overrideParsed.suffix;
+        // Check for profile:strategy before parseModelSuffix strips the colon
+        let profileMatch = false;
+        {
+            const colonIdx = requestedModel.indexOf(":");
+            if (colonIdx > 0) {
+                const candidateName = requestedModel.substring(0, colonIdx);
+                const candidateStrategy = requestedModel.substring(
+                    colonIdx + 1,
+                );
+                if (
+                    proxyConfig.profiles?.[candidateName] &&
+                    VALID_PROFILE_STRATEGIES.has(candidateStrategy)
+                ) {
+                    profileMatch = true;
                 }
-                requestedModel = overrideParsed.baseModel;
             }
         }
 
-        // Resolve aliases (e.g., relayplane:auto → rp:balanced)
-        const resolvedModel = resolveModelAlias(requestedModel);
-        if (resolvedModel !== requestedModel) {
-            log(`Alias resolution: ${requestedModel} → ${resolvedModel}`);
-            requestedModel = resolvedModel;
+        let routingSuffix: RoutingSuffix | null = null;
+        if (!profileMatch) {
+            const parsedModel = parseModelSuffix(requestedModel);
+            routingSuffix = parsedModel.suffix;
+            requestedModel = parsedModel.baseModel;
+
+            if (!bypassRouting) {
+                const override =
+                    proxyConfig.modelOverrides?.[requestedModel];
+                if (override) {
+                    log(
+                        `Model override: ${requestedModel} → ${override}`,
+                    );
+                    const overrideParsed = parseModelSuffix(override);
+                    if (!routingSuffix && overrideParsed.suffix) {
+                        routingSuffix = overrideParsed.suffix;
+                    }
+                    requestedModel = overrideParsed.baseModel;
+                }
+            }
+
+            // Resolve aliases (e.g., relayplane:auto → rp:balanced)
+            const resolvedModel = resolveModelAlias(requestedModel);
+            if (resolvedModel !== requestedModel) {
+                log(
+                    `Alias resolution: ${requestedModel} → ${resolvedModel}`,
+                );
+                requestedModel = resolvedModel;
+            }
         }
 
         let routingMode:
@@ -4427,11 +4598,14 @@ export async function startProxy(
             | "fast"
             | "quality"
             | "alphadeal"
+            | "profile"
             | "passthrough" = "auto";
         let targetModel: string = "";
         let targetProvider: Provider = "anthropic";
 
-        if (bypassRouting) {
+        if (profileMatch) {
+            routingMode = "profile";
+        } else if (bypassRouting) {
             routingMode = "passthrough";
         } else if (routingSuffix) {
             routingMode = routingSuffix;
@@ -4523,7 +4697,30 @@ export async function startProxy(
             }
         }
 
-        if (routingMode === "passthrough") {
+        if (routingMode === "profile") {
+            const resolved = resolveProfileModel(
+                requestedModel,
+                proxyConfig,
+                complexity,
+            );
+            if (!resolved) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(
+                    JSON.stringify(
+                        buildModelNotFoundError(
+                            requestedModel,
+                            getAvailableModelNames(proxyConfig),
+                        ),
+                    ),
+                );
+                return;
+            }
+            targetProvider = resolved.provider;
+            targetModel = resolved.model;
+            log(
+                `Profile routing (completions): ${requestedModel} → ${targetProvider}/${targetModel} (strategy: ${resolved.strategy}, complexity: ${complexity})`,
+            );
+        } else if (routingMode === "passthrough") {
             const resolved = resolveExplicitModel(requestedModel);
             if (resolved) {
                 targetProvider = resolved.provider;
@@ -4536,7 +4733,7 @@ export async function startProxy(
                 if (bypassRouting) {
                     const modelError = buildModelNotFoundError(
                         requestedModel,
-                        getAvailableModelNames(),
+                        getAvailableModelNames(proxyConfig),
                     );
                     res.end(
                         JSON.stringify({
@@ -4550,7 +4747,7 @@ export async function startProxy(
                         JSON.stringify(
                             buildModelNotFoundError(
                                 requestedModel,
-                                getAvailableModelNames(),
+                                getAvailableModelNames(proxyConfig),
                             ),
                         ),
                     );
@@ -4878,6 +5075,12 @@ export async function startProxy(
             console.log(
                 `  Models: relayplane:auto, relayplane:cost, relayplane:fast, relayplane:quality`,
             );
+            const profileNames = Object.keys(proxyConfig.profiles ?? {});
+            if (profileNames.length > 0) {
+                console.log(
+                    `  Profiles: ${profileNames.map((n) => `${n}:*`).join(", ")}`,
+                );
+            }
             console.log(
                 `  Auth: Passthrough for Anthropic, env vars for other providers`,
             );
