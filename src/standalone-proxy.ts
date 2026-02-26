@@ -2696,6 +2696,13 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 .badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
 @media(max-width:768px){.col-tt,.col-cx{display:none}}
 .prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
+.alerts{display:flex;flex-direction:column;gap:8px;margin-bottom:24px}
+.alert{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:8px;font-size:.85rem;line-height:1.4}
+.alert-high{background:#2d0a0a;border:1px solid #ef4444;color:#fca5a5}
+.alert-medium{background:#2d2a0a;border:1px solid #fbbf24;color:#fde68a}
+.alert-info{background:#0a1a2d;border:1px solid #3b82f6;color:#93c5fd}
+.alert-icon{font-size:1.1rem;flex-shrink:0}
+.alert-detail{color:#94a3b8;font-size:.8rem;margin-top:2px}
 </style></head><body>
 <div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><span id="ver"></span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
 <div class="cards">
@@ -2704,6 +2711,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
   <div class="card"><div class="label">Savings</div><div class="value green" id="savings">—</div></div>
   <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div></div>
 </div>
+<div class="alerts" id="alerts"></div>
 <div class="section"><h2>Model Breakdown</h2>
 <table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
@@ -2716,12 +2724,13 @@ function fmtTime(s){const d=new Date(s);return d.toLocaleTimeString()}
 function dur(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'h '+m+'m':m+'m'}
 async function load(){
   try{
-    const [health,stats,runsR,sav,provH]=await Promise.all([
+    const [health,stats,runsR,sav,provH,ovr]=await Promise.all([
       fetch('/health').then(r=>r.json()),
       fetch('/v1/telemetry/stats').then(r=>r.json()),
       fetch('/v1/telemetry/runs?limit=20').then(r=>r.json()),
       fetch('/v1/telemetry/savings').then(r=>r.json()),
-      fetch('/v1/telemetry/health').then(r=>r.json())
+      fetch('/v1/telemetry/health').then(r=>r.json()),
+      fetch('/v1/telemetry/overrides').then(r=>r.json())
     ]);
     $('ver').textContent='v'+health.version;
     $('uptime').textContent=dur(health.uptime);
@@ -2738,6 +2747,20 @@ async function load(){
     $('runs').innerHTML=(runsR.runs||[]).map(r=>
       '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>'
     ).join('')||'<tr><td colspan=9 style="color:#64748b">No runs yet</td></tr>';
+    const alerts=[];
+    (ovr.overrides||[]).forEach(o=>{
+      const icon=o.severity==='high'?'!!':o.severity==='medium'?'!':'i';
+      const pct=sav.total>0?Math.round(o.savingsLost/sav.total*100):0;
+      const detail=o.requestCount>0
+        ?o.requestCount+' requests affected · $'+fmt(o.costImpact,4)+' cost impact'+(pct>0?' · '+pct+'% of potential savings lost':'')
+        :'No requests affected yet';
+      alerts.push('<div class="alert alert-'+o.severity+'"><span class="alert-icon">'+icon+'</span><div><div>Override: <b>'+o.from+'</b> → <b>'+o.to+'</b></div><div class="alert-detail">'+detail+'</div></div></div>');
+    });
+    if(ovr.totalSavingsLost>0){
+      const lostPct=sav.total>0?Math.round(ovr.totalSavingsLost/sav.total*100):0;
+      alerts.unshift('<div class="alert alert-medium"><span class="alert-icon">!</span><div><div>Model overrides are reducing savings by <b>$'+fmt(ovr.totalSavingsLost,4)+'</b>'+(lostPct>0?' (<b>'+lostPct+'%</b> of potential savings)':'')+'</div><div class="alert-detail">'+ovr.totalOverriddenRequests+' total requests overridden · Review overrides in ~/.relayplane/config.json</div></div></div>');
+    }
+    $('alerts').innerHTML=alerts.join('');
     $('providers').innerHTML=(provH.providers||[]).map(p=>{
       const cls=p.status==='healthy'?'up':p.status==='degraded'?'degraded':p.status==='idle'?'idle':'down';
       return '<div class="prov-item"><span class="dot '+cls+'"></span>'+p.provider+'</div>';
@@ -3231,6 +3254,73 @@ export async function startProxy(
                 }
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ providers }));
+                return;
+            }
+
+            if (req.method === "GET" && telemetryPath === "overrides") {
+                const overrides = proxyConfig.modelOverrides ?? {};
+                const entries = Object.entries(overrides);
+                const warnings: Array<{
+                    from: string;
+                    to: string;
+                    requestCount: number;
+                    costImpact: number;
+                    savingsLost: number;
+                    severity: string;
+                }> = [];
+
+                for (const [from, to] of entries) {
+                    const affected = requestHistory.filter(
+                        (r) => r.originalModel === from,
+                    );
+                    const requestCount = affected.length;
+                    const fromCost = affected.reduce(
+                        (sum, r) =>
+                            sum + estimateCost(from, r.tokensIn, r.tokensOut),
+                        0,
+                    );
+                    const toCost = affected.reduce(
+                        (sum, r) =>
+                            sum + estimateCost(to, r.tokensIn, r.tokensOut),
+                        0,
+                    );
+                    const costImpact =
+                        Math.round((toCost - fromCost) * 10000) / 10000;
+                    const savingsLost =
+                        Math.round(Math.max(0, costImpact) * 10000) / 10000;
+                    const severity =
+                        savingsLost > 1
+                            ? "high"
+                            : savingsLost > 0
+                              ? "medium"
+                              : "info";
+                    warnings.push({
+                        from,
+                        to,
+                        requestCount,
+                        costImpact,
+                        savingsLost,
+                        severity,
+                    });
+                }
+
+                const totalSavingsLost = warnings.reduce(
+                    (sum, w) => sum + w.savingsLost,
+                    0,
+                );
+                const totalOverriddenRequests = warnings.reduce(
+                    (sum, w) => sum + w.requestCount,
+                    0,
+                );
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(
+                    JSON.stringify({
+                        overrides: warnings,
+                        totalSavingsLost:
+                            Math.round(totalSavingsLost * 10000) / 10000,
+                        totalOverriddenRequests,
+                    }),
+                );
                 return;
             }
 
