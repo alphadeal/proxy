@@ -245,40 +245,40 @@ export function resolveModelAlias(model: string): string {
 
 /**
  * Default routing based on task type
- * Uses Haiku 3.5 for cost optimization, upgrades based on learned rules
+ * Uses Haiku 4.5 as safe fallback (never use "latest" suffixes - Anthropic deprecated them)
  */
 const DEFAULT_ROUTING: Record<TaskType, { provider: Provider; model: string }> =
     {
         code_generation: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         code_review: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         summarization: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
-        analysis: { provider: "anthropic", model: "claude-3-5-haiku-latest" },
+        analysis: { provider: "anthropic", model: "claude-haiku-4-5-20251001" },
         creative_writing: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         data_extraction: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         translation: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         question_answering: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
-        general: { provider: "anthropic", model: "claude-3-5-haiku-latest" },
+        general: { provider: "anthropic", model: "claude-haiku-4-5-20251001" },
     };
 
 type RoutingSuffix = "cost" | "fast" | "quality";
@@ -3319,7 +3319,16 @@ export async function startProxy(
             } else if (requestedModel === "quality") {
                 routingMode = "quality";
             } else {
-                routingMode = "passthrough";
+                // Check if model is valid before passthrough
+                // Invalid models trigger auto mode with sonnet fallback
+                const modelResolved = resolveExplicitModel(requestedModel);
+                if (!modelResolved || (modelResolved.provider === "anthropic" && requestedModel.includes("latest"))) {
+                    log(`Invalid model "${requestedModel}" detected, switching to auto mode with fallback`);
+                    routingMode = "auto";
+                    requestedModel = "claude-sonnet-4-6";
+                } else {
+                    routingMode = "passthrough";
+                }
             }
 
             const isStreaming = requestBody["stream"] === true;
@@ -4268,7 +4277,16 @@ export async function startProxy(
         } else if (requestedModel === "quality") {
             routingMode = "quality";
         } else {
-            routingMode = "passthrough";
+            // Check if model is valid before passthrough
+            // Invalid models trigger auto mode with sonnet fallback
+            const modelResolved = resolveExplicitModel(requestedModel);
+            if (!modelResolved || (modelResolved.provider === "anthropic" && requestedModel.includes("latest"))) {
+                log(`Invalid model "${requestedModel}" detected, switching to auto mode with fallback`);
+                routingMode = "auto";
+                requestedModel = "claude-sonnet-4-6";
+            } else {
+                routingMode = "passthrough";
+            }
         }
 
         log(
