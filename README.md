@@ -267,6 +267,56 @@ Use these as the `model` field in your API requests:
 }
 ```
 
+## Claude Code Integration
+
+RelayPlane integrates cleanly with [Claude Code](https://claude.ai/code) via a single settings change. Set `"model": "default"` in your project's local settings file to enable smart auto-routing for every session.
+
+### Setup
+
+Add the `model` field to `.claude/settings.local.json` in your project root:
+
+```json
+{
+  "model": "default"
+}
+```
+
+> **Why `"default"` and not `"relayplane:auto"`?**
+>
+> `"default"` is a valid Anthropic model alias (resolves to Opus on Max/Team Premium, Sonnet on Pro). If RelayPlane is not running, Claude Code falls back gracefully to that model — no connection errors. When RelayPlane *is* running, it intercepts the `"default"` alias and applies full auto-routing instead.
+
+### How it works
+
+1. Claude Code sends `model: "default"` with every request
+2. RelayPlane intercepts it and sets `routingMode = "auto"`
+3. The proxy classifies the task (complexity, type, token count) and routes to the optimal model
+4. If the routed model fails with a rate-limit (429), overload (500/503/529), or similar, RelayPlane retries automatically with `claude-sonnet-4-6` before returning an error
+
+### Graceful degradation
+
+| State | What happens |
+|---|---|
+| RelayPlane running | `"default"` → auto-routing → optimal model per task |
+| RelayPlane down | `"default"` sent directly to Anthropic → Opus (Max) or Sonnet (Pro) |
+| Auto-routed model overloaded | Sonnet fallback fires automatically, logged as `[ALERT] Sonnet fallback used` |
+
+### Verification
+
+```bash
+# Confirm routing in logs after starting a session
+journalctl --user -u relayplane-proxy.service -n 20 | grep "default\|auto\|Sonnet fallback"
+```
+
+### Per-session override
+
+Use `/model` inside Claude Code to override for a specific session without changing settings:
+
+```
+/model opus        # force Opus for this session
+/model rp:fast     # force Haiku for this session
+/model default     # back to auto-routing
+```
+
 ## Routing Suffixes
 
 Append `:cost`, `:fast`, or `:quality` to any model name to hint at routing preference:

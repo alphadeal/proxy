@@ -295,40 +295,40 @@ export function resolveModelAlias(model: string): string {
 
 /**
  * Default routing based on task type
- * Uses Haiku 3.5 for cost optimization, upgrades based on learned rules
+ * Uses Haiku 4.5 as safe fallback (never use "latest" suffixes - Anthropic deprecated them)
  */
 const DEFAULT_ROUTING: Record<TaskType, { provider: Provider; model: string }> =
     {
         code_generation: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         code_review: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         summarization: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
-        analysis: { provider: "anthropic", model: "claude-3-5-haiku-latest" },
+        analysis: { provider: "anthropic", model: "claude-haiku-4-5-20251001" },
         creative_writing: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         data_extraction: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         translation: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
         question_answering: {
             provider: "anthropic",
-            model: "claude-3-5-haiku-latest",
+            model: "claude-haiku-4-5-20251001",
         },
-        general: { provider: "anthropic", model: "claude-3-5-haiku-latest" },
+        general: { provider: "anthropic", model: "claude-haiku-4-5-20251001" },
     };
 
 type RoutingSuffix = "cost" | "fast" | "quality";
@@ -573,6 +573,16 @@ interface RequestHistoryEntry {
 const requestHistory: RequestHistoryEntry[] = [];
 const MAX_HISTORY = 10000;
 const HISTORY_RETENTION_DAYS = 7;
+
+/** Model names that indicate proxy-routed (auto) requests vs direct user requests */
+const AUTO_ROUTING_MODELS = new Set([
+    "relayplane:auto", "relayplane:cost", "relayplane:fast", "relayplane:quality",
+    "rp:auto", "rp:balanced", "rp:best", "rp:fast", "rp:cheap",
+]);
+
+function isAutoRouted(originalModel: string): boolean {
+    return AUTO_ROUTING_MODELS.has(originalModel);
+}
 let requestIdCounter = 0;
 
 // --- Persistent history (JSONL) ---
@@ -1037,54 +1047,104 @@ function extractPromptText(messages: ChatRequest["messages"]): string {
         .join("\n");
 }
 
+function extractSingleMessageText(msg: { content?: unknown }): string {
+    const content = msg.content;
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+        return (content as Array<{ type?: string; text?: string }>)
+            .filter((c) => c.type === "text")
+            .map((c) => c.text ?? "")
+            .join(" ");
+    }
+    return "";
+}
+
 function extractMessageText(messages: Array<{ content?: unknown }>): string {
-    return messages
-        .map((msg) => {
-            const content = msg.content;
-            if (typeof content === "string") return content;
-            if (Array.isArray(content)) {
-                return content
-                    .map((c: unknown) => {
-                        const part = c as { type?: string; text?: string };
-                        return part.type === "text" ? (part.text ?? "") : "";
-                    })
-                    .join(" ");
-            }
-            return "";
-        })
-        .join(" ");
+    return messages.map(extractSingleMessageText).join(" ");
+}
+
+/**
+ * Find the last user message in the conversation.
+ * Claude Code alternates user/assistant messages; the last user message
+ * is the one that determines what we're actually being asked to do NOW.
+ * We look for the last message that has text content (not just tool_result).
+ */
+function findLastUserText(
+    messages: Array<{ content?: unknown; role?: string }>,
+): string {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        // Skip pure tool_result messages (assistant continuations)
+        const content = msg.content;
+        if (Array.isArray(content)) {
+            const hasText = (content as Array<{ type?: string }>).some(
+                (p) => p.type === "text",
+            );
+            const isOnlyToolResult =
+                !hasText &&
+                (content as Array<{ type?: string }>).every(
+                    (p) =>
+                        p.type === "tool_result" || p.type === "tool_use",
+                );
+            if (isOnlyToolResult) continue;
+        }
+        const text = extractSingleMessageText(msg);
+        if (text.trim().length > 0) return text;
+    }
+    return "";
 }
 
 export function classifyComplexity(
-    messages: Array<{ content?: unknown }>,
+    messages: Array<{ content?: unknown; role?: string }>,
     bodyTools?: unknown,
 ): Complexity {
-    const text = extractMessageText(messages).toLowerCase();
-    const tokens = Math.ceil(text.length / 4);
+    // Score the CURRENT turn, not the accumulated history.
+    // This prevents long sessions from always routing to Opus.
+    const currentText = findLastUserText(messages).toLowerCase();
+    const currentTokens = Math.ceil(currentText.length / 4);
 
     let score = 0;
 
-    // Message count — long agentic sessions are inherently complex
-    if (messages.length >= 6) score += 1;
-    if (messages.length >= 12) score += 2;
+    // --- Current-turn signals (what is the user asking NOW?) ---
 
-    if (/```/.test(text) || /function |class |const |let |import /.test(text))
+    // Code patterns in the current message.
+    // Note: 'let ' is intentionally excluded — it triggers false positives in
+    // natural language (e.g. "let me fix it") when scoring the current user
+    // message. 'const' and 'import' reliably signal code without the ambiguity.
+    if (
+        /```/.test(currentText) ||
+        /function |class |const |import /.test(currentText)
+    )
         score += 2;
-    if (/analyze|compare|evaluate|assess|review|audit/.test(text)) score += 1;
-    if (/calculate|compute|solve|equation|prove|derive/.test(text)) score += 2;
-    if (/first.*then|step \d|1\).*2\)|phase \d/.test(text)) score += 1;
-    if (tokens > 2000) score += 1;
-    if (tokens > 5000) score += 2;
-    if (tokens > 10000) score += 2;
+
+    // Analytical keywords
+    if (/analyze|compare|evaluate|assess|review|audit/.test(currentText))
+        score += 1;
+
+    // Computation keywords
+    if (/calculate|compute|solve|equation|prove|derive/.test(currentText))
+        score += 2;
+
+    // Multi-step instructions
+    if (/first.*then|step \d|1\).*2\)|phase \d/.test(currentText)) score += 1;
+
+    // Current message token size
+    if (currentTokens > 2000) score += 1;
+    if (currentTokens > 5000) score += 2;
+
+    // Creative/engineering keywords
     if (
         /write a (story|essay|article|report)|create a|design a|build a/.test(
-            text,
+            currentText,
         )
     )
         score += 1;
-    if (/refactor|migrate|architect|implement|integrate/.test(text)) score += 1;
+    if (/refactor|migrate|architect|implement|integrate/.test(currentText))
+        score += 1;
 
-    // Tool use: check body-level tools array, or tool_use/tool_result turns in messages
+    // --- Session-level signals (lightweight context from history) ---
+
+    // Tool presence: does this session involve tool use?
     const hasTools =
         Array.isArray(bodyTools) ||
         messages.some((m) => {
@@ -1098,8 +1158,22 @@ export function classifyComplexity(
         });
     if (hasTools) score += 2;
 
-    if (score >= 3) return "complex";
-    if (score >= 2) return "moderate";
+    // Recent tool activity: only count tool_results in the LAST 6 messages
+    // (the current agentic turn), not the entire conversation history.
+    const recentMessages = messages.slice(-6);
+    const recentToolResults = recentMessages.filter((m) => {
+        const c = m.content;
+        return (
+            Array.isArray(c) &&
+            (c as Array<{ type?: string }>).some(
+                (p) => p.type === "tool_result",
+            )
+        );
+    }).length;
+    if (recentToolResults >= 3) score += 1;
+
+    if (score >= 5) return "complex";
+    if (score >= 3) return "moderate";
     return "simple";
 }
 
@@ -3206,13 +3280,32 @@ table{width:100%;border-collapse:collapse;font-size:.85rem}
 th{text-align:left;color:#64748b;font-weight:500;padding:8px 12px;border-bottom:1px solid #1e293b;font-size:.75rem;text-transform:uppercase;letter-spacing:.04em}
 td{padding:8px 12px;border-bottom:1px solid #111318}
 .section{margin-bottom:32px}.section h2{font-size:1rem;font-weight:600;margin-bottom:12px;color:#94a3b8}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.dot.up{background:#34d399}.dot.down{background:#ef4444}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.dot.up{background:#34d399}.dot.down{background:#ef4444}.dot.idle{background:#64748b}.dot.degraded{background:#fbbf24}
 .badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.75rem;font-weight:500}
 .badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}
 .badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
 .badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
-@media(max-width:768px){.col-tt,.col-cx{display:none}}
-.prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
+.badge.rt-auto{background:#052e1633;color:#34d399}.badge.rt-direct{background:#1e293b;color:#94a3b8}
+.badge.auth-passthrough{background:#1e3a5f;color:#60a5fa}.badge.auth-auto{background:#2d1b52;color:#a78bfa}.badge.auth-apikey{background:#052e1633;color:#34d399}
+.col-rt .sub{font-size:.7rem;color:#64748b}
+@media(max-width:768px){.col-tt,.col-cx,.col-rt{display:none}}
+.prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;gap:8px;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
+.alerts{display:flex;flex-direction:column;gap:8px;margin-bottom:24px}
+.alert{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:8px;font-size:.85rem;line-height:1.4}
+.alert-high{background:#2d0a0a;border:1px solid #ef4444;color:#fca5a5}
+.alert-medium{background:#2d2a0a;border:1px solid #fbbf24;color:#fde68a}
+.alert-info{background:#0a1a2d;border:1px solid #3b82f6;color:#93c5fd}
+.alert-icon{font-size:1.1rem;flex-shrink:0}
+.alert-detail{color:#94a3b8;font-size:.8rem;margin-top:2px}
+.chart-container{background:#0d1117;border:1px solid #1e293b;border-radius:12px;padding:20px}
+.chart-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.chart-header h3{margin:0;font-size:.95rem;color:#e2e8f0}
+.chart-legend{display:flex;gap:16px;font-size:.75rem;color:#94a3b8}
+.chart-legend span{display:flex;align-items:center;gap:4px}
+.chart-legend .swatch{width:10px;height:10px;border-radius:2px;display:inline-block}
+.chart-tabs{display:flex;gap:4px;font-size:.75rem}
+.chart-tab{padding:4px 10px;border-radius:4px;cursor:pointer;border:1px solid #1e293b;background:transparent;color:#94a3b8}
+.chart-tab.active{background:#1e293b;color:#e2e8f0}
 </style></head><body>
 <div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><span id="ver"></span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
 <div class="cards">
@@ -3221,24 +3314,39 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
   <div class="card"><div class="label">Savings</div><div class="value green" id="savings">—</div></div>
   <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div></div>
 </div>
+<div class="alerts" id="alerts"></div>
+<div class="section">
+<div class="chart-container">
+<div class="chart-header">
+<h3>Usage &amp; Savings</h3>
+<div style="display:flex;gap:12px;align-items:center">
+<div class="chart-legend"><span><span class="swatch" style="background:#ef4444"></span>Baseline (Opus)</span><span><span class="swatch" style="background:#3b82f6"></span>Actual Cost</span><span><span class="swatch" style="background:#34d39966"></span>Saved</span></div>
+<div class="chart-tabs"><button class="chart-tab active" onclick="setChartView('hourly')">24h</button><button class="chart-tab" onclick="setChartView('daily')">Daily</button></div>
+</div>
+</div>
+<div id="chart"></div>
+</div>
+</div>
 <div class="section"><h2>Model Breakdown</h2>
-<table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
+<table><thead><tr><th>Model</th><th>Requests</th><th class="col-rt" title="Requests where the proxy chose this model via auto-routing">Auto</th><th class="col-rt" title="Requests where the client explicitly requested this model">Direct</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
 <div class="section"><h2>Recent Runs</h2>
-<table><thead><tr><th>Time</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
+<table><thead><tr><th>Time</th><th>Model</th><th class="col-rt">Source</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
 <script>
 const $ = id => document.getElementById(id);
 function fmt(n,d=2){return typeof n==='number'?n.toFixed(d):'-'}
 function fmtTime(s){const d=new Date(s);return d.toLocaleTimeString()}
 function dur(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'h '+m+'m':m+'m'}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 async function load(){
   try{
-    const [health,stats,runsR,sav,provH]=await Promise.all([
+    const [health,stats,runsR,sav,provH,ovr]=await Promise.all([
       fetch('/health').then(r=>r.json()),
       fetch('/v1/telemetry/stats').then(r=>r.json()),
       fetch('/v1/telemetry/runs?limit=20').then(r=>r.json()),
       fetch('/v1/telemetry/savings').then(r=>r.json()),
-      fetch('/v1/telemetry/health').then(r=>r.json())
+      fetch('/v1/telemetry/health').then(r=>r.json()),
+      fetch('/v1/telemetry/overrides').then(r=>r.json())
     ]);
     $('ver').textContent='v'+health.version;
     $('uptime').textContent=dur(health.uptime);
@@ -3248,17 +3356,93 @@ async function load(){
     $('avgLat').textContent=(stats.summary?.avgLatencyMs??0)+'ms';
     const total=stats.summary?.totalEvents||1;
     $('models').innerHTML=(stats.byModel||[]).map(m=>
-      '<tr><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(m.count/total*100,1)+'%</td></tr>'
-    ).join('')||'<tr><td colspan=4 style="color:#64748b">No data yet</td></tr>';
+      '<tr><td>'+esc(m.model)+'</td><td>'+m.count+'</td><td class="col-rt">'+m.autoCount+'</td><td class="col-rt">'+m.directCount+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(m.count/total*100,1)+'%</td></tr>'
+    ).join('')||'<tr><td colspan=6 style="color:#64748b">No data yet</td></tr>';
     function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
     function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
-    $('runs').innerHTML=(runsR.runs||[]).map(r=>
-      '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>'
-    ).join('')||'<tr><td colspan=9 style="color:#64748b">No runs yet</td></tr>';
-    $('providers').innerHTML=(provH.providers||[]).map(p=>
-      '<div class="prov-item"><span class="dot '+(p.status==='healthy'?'up':'down')+'"></span>'+p.provider+'</div>'
-    ).join('');
+    $('runs').innerHTML=(runsR.runs||[]).map(r=>{
+      const src=r.routingSource==='auto'?'auto':'direct';
+      const srcTip=src==='auto'?'Proxy selected this model via complexity routing (requested: '+esc(r.original_model)+')':'Client explicitly requested this model';
+      return '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+esc(r.model)+'</td><td class="col-rt"><span class="badge rt-'+src+'" title="'+srcTip+'">'+src+'</span></td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+esc((r.taskType||'general').replace(/_/g,' '))+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+esc(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+esc(r.status)+'</span></td></tr>';
+    }).join('')||'<tr><td colspan=10 style="color:#64748b">No runs yet</td></tr>';
+    const alerts=[];
+    (ovr.overrides||[]).forEach(o=>{
+      const icon=o.severity==='high'?'!!':o.severity==='medium'?'!':'i';
+      const pct=sav.total>0?Math.round(o.savingsLost/sav.total*100):0;
+      const detail=o.requestCount>0
+        ?o.requestCount+' requests affected · $'+fmt(o.costImpact,4)+' cost impact'+(pct>0?' · '+pct+'% of potential savings lost':'')
+        :'No requests affected yet';
+      alerts.push('<div class="alert alert-'+o.severity+'"><span class="alert-icon">'+icon+'</span><div><div>Override: <b>'+esc(o.from)+'</b> → <b>'+esc(o.to)+'</b></div><div class="alert-detail">'+detail+'</div></div></div>');
+    });
+    if(ovr.totalSavingsLost>0){
+      const lostPct=sav.total>0?Math.round(ovr.totalSavingsLost/sav.total*100):0;
+      alerts.unshift('<div class="alert alert-medium"><span class="alert-icon">!</span><div><div>Model overrides are reducing savings by <b>$'+fmt(ovr.totalSavingsLost,4)+'</b>'+(lostPct>0?' (<b>'+lostPct+'%</b> of potential savings)':'')+'</div><div class="alert-detail">'+ovr.totalOverriddenRequests+' total requests overridden · Review overrides in ~/.relayplane/config.json</div></div></div>');
+    }
+    $('alerts').innerHTML=alerts.join('');
+    $('providers').innerHTML=(provH.providers||[]).map(p=>{
+      const cls=p.status==='healthy'?'up':p.status==='degraded'?'degraded':p.status==='idle'?'idle':'down';
+      const authBadge=p.authMode==='passthrough'
+        ?'<span class="badge auth-passthrough" title="OAuth token always forwarded from client — no API key needed">passthrough</span>'
+        :p.authMode==='auto'
+        ?'<span class="badge auth-auto" title="OAuth passthrough when client provides token; falls back to API key env var">auto</span>'
+        :p.authMode==='api-key'
+        ?'<span class="badge auth-apikey" title="Authenticated via API key environment variable">API key</span>'
+        :'';
+      const tip=p.latency>0?p.provider+' · '+p.latency+'ms avg · '+(Math.round(p.successRate*100))+'% success rate':p.provider;
+      return '<div class="prov-item" title="'+tip+'"><span class="dot '+cls+'"></span>'+p.provider+authBadge+'</div>';
+    }).join('');
+    renderChart(sav);
   }catch(e){console.error(e)}
+}
+let chartView='hourly';
+function setChartView(v){
+  chartView=v;
+  document.querySelectorAll('.chart-tab').forEach(b=>b.classList.toggle('active',b.textContent===(v==='hourly'?'24h':'Daily')));
+  load();
+}
+function renderChart(sav){
+  const data=chartView==='hourly'?(sav.byHour||[]):(sav.byDay||[]);
+  if(!data.length){$('chart').innerHTML='<div style="color:#64748b;text-align:center;padding:40px">No data yet</div>';return;}
+  const W=800,H=200,pad={t:10,r:16,b:28,l:50};
+  const cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;
+  const maxVal=Math.max(...data.map(d=>d.originalCost||0),0.001);
+  const barW=Math.max(4,Math.min(40,cw/data.length-2));
+  const gap=(cw-barW*data.length)/(data.length+1);
+  function y(v){return pad.t+ch-(v/maxVal)*ch}
+  function x(i){return pad.l+gap+(barW+gap)*i}
+  let svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto">';
+  // Grid lines
+  const gridLines=4;
+  for(let i=0;i<=gridLines;i++){
+    const yp=pad.t+(ch/gridLines)*i;
+    const val=maxVal*(1-i/gridLines);
+    svg+='<line x1="'+pad.l+'" y1="'+yp+'" x2="'+(W-pad.r)+'" y2="'+yp+'" stroke="#1e293b" stroke-width="1"/>';
+    svg+='<text x="'+(pad.l-6)+'" y="'+(yp+4)+'" fill="#64748b" font-size="9" text-anchor="end">$'+val.toFixed(2)+'</text>';
+  }
+  // Bars
+  data.forEach((d,i)=>{
+    const bx=x(i);
+    const origH=((d.originalCost||0)/maxVal)*ch;
+    const actH=((d.actualCost||0)/maxVal)*ch;
+    const savedH=origH-actH;
+    // Baseline (Opus) bar — full height, red
+    svg+='<rect x="'+bx+'" y="'+(pad.t+ch-origH)+'" width="'+barW+'" height="'+origH+'" fill="#ef444433" rx="2"/>';
+    // Saved area — the gap between baseline and actual
+    if(savedH>0) svg+='<rect x="'+bx+'" y="'+(pad.t+ch-origH)+'" width="'+barW+'" height="'+savedH+'" fill="#34d39944" rx="2"/>';
+    // Actual cost bar — blue
+    svg+='<rect x="'+bx+'" y="'+(pad.t+ch-actH)+'" width="'+barW+'" height="'+Math.max(actH,0.5)+'" fill="#3b82f6" rx="2"/>';
+    // Tooltip area
+    svg+='<rect x="'+bx+'" y="'+pad.t+'" width="'+barW+'" height="'+ch+'" fill="transparent" opacity="0">';
+    svg+='<title>'+(d.label||d.date)+'\\nBaseline: $'+(d.originalCost||0).toFixed(4)+'\\nActual: $'+(d.actualCost||0).toFixed(4)+'\\nSaved: $'+(d.saved||d.savedAmount||0).toFixed(4);
+    if(d.requests) svg+='\\nRequests: '+d.requests;
+    svg+='</title></rect>';
+    // X-axis label
+    const label=chartView==='hourly'?(d.label||''):(d.date||'').slice(5);
+    const showLabel=data.length<=12||i%Math.ceil(data.length/12)===0;
+    if(showLabel) svg+='<text x="'+(bx+barW/2)+'" y="'+(H-4)+'" fill="#64748b" font-size="9" text-anchor="middle">'+label+'</text>';
+  });
+  svg+='</svg>';
+  $('chart').innerHTML=svg;
 }
 load();setInterval(load,5000);
 </script></body></html>`;
@@ -3476,6 +3660,12 @@ export async function startProxy(
 
         // === Telemetry endpoints for dashboard ===
         if (pathname.startsWith("/v1/telemetry/")) {
+            // Security note: these endpoints are intentionally unauthenticated.
+            // The proxy binds to 127.0.0.1 by default, making the network
+            // boundary (localhost-only) the security perimeter. If you expose
+            // the proxy on a non-loopback interface (--host 0.0.0.0), you MUST
+            // add your own authentication layer (e.g. a reverse proxy with auth)
+            // before these endpoints in production.
             const telemetryPath = pathname.replace("/v1/telemetry/", "");
             const queryString = url.includes("?")
                 ? (url.split("?")[1] ?? "")
@@ -3489,16 +3679,21 @@ export async function startProxy(
                     (r) => new Date(r.timestamp).getTime() >= cutoff,
                 );
 
-                // Model breakdown
+                // Model breakdown with auto vs direct split
                 const modelMap = new Map<
                     string,
-                    { count: number; cost: number }
+                    { count: number; cost: number; autoCount: number; directCount: number }
                 >();
                 for (const r of recent) {
                     const key = r.targetModel;
-                    const cur = modelMap.get(key) || { count: 0, cost: 0 };
+                    const cur = modelMap.get(key) || { count: 0, cost: 0, autoCount: 0, directCount: 0 };
                     cur.count++;
                     cur.cost += r.costUsd;
+                    if (isAutoRouted(r.originalModel)) {
+                        cur.autoCount++;
+                    } else {
+                        cur.directCount++;
+                    }
                     modelMap.set(key, cur);
                 }
 
@@ -3538,6 +3733,8 @@ export async function startProxy(
                             model,
                             count: v.count,
                             costUsd: v.cost,
+                            autoCount: v.autoCount,
+                            directCount: v.directCount,
                             savings: 0,
                         }),
                     ),
@@ -3559,8 +3756,11 @@ export async function startProxy(
                 const offset = parseInt(params.get("offset") || "0", 10);
                 const sorted = [...requestHistory].reverse();
                 const runs = sorted.slice(offset, offset + limit).map((r) => {
+                    const baseline = isAutoRouted(r.originalModel)
+                        ? "claude-opus-4-6"
+                        : r.originalModel;
                     const origCost = estimateCost(
-                        r.originalModel,
+                        baseline,
                         r.tokensIn,
                         r.tokensOut,
                     );
@@ -3572,11 +3772,12 @@ export async function startProxy(
                         status: r.success ? "success" : "error",
                         success: r.success,
                         started_at: r.timestamp,
-                        timestamp: r.timestamp, // used by the run detail view
+                        timestamp: r.timestamp,
                         model: r.targetModel,
-                        provider: r.provider, // used by the run detail view
+                        provider: r.provider,
                         routed_to: `${r.provider}/${r.targetModel}`,
                         original_model: r.originalModel,
+                        routingSource: isAutoRouted(r.originalModel) ? "auto" : "direct",
                         taskType: r.taskType || "general",
                         complexity: r.complexity || "simple",
                         costUsd: r.costUsd,
@@ -3598,9 +3799,12 @@ export async function startProxy(
             }
 
             if (req.method === "GET" && telemetryPath === "savings") {
-                // Savings = cost(original requested model) - cost(actual routed-to model)
-                // If no routing happened (same model) → savings = 0
-                // Uses actual token counts from the response, so zeroed tokens produce zero savings.
+                // Savings = cost(baseline model) - cost(actual routed-to model)
+                // For auto-routing aliases, the baseline is the most capable model
+                // the user would need without smart routing (Opus).
+                // For direct model requests, the baseline is the requested model itself.
+                const BASELINE_MODEL = "claude-opus-4-6";
+
                 let totalOriginalCost = 0;
                 let totalActualCost = 0;
                 let totalSavedAmount = 0;
@@ -3614,8 +3818,11 @@ export async function startProxy(
                 >();
 
                 for (const r of requestHistory) {
+                    const baselineModel = isAutoRouted(r.originalModel)
+                        ? BASELINE_MODEL
+                        : r.originalModel;
                     const origCost = estimateCost(
-                        r.originalModel,
+                        baselineModel,
                         r.tokensIn,
                         r.tokensOut,
                     );
@@ -3648,6 +3855,51 @@ export async function startProxy(
                         actualCost: Math.round(v.actualCost * 10000) / 10000,
                     }));
 
+                // Hourly breakdown for last 24 hours
+                const now = Date.now();
+                const h24ago = now - 86400000;
+                const byHourMap = new Map<
+                    string,
+                    { requests: number; actualCost: number; originalCost: number }
+                >();
+                for (const r of requestHistory) {
+                    const ts = new Date(r.timestamp).getTime();
+                    if (ts < h24ago) continue;
+                    const hourKey = r.timestamp.slice(0, 13); // "2026-02-26T14"
+                    const bucket = byHourMap.get(hourKey) || {
+                        requests: 0,
+                        actualCost: 0,
+                        originalCost: 0,
+                    };
+                    bucket.requests++;
+                    bucket.actualCost += r.costUsd;
+                    const baseM = isAutoRouted(r.originalModel)
+                        ? BASELINE_MODEL
+                        : r.originalModel;
+                    bucket.originalCost += estimateCost(
+                        baseM,
+                        r.tokensIn,
+                        r.tokensOut,
+                    );
+                    byHourMap.set(hourKey, bucket);
+                }
+                const byHour = Array.from(byHourMap.entries())
+                    .sort((a, b) => a[0].localeCompare(b[0]))
+                    .map(([hour, v]) => ({
+                        hour,
+                        label: hour.slice(11) + ":00",
+                        requests: v.requests,
+                        actualCost:
+                            Math.round(v.actualCost * 10000) / 10000,
+                        originalCost:
+                            Math.round(v.originalCost * 10000) / 10000,
+                        saved:
+                            Math.round(
+                                Math.max(0, v.originalCost - v.actualCost) *
+                                    10000,
+                            ) / 10000,
+                    }));
+
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(
                     JSON.stringify({
@@ -3666,31 +3918,156 @@ export async function startProxy(
                                   )
                                 : 0,
                         byDay,
+                        byHour,
                     }),
                 );
                 return;
             }
 
             if (req.method === "GET" && telemetryPath === "health") {
+                const recentWindow = Date.now() - 3600000; // last hour
                 const providers: Array<{
                     provider: string;
                     status: string;
+                    authMode: "passthrough" | "auto" | "api-key" | "none";
                     latency: number;
                     successRate: number;
                     lastChecked: string;
                 }> = [];
                 for (const [name, ep] of Object.entries(DEFAULT_ENDPOINTS)) {
                     const hasKey = !!process.env[ep.apiKeyEnv];
+                    const hasPassthrough =
+                        name === "anthropic" &&
+                        anthropicAuthMode !== "env";
+                    const recentRequests = requestHistory.filter(
+                        (r) =>
+                            r.provider === name &&
+                            new Date(r.timestamp).getTime() > recentWindow,
+                    );
+                    const successCount = recentRequests.filter(
+                        (r) => r.success,
+                    ).length;
+                    const totalCount = recentRequests.length;
+                    const successRate =
+                        totalCount > 0 ? successCount / totalCount : 0;
+                    const avgLatency =
+                        totalCount > 0
+                            ? Math.round(
+                                  recentRequests.reduce(
+                                      (sum, r) => sum + r.latencyMs,
+                                      0,
+                                  ) / totalCount,
+                              )
+                            : 0;
+
+                    let status: string;
+                    if (totalCount > 0 && successRate > 0.5) {
+                        status = "healthy";
+                    } else if (totalCount > 0 && successRate > 0) {
+                        status = "degraded";
+                    } else if (totalCount > 0) {
+                        status = "down";
+                    } else if (hasKey || hasPassthrough) {
+                        status = "idle";
+                    } else {
+                        status = "unconfigured";
+                    }
+
+                    // Distinguish the three Anthropic auth modes:
+                    // "passthrough" — client OAuth token always forwarded (no env key needed)
+                    // "auto"        — passthrough when client provides token, env key as fallback
+                    // "api-key"     — always use ANTHROPIC_API_KEY env var
+                    const authMode: "passthrough" | "auto" | "api-key" | "none" =
+                        name !== "anthropic"
+                            ? hasKey
+                                ? "api-key"
+                                : "none"
+                            : anthropicAuthMode === "passthrough"
+                              ? "passthrough"
+                              : anthropicAuthMode === "auto"
+                                ? "auto"
+                                : hasKey
+                                  ? "api-key"
+                                  : "none";
                     providers.push({
                         provider: name,
-                        status: hasKey ? "healthy" : "down",
-                        latency: 0,
-                        successRate: hasKey ? 1 : 0,
+                        status,
+                        authMode,
+                        latency: avgLatency,
+                        successRate:
+                            Math.round(successRate * 10000) / 10000,
                         lastChecked: new Date().toISOString(),
                     });
                 }
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify({ providers }));
+                return;
+            }
+
+            if (req.method === "GET" && telemetryPath === "overrides") {
+                const overrides = proxyConfig.modelOverrides ?? {};
+                const entries = Object.entries(overrides);
+                const warnings: Array<{
+                    from: string;
+                    to: string;
+                    requestCount: number;
+                    costImpact: number;
+                    savingsLost: number;
+                    severity: string;
+                }> = [];
+
+                for (const [from, to] of entries) {
+                    const affected = requestHistory.filter(
+                        (r) => r.originalModel === from,
+                    );
+                    const requestCount = affected.length;
+                    const fromCost = affected.reduce(
+                        (sum, r) =>
+                            sum + estimateCost(from, r.tokensIn, r.tokensOut),
+                        0,
+                    );
+                    const toCost = affected.reduce(
+                        (sum, r) =>
+                            sum + estimateCost(to, r.tokensIn, r.tokensOut),
+                        0,
+                    );
+                    const costImpact =
+                        Math.round((toCost - fromCost) * 10000) / 10000;
+                    const savingsLost =
+                        Math.round(Math.max(0, costImpact) * 10000) / 10000;
+                    const severity =
+                        savingsLost > 1
+                            ? "high"
+                            : savingsLost > 0
+                              ? "medium"
+                              : "info";
+                    warnings.push({
+                        from,
+                        to,
+                        requestCount,
+                        costImpact,
+                        savingsLost,
+                        severity,
+                    });
+                }
+
+                const totalSavingsLost = warnings.reduce(
+                    (sum, w) => sum + w.savingsLost,
+                    0,
+                );
+                const totalOverriddenRequests = warnings.reduce(
+                    (sum, w) => sum + w.requestCount,
+                    0,
+                );
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(
+                    JSON.stringify({
+                        overrides: warnings,
+                        totalSavingsLost:
+                            Math.round(totalSavingsLost * 10000) / 10000,
+                        totalOverriddenRequests,
+                    }),
+                );
                 return;
             }
 
@@ -3787,16 +4164,21 @@ export async function startProxy(
 
             let routingSuffix: RoutingSuffix | null = null;
             if (!profileMatch) {
+                // Track annotated model name (e.g. claude-opus-4-6[1m]) before
+                // parseModelSuffix strips the annotation, so config overrides for
+                // annotated variants take priority over base-model overrides.
+                const preStripModel = requestedModel;
                 const parsedModel = parseModelSuffix(requestedModel);
                 routingSuffix = parsedModel.suffix;
                 requestedModel = parsedModel.baseModel;
 
                 if (relayplaneEnabled && !relayplaneBypass && requestedModel) {
                     const override =
+                        proxyConfig.modelOverrides?.[preStripModel] ??
                         proxyConfig.modelOverrides?.[requestedModel];
                     if (override) {
                         log(
-                            `Model override: ${requestedModel} → ${override}`,
+                            `Model override: ${preStripModel} → ${override}`,
                         );
                         const overrideParsed = parseModelSuffix(override);
                         if (!routingSuffix && overrideParsed.suffix) {
@@ -3867,12 +4249,24 @@ export async function startProxy(
                 ) {
                     routingMode = "quality";
                 } else {
-                    // rp:balanced and others go through passthrough to resolve via SMART_ALIASES
-                    routingMode = "passthrough";
+                    // rp:balanced reached here via alias resolution of relayplane:auto/rp:auto.
+                    // Recover the original auto-routing intent rather than hardcoding passthrough.
+                    const preAliasModel = originalModel ?? "";
+                    if (
+                        preAliasModel === "relayplane:auto" ||
+                        preAliasModel === "rp:auto" ||
+                        preAliasModel === "auto" ||
+                        preAliasModel === "default"
+                    ) {
+                        routingMode = "auto";
+                    } else {
+                        routingMode = "passthrough";
+                    }
                 }
             } else if (
                 requestedModel === "auto" ||
-                requestedModel === "relayplane:auto"
+                requestedModel === "relayplane:auto" ||
+                requestedModel === "default"
             ) {
                 routingMode = "auto";
             } else if (requestedModel === "cost") {
@@ -3882,7 +4276,16 @@ export async function startProxy(
             } else if (requestedModel === "quality") {
                 routingMode = "quality";
             } else {
-                routingMode = "passthrough";
+                // Check if model is valid before passthrough
+                // Invalid models trigger auto mode with sonnet fallback
+                const modelResolved = resolveExplicitModel(requestedModel);
+                if (!modelResolved || (modelResolved.provider === "anthropic" && requestedModel.includes("latest"))) {
+                    log(`Invalid model "${requestedModel}" detected, switching to auto mode with fallback`);
+                    routingMode = "auto";
+                    requestedModel = "claude-sonnet-4-6";
+                } else {
+                    routingMode = "passthrough";
+                }
             }
 
             const isStreaming = requestBody["stream"] === true;
@@ -3982,7 +4385,7 @@ export async function startProxy(
                 }
                 targetProvider = resolved.provider;
                 targetModel = resolved.model;
-            } else if (!useCascade) {
+            } else if (!useCascade && !targetModel) {
                 let selectedModel: string | null = null;
                 if (routingMode === "alphadeal") {
                     // AlphaDeal: OpenAI complexity-based routing
@@ -4000,6 +4403,12 @@ export async function startProxy(
                     selectedModel = getFastModel(proxyConfig);
                 } else if (routingMode === "quality") {
                     selectedModel = getQualityModel(proxyConfig);
+                } else if (proxyConfig.routing?.complexity?.enabled) {
+                    // Complexity routing takes priority over relay learned rules,
+                    // which may reference deprecated models (e.g. claude-3-5-haiku-latest)
+                    const complexityModel =
+                        proxyConfig.routing?.complexity?.[complexity];
+                    selectedModel = complexityModel ?? null;
                 } else {
                     const rule = relay.routing.get(taskType);
                     const parsedRule = rule?.preferredModel
@@ -4007,10 +4416,6 @@ export async function startProxy(
                         : null;
                     if (parsedRule?.provider === "anthropic") {
                         selectedModel = parsedRule.model;
-                    } else if (proxyConfig.routing?.complexity?.enabled) {
-                        const complexityModel =
-                            proxyConfig.routing?.complexity?.[complexity];
-                        selectedModel = complexityModel ?? null;
                     } else {
                         selectedModel = DEFAULT_ROUTING[taskType].model;
                     }
@@ -4201,6 +4606,248 @@ export async function startProxy(
                                 string,
                                 unknown
                             >;
+                        log(`Anthropic error [${providerResponse.status}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`);
+
+                        // TODO: The long-context fallback below and the Sonnet fallback
+                        // further down share identical request-forwarding and response-
+                        // handling logic. Extract a shared helper (e.g. retryWithModel())
+                        // to reduce duplication — tracked in
+                        // https://github.com/alphadeal/proxy/issues/6
+                        //
+                        // Long-context fallback: if a downgraded model is rejected with
+                        // "Extra usage is required for long context requests", retry using
+                        // the original requested model which has extra usage enabled.
+                        const errorObj = errorPayload.error as
+                            | Record<string, unknown>
+                            | undefined;
+                        const isLongContextError =
+                            providerResponse.status === 429 &&
+                            errorObj?.type === "rate_limit_error" &&
+                            typeof errorObj?.message === "string" &&
+                            (errorObj.message as string).includes(
+                                "Extra usage",
+                            );
+                        const wasDowngraded =
+                            originalModel &&
+                            originalModel !==
+                                (targetModel || requestedModel);
+
+                        if (isLongContextError && wasDowngraded) {
+                            log(
+                                `[ALERT] Long-context fallback: downgraded model ${targetModel || requestedModel} rejected. Retrying with original model: ${originalModel}`,
+                            );
+                            const fallbackResolved =
+                                resolveExplicitModel(originalModel!);
+                            if (
+                                fallbackResolved?.provider === "anthropic"
+                            ) {
+                                const fallbackAuth = getAuthForModel(
+                                    fallbackResolved.model,
+                                    proxyConfig.auth,
+                                    useAnthropicEnvKey,
+                                );
+                                const fallbackResponse =
+                                    await forwardNativeAnthropicRequest(
+                                        stripThinkingIfUnsupported(
+                                            {
+                                                ...requestBody,
+                                                model: fallbackResolved.model,
+                                            },
+                                            fallbackResolved.model,
+                                        ),
+                                        ctx,
+                                        fallbackAuth.apiKey,
+                                        fallbackAuth.isMax,
+                                    );
+                                if (fallbackResponse.ok) {
+                                    targetModel = fallbackResolved.model;
+                                    const durationMs =
+                                        Date.now() - startTime;
+                                    if (isStreaming) {
+                                        res.writeHead(
+                                            fallbackResponse.status,
+                                            {
+                                                "Content-Type":
+                                                    "text/event-stream",
+                                                "Cache-Control": "no-cache",
+                                                Connection: "keep-alive",
+                                            },
+                                        );
+                                        const reader =
+                                            fallbackResponse.body?.getReader();
+                                        if (reader) {
+                                            const decoder = new TextDecoder();
+                                            while (true) {
+                                                const { done, value } =
+                                                    await reader.read();
+                                                if (done) break;
+                                                res.write(
+                                                    decoder.decode(value, {
+                                                        stream: true,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                        res.end();
+                                    } else {
+                                        const fallbackData =
+                                            (await fallbackResponse.json()) as Record<
+                                                string,
+                                                unknown
+                                            >;
+                                        res.writeHead(
+                                            fallbackResponse.status,
+                                            {
+                                                "Content-Type":
+                                                    "application/json",
+                                            },
+                                        );
+                                        res.end(
+                                            JSON.stringify(fallbackData),
+                                        );
+                                    }
+                                    logRequest(
+                                        originalModel ?? "unknown",
+                                        targetModel,
+                                        targetProvider,
+                                        durationMs,
+                                        true,
+                                        "passthrough",
+                                        undefined,
+                                        taskType,
+                                        complexity,
+                                    );
+                                    return;
+                                } else {
+                                    const fallbackErrPayload =
+                                        (await fallbackResponse
+                                            .json()
+                                            .catch(() => ({}))) as Record<
+                                            string,
+                                            unknown
+                                        >;
+                                    log(
+                                        `[ALERT] Fallback to ${fallbackResolved.model} also failed [${fallbackResponse.status}]: ${JSON.stringify(fallbackErrPayload)}`,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Sonnet fallback: when a non-passthrough routing decision
+                        // fails with a rate-limit or overload error, retry once
+                        // with claude-sonnet-4-6 before surfacing the error.
+                        const SONNET_FALLBACK_MODEL = "claude-sonnet-4-6";
+                        const isFallbackTriggerStatus = [
+                            429, 500, 503, 529,
+                        ].includes(providerResponse.status);
+                        const isAlreadySonnet =
+                            finalModel === SONNET_FALLBACK_MODEL;
+                        const isNonPassthrough =
+                            routingMode !== "passthrough";
+
+                        if (
+                            isFallbackTriggerStatus &&
+                            isNonPassthrough &&
+                            !isAlreadySonnet &&
+                            !isLongContextError
+                        ) {
+                            log(
+                                `[ALERT] Sonnet fallback: model ${finalModel} failed [${providerResponse.status}]. Retrying with ${SONNET_FALLBACK_MODEL}`,
+                            );
+                            const sonnetResolved =
+                                resolveExplicitModel(SONNET_FALLBACK_MODEL);
+                            if (sonnetResolved?.provider === "anthropic") {
+                                const sonnetAuth = getAuthForModel(
+                                    sonnetResolved.model,
+                                    proxyConfig.auth,
+                                    useAnthropicEnvKey,
+                                );
+                                const sonnetResponse =
+                                    await forwardNativeAnthropicRequest(
+                                        stripThinkingIfUnsupported(
+                                            {
+                                                ...requestBody,
+                                                model: sonnetResolved.model,
+                                            },
+                                            sonnetResolved.model,
+                                        ),
+                                        ctx,
+                                        sonnetAuth.apiKey,
+                                        sonnetAuth.isMax,
+                                    );
+                                if (sonnetResponse.ok) {
+                                    targetModel = sonnetResolved.model;
+                                    const durationMs =
+                                        Date.now() - startTime;
+                                    if (isStreaming) {
+                                        res.writeHead(
+                                            sonnetResponse.status,
+                                            {
+                                                "Content-Type":
+                                                    "text/event-stream",
+                                                "Cache-Control": "no-cache",
+                                                Connection: "keep-alive",
+                                            },
+                                        );
+                                        const reader =
+                                            sonnetResponse.body?.getReader();
+                                        if (reader) {
+                                            const decoder = new TextDecoder();
+                                            while (true) {
+                                                const { done, value } =
+                                                    await reader.read();
+                                                if (done) break;
+                                                res.write(
+                                                    decoder.decode(value, {
+                                                        stream: true,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                        res.end();
+                                    } else {
+                                        const sonnetData =
+                                            (await sonnetResponse.json()) as Record<
+                                                string,
+                                                unknown
+                                            >;
+                                        res.writeHead(
+                                            sonnetResponse.status,
+                                            {
+                                                "Content-Type":
+                                                    "application/json",
+                                            },
+                                        );
+                                        res.end(
+                                            JSON.stringify(sonnetData),
+                                        );
+                                    }
+                                    logRequest(
+                                        originalModel ?? "unknown",
+                                        targetModel,
+                                        targetProvider,
+                                        durationMs,
+                                        true,
+                                        "passthrough",
+                                        undefined,
+                                        taskType,
+                                        complexity,
+                                    );
+                                    return;
+                                } else {
+                                    const sonnetErrPayload =
+                                        (await sonnetResponse
+                                            .json()
+                                            .catch(
+                                                () => ({}),
+                                            )) as Record<string, unknown>;
+                                    log(
+                                        `[ALERT] Sonnet fallback also failed [${sonnetResponse.status}]: ${JSON.stringify(sonnetErrPayload)}`,
+                                    );
+                                }
+                            }
+                        }
+
                         if (proxyConfig.reliability?.cooldowns?.enabled) {
                             cooldownManager.recordFailure(
                                 targetProvider,
@@ -4463,7 +5110,10 @@ export async function startProxy(
         }
 
         // === Model list endpoint ===
+        // Proxies the real Anthropic model list and prepends RelayPlane routing aliases
+        // so Claude Code's model picker shows both native Claude models and relayplane:auto etc.
         if (req.method === "GET" && url.includes("/models")) {
+            // Build profile model entries from named routing profiles in config
             const profileModels = Object.keys(
                 proxyConfig.profiles ?? {},
             ).flatMap((name) => [
@@ -4472,33 +5122,19 @@ export async function startProxy(
                 { id: `${name}:fast`, object: "model", owned_by: name },
                 { id: `${name}:quality`, object: "model", owned_by: name },
             ]);
+            const relayplaneModels = [
+                { id: "relayplane:auto", object: "model", owned_by: "relayplane" },
+                { id: "relayplane:cost", object: "model", owned_by: "relayplane" },
+                { id: "relayplane:fast", object: "model", owned_by: "relayplane" },
+                { id: "relayplane:quality", object: "model", owned_by: "relayplane" },
+                ...profileModels,
+            ];
+
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
                 JSON.stringify({
                     object: "list",
-                    data: [
-                        {
-                            id: "relayplane:auto",
-                            object: "model",
-                            owned_by: "relayplane",
-                        },
-                        {
-                            id: "relayplane:cost",
-                            object: "model",
-                            owned_by: "relayplane",
-                        },
-                        {
-                            id: "relayplane:fast",
-                            object: "model",
-                            owned_by: "relayplane",
-                        },
-                        {
-                            id: "relayplane:quality",
-                            object: "model",
-                            owned_by: "relayplane",
-                        },
-                        ...profileModels,
-                    ],
+                    data: relayplaneModels,
                 }),
             );
             return;
@@ -4580,16 +5216,18 @@ export async function startProxy(
 
         let routingSuffix: RoutingSuffix | null = null;
         if (!profileMatch) {
+            const preStripModel = requestedModel;
             const parsedModel = parseModelSuffix(requestedModel);
             routingSuffix = parsedModel.suffix;
             requestedModel = parsedModel.baseModel;
 
             if (!bypassRouting) {
                 const override =
+                    proxyConfig.modelOverrides?.[preStripModel] ??
                     proxyConfig.modelOverrides?.[requestedModel];
                 if (override) {
                     log(
-                        `Model override: ${requestedModel} → ${override}`,
+                        `Model override: ${preStripModel} → ${override}`,
                     );
                     const overrideParsed = parseModelSuffix(override);
                     if (!routingSuffix && overrideParsed.suffix) {
@@ -4656,12 +5294,24 @@ export async function startProxy(
             ) {
                 routingMode = "quality";
             } else {
-                // rp:balanced and others go through passthrough to resolve via SMART_ALIASES
-                routingMode = "passthrough";
+                // rp:balanced reached here via alias resolution of relayplane:auto/rp:auto.
+                // Recover the original auto-routing intent rather than hardcoding passthrough.
+                const preAliasModel = originalRequestedModel ?? "";
+                if (
+                    preAliasModel === "relayplane:auto" ||
+                    preAliasModel === "rp:auto" ||
+                    preAliasModel === "auto" ||
+                    preAliasModel === "default"
+                ) {
+                    routingMode = "auto";
+                } else {
+                    routingMode = "passthrough";
+                }
             }
         } else if (
             requestedModel === "auto" ||
-            requestedModel === "relayplane:auto"
+            requestedModel === "relayplane:auto" ||
+            requestedModel === "default"
         ) {
             routingMode = "auto";
         } else if (requestedModel === "cost") {
@@ -4671,7 +5321,16 @@ export async function startProxy(
         } else if (requestedModel === "quality") {
             routingMode = "quality";
         } else {
-            routingMode = "passthrough";
+            // Check if model is valid before passthrough
+            // Invalid models trigger auto mode with sonnet fallback
+            const modelResolved = resolveExplicitModel(requestedModel);
+            if (!modelResolved || (modelResolved.provider === "anthropic" && requestedModel.includes("latest"))) {
+                log(`Invalid model "${requestedModel}" detected, switching to auto mode with fallback`);
+                routingMode = "auto";
+                requestedModel = "claude-sonnet-4-6";
+            } else {
+                routingMode = "passthrough";
+            }
         }
 
         log(
@@ -4702,12 +5361,13 @@ export async function startProxy(
 
         if (useCascade && isStreaming) {
             log(
-                "Cascade disabled for streaming request; using first cascade model",
+                "Cascade disabled for streaming request; using complexity-based routing",
             );
             useCascade = false;
-            const fallbackModel =
-                getCascadeModels(proxyConfig)[0] || getCostModel(proxyConfig);
-            const resolvedFallback = resolveConfigModel(fallbackModel);
+            const streamingModel = proxyConfig.routing?.complexity?.enabled
+                ? proxyConfig.routing.complexity[complexity]
+                : getCascadeModels(proxyConfig)[0] || getCostModel(proxyConfig);
+            const resolvedFallback = resolveConfigModel(streamingModel);
             if (resolvedFallback) {
                 targetProvider = resolvedFallback.provider;
                 targetModel = resolvedFallback.model;
@@ -4771,7 +5431,7 @@ export async function startProxy(
                 }
                 return;
             }
-        } else if (!useCascade) {
+        } else if (!useCascade && !targetModel) {
             let selectedModel: string | null = null;
             if (routingMode === "alphadeal") {
                 // AlphaDeal: OpenAI complexity-based routing for underwriting/analysis
@@ -4789,6 +5449,12 @@ export async function startProxy(
                 selectedModel = getFastModel(proxyConfig);
             } else if (routingMode === "quality") {
                 selectedModel = getQualityModel(proxyConfig);
+            } else if (proxyConfig.routing?.complexity?.enabled) {
+                // Complexity routing takes priority over relay learned rules,
+                // which may reference deprecated models (e.g. claude-3-5-haiku-latest)
+                const complexityModel =
+                    proxyConfig.routing?.complexity?.[complexity];
+                selectedModel = complexityModel ?? null;
             } else {
                 const rule = relay.routing.get(taskType);
                 if (rule && rule.preferredModel) {
@@ -4800,13 +5466,7 @@ export async function startProxy(
                     }
                 }
                 if (!targetModel) {
-                    if (proxyConfig.routing?.complexity?.enabled) {
-                        const complexityModel =
-                            proxyConfig.routing?.complexity?.[complexity];
-                        selectedModel = complexityModel ?? null;
-                    } else {
-                        selectedModel = DEFAULT_ROUTING[taskType].model;
-                    }
+                    selectedModel = DEFAULT_ROUTING[taskType].model;
                 }
             }
 

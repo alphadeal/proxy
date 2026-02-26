@@ -39,10 +39,11 @@ describe('SMART_ALIASES', () => {
   });
 
   it('should point to existing models', () => {
-    // Verify model names are valid API model IDs
-    expect(SMART_ALIASES['rp:best'].model).toMatch(/claude-.*-\d{8}$/);
-    expect(SMART_ALIASES['rp:fast'].model).toMatch(/claude-.*-\d{8}$/);
-    expect(SMART_ALIASES['rp:balanced'].model).toMatch(/claude-.*-\d{8}$/);
+    // Model IDs can be date-suffixed (claude-sonnet-4-20250514) or versioned (claude-opus-4-6)
+    const validModelPattern = /^claude-[\w-]+$/;
+    expect(SMART_ALIASES['rp:best'].model).toMatch(validModelPattern);
+    expect(SMART_ALIASES['rp:fast'].model).toMatch(validModelPattern);
+    expect(SMART_ALIASES['rp:balanced'].model).toMatch(validModelPattern);
   });
 });
 
