@@ -2703,6 +2703,15 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 .alert-info{background:#0a1a2d;border:1px solid #3b82f6;color:#93c5fd}
 .alert-icon{font-size:1.1rem;flex-shrink:0}
 .alert-detail{color:#94a3b8;font-size:.8rem;margin-top:2px}
+.chart-container{background:#0d1117;border:1px solid #1e293b;border-radius:12px;padding:20px}
+.chart-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.chart-header h3{margin:0;font-size:.95rem;color:#e2e8f0}
+.chart-legend{display:flex;gap:16px;font-size:.75rem;color:#94a3b8}
+.chart-legend span{display:flex;align-items:center;gap:4px}
+.chart-legend .swatch{width:10px;height:10px;border-radius:2px;display:inline-block}
+.chart-tabs{display:flex;gap:4px;font-size:.75rem}
+.chart-tab{padding:4px 10px;border-radius:4px;cursor:pointer;border:1px solid #1e293b;background:transparent;color:#94a3b8}
+.chart-tab.active{background:#1e293b;color:#e2e8f0}
 </style></head><body>
 <div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><span id="ver"></span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
 <div class="cards">
@@ -2712,6 +2721,18 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
   <div class="card"><div class="label">Avg Latency</div><div class="value" id="avgLat">—</div></div>
 </div>
 <div class="alerts" id="alerts"></div>
+<div class="section">
+<div class="chart-container">
+<div class="chart-header">
+<h3>Usage &amp; Savings</h3>
+<div style="display:flex;gap:12px;align-items:center">
+<div class="chart-legend"><span><span class="swatch" style="background:#ef4444"></span>Baseline (Opus)</span><span><span class="swatch" style="background:#3b82f6"></span>Actual Cost</span><span><span class="swatch" style="background:#34d39966"></span>Saved</span></div>
+<div class="chart-tabs"><button class="chart-tab active" onclick="setChartView('hourly')">24h</button><button class="chart-tab" onclick="setChartView('daily')">Daily</button></div>
+</div>
+</div>
+<div id="chart"></div>
+</div>
+</div>
 <div class="section"><h2>Model Breakdown</h2>
 <table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
@@ -2765,7 +2786,58 @@ async function load(){
       const cls=p.status==='healthy'?'up':p.status==='degraded'?'degraded':p.status==='idle'?'idle':'down';
       return '<div class="prov-item"><span class="dot '+cls+'"></span>'+p.provider+'</div>';
     }).join('');
+    renderChart(sav);
   }catch(e){console.error(e)}
+}
+let chartView='hourly';
+function setChartView(v){
+  chartView=v;
+  document.querySelectorAll('.chart-tab').forEach(b=>b.classList.toggle('active',b.textContent===(v==='hourly'?'24h':'Daily')));
+  load();
+}
+function renderChart(sav){
+  const data=chartView==='hourly'?(sav.byHour||[]):(sav.byDay||[]);
+  if(!data.length){$('chart').innerHTML='<div style="color:#64748b;text-align:center;padding:40px">No data yet</div>';return;}
+  const W=800,H=200,pad={t:10,r:16,b:28,l:50};
+  const cw=W-pad.l-pad.r,ch=H-pad.t-pad.b;
+  const maxVal=Math.max(...data.map(d=>d.originalCost||0),0.001);
+  const barW=Math.max(4,Math.min(40,cw/data.length-2));
+  const gap=(cw-barW*data.length)/(data.length+1);
+  function y(v){return pad.t+ch-(v/maxVal)*ch}
+  function x(i){return pad.l+gap+(barW+gap)*i}
+  let svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto">';
+  // Grid lines
+  const gridLines=4;
+  for(let i=0;i<=gridLines;i++){
+    const yp=pad.t+(ch/gridLines)*i;
+    const val=maxVal*(1-i/gridLines);
+    svg+='<line x1="'+pad.l+'" y1="'+yp+'" x2="'+(W-pad.r)+'" y2="'+yp+'" stroke="#1e293b" stroke-width="1"/>';
+    svg+='<text x="'+(pad.l-6)+'" y="'+(yp+4)+'" fill="#64748b" font-size="9" text-anchor="end">$'+val.toFixed(2)+'</text>';
+  }
+  // Bars
+  data.forEach((d,i)=>{
+    const bx=x(i);
+    const origH=((d.originalCost||0)/maxVal)*ch;
+    const actH=((d.actualCost||0)/maxVal)*ch;
+    const savedH=origH-actH;
+    // Baseline (Opus) bar — full height, red
+    svg+='<rect x="'+bx+'" y="'+(pad.t+ch-origH)+'" width="'+barW+'" height="'+origH+'" fill="#ef444433" rx="2"/>';
+    // Saved area — the gap between baseline and actual
+    if(savedH>0) svg+='<rect x="'+bx+'" y="'+(pad.t+ch-origH)+'" width="'+barW+'" height="'+savedH+'" fill="#34d39944" rx="2"/>';
+    // Actual cost bar — blue
+    svg+='<rect x="'+bx+'" y="'+(pad.t+ch-actH)+'" width="'+barW+'" height="'+Math.max(actH,0.5)+'" fill="#3b82f6" rx="2"/>';
+    // Tooltip area
+    svg+='<rect x="'+bx+'" y="'+pad.t+'" width="'+barW+'" height="'+ch+'" fill="transparent" opacity="0">';
+    svg+='<title>'+(d.label||d.date)+'\\nBaseline: $'+(d.originalCost||0).toFixed(4)+'\\nActual: $'+(d.actualCost||0).toFixed(4)+'\\nSaved: $'+(d.saved||d.savedAmount||0).toFixed(4);
+    if(d.requests) svg+='\\nRequests: '+d.requests;
+    svg+='</title></rect>';
+    // X-axis label
+    const label=chartView==='hourly'?(d.label||''):(d.date||'').slice(5);
+    const showLabel=data.length<=12||i%Math.ceil(data.length/12)===0;
+    if(showLabel) svg+='<text x="'+(bx+barW/2)+'" y="'+(H-4)+'" fill="#64748b" font-size="9" text-anchor="middle">'+label+'</text>';
+  });
+  svg+='</svg>';
+  $('chart').innerHTML=svg;
 }
 load();setInterval(load,5000);
 </script></body></html>`;
@@ -3172,6 +3244,51 @@ export async function startProxy(
                         actualCost: Math.round(v.actualCost * 10000) / 10000,
                     }));
 
+                // Hourly breakdown for last 24 hours
+                const now = Date.now();
+                const h24ago = now - 86400000;
+                const byHourMap = new Map<
+                    string,
+                    { requests: number; actualCost: number; originalCost: number }
+                >();
+                for (const r of requestHistory) {
+                    const ts = new Date(r.timestamp).getTime();
+                    if (ts < h24ago) continue;
+                    const hourKey = r.timestamp.slice(0, 13); // "2026-02-26T14"
+                    const bucket = byHourMap.get(hourKey) || {
+                        requests: 0,
+                        actualCost: 0,
+                        originalCost: 0,
+                    };
+                    bucket.requests++;
+                    bucket.actualCost += r.costUsd;
+                    const baseM = AUTO_ROUTING_ALIASES.has(r.originalModel)
+                        ? BASELINE_MODEL
+                        : r.originalModel;
+                    bucket.originalCost += estimateCost(
+                        baseM,
+                        r.tokensIn,
+                        r.tokensOut,
+                    );
+                    byHourMap.set(hourKey, bucket);
+                }
+                const byHour = Array.from(byHourMap.entries())
+                    .sort((a, b) => a[0].localeCompare(b[0]))
+                    .map(([hour, v]) => ({
+                        hour,
+                        label: hour.slice(11) + ":00",
+                        requests: v.requests,
+                        actualCost:
+                            Math.round(v.actualCost * 10000) / 10000,
+                        originalCost:
+                            Math.round(v.originalCost * 10000) / 10000,
+                        saved:
+                            Math.round(
+                                Math.max(0, v.originalCost - v.actualCost) *
+                                    10000,
+                            ) / 10000,
+                    }));
+
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(
                     JSON.stringify({
@@ -3190,6 +3307,7 @@ export async function startProxy(
                                   )
                                 : 0,
                         byDay,
+                        byHour,
                     }),
                 );
                 return;
