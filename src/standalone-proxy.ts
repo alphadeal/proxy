@@ -3041,10 +3041,17 @@ export async function startProxy(
             if (req.method === "GET" && telemetryPath === "runs") {
                 const limit = parseInt(params.get("limit") || "50", 10);
                 const offset = parseInt(params.get("offset") || "0", 10);
+                const autoAliases = new Set([
+                    "relayplane:auto", "relayplane:cost", "relayplane:fast", "relayplane:quality",
+                    "rp:auto", "rp:balanced", "rp:best", "rp:fast", "rp:cheap",
+                ]);
                 const sorted = [...requestHistory].reverse();
                 const runs = sorted.slice(offset, offset + limit).map((r) => {
+                    const baseline = autoAliases.has(r.originalModel)
+                        ? "claude-opus-4-6"
+                        : r.originalModel;
                     const origCost = estimateCost(
-                        r.originalModel,
+                        baseline,
                         r.tokensIn,
                         r.tokensOut,
                     );
@@ -3082,9 +3089,16 @@ export async function startProxy(
             }
 
             if (req.method === "GET" && telemetryPath === "savings") {
-                // Savings = cost(original requested model) - cost(actual routed-to model)
-                // If no routing happened (same model) → savings = 0
-                // Uses actual token counts from the response, so zeroed tokens produce zero savings.
+                // Savings = cost(baseline model) - cost(actual routed-to model)
+                // For auto-routing aliases, the baseline is the most capable model
+                // the user would need without smart routing (Opus).
+                // For direct model requests, the baseline is the requested model itself.
+                const AUTO_ROUTING_ALIASES = new Set([
+                    "relayplane:auto", "relayplane:cost", "relayplane:fast", "relayplane:quality",
+                    "rp:auto", "rp:balanced", "rp:best", "rp:fast", "rp:cheap",
+                ]);
+                const BASELINE_MODEL = "claude-opus-4-6";
+
                 let totalOriginalCost = 0;
                 let totalActualCost = 0;
                 let totalSavedAmount = 0;
@@ -3098,8 +3112,11 @@ export async function startProxy(
                 >();
 
                 for (const r of requestHistory) {
+                    const baselineModel = AUTO_ROUTING_ALIASES.has(r.originalModel)
+                        ? BASELINE_MODEL
+                        : r.originalModel;
                     const origCost = estimateCost(
-                        r.originalModel,
+                        baselineModel,
                         r.tokensIn,
                         r.tokensOut,
                     );
