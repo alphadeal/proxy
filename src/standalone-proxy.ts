@@ -2750,9 +2750,10 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 .badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
 .badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
 .badge.rt-auto{background:#052e1633;color:#34d399}.badge.rt-direct{background:#1e293b;color:#94a3b8}
+.badge.auth-passthrough{background:#1e3a5f;color:#60a5fa}.badge.auth-apikey{background:#052e1633;color:#34d399}
 .col-rt .sub{font-size:.7rem;color:#64748b}
 @media(max-width:768px){.col-tt,.col-cx,.col-rt{display:none}}
-.prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
+.prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;gap:8px;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
 .alerts{display:flex;flex-direction:column;gap:8px;margin-bottom:24px}
 .alert{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:8px;font-size:.85rem;line-height:1.4}
 .alert-high{background:#2d0a0a;border:1px solid #ef4444;color:#fca5a5}
@@ -2843,7 +2844,13 @@ async function load(){
     $('alerts').innerHTML=alerts.join('');
     $('providers').innerHTML=(provH.providers||[]).map(p=>{
       const cls=p.status==='healthy'?'up':p.status==='degraded'?'degraded':p.status==='idle'?'idle':'down';
-      return '<div class="prov-item"><span class="dot '+cls+'"></span>'+p.provider+'</div>';
+      const authBadge=p.authMode==='passthrough'
+        ?'<span class="badge auth-passthrough" title="OAuth token forwarded from client — no API key needed">passthrough</span>'
+        :p.authMode==='api-key'
+        ?'<span class="badge auth-apikey" title="Authenticated via API key environment variable">API key</span>'
+        :'';
+      const tip=p.latency>0?p.provider+' · '+p.latency+'ms avg · '+(Math.round(p.successRate*100))+'% success rate':p.provider;
+      return '<div class="prov-item" title="'+tip+'"><span class="dot '+cls+'"></span>'+p.provider+authBadge+'</div>';
     }).join('');
     renderChart(sav);
   }catch(e){console.error(e)}
@@ -3377,6 +3384,7 @@ export async function startProxy(
                 const providers: Array<{
                     provider: string;
                     status: string;
+                    authMode: "passthrough" | "api-key" | "none";
                     latency: number;
                     successRate: number;
                     lastChecked: string;
@@ -3420,9 +3428,16 @@ export async function startProxy(
                         status = "unconfigured";
                     }
 
+                    const authMode: "passthrough" | "api-key" | "none" =
+                        hasPassthrough
+                            ? "passthrough"
+                            : hasKey
+                              ? "api-key"
+                              : "none";
                     providers.push({
                         provider: name,
                         status,
+                        authMode,
                         latency: avgLatency,
                         successRate:
                             Math.round(successRate * 10000) / 10000,
