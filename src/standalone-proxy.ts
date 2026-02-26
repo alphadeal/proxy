@@ -3308,7 +3308,8 @@ export async function startProxy(
                 }
             } else if (
                 requestedModel === "auto" ||
-                requestedModel === "relayplane:auto"
+                requestedModel === "relayplane:auto" ||
+                requestedModel === "default"
             ) {
                 routingMode = "auto";
             } else if (requestedModel === "cost") {
@@ -3575,6 +3576,242 @@ export async function startProxy(
                                 string,
                                 unknown
                             >;
+                        log(`Anthropic error [${providerResponse.status}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`);
+
+                        // Long-context fallback: if a downgraded model is rejected with
+                        // "Extra usage is required for long context requests", retry using
+                        // the original requested model which has extra usage enabled.
+                        const errorObj = errorPayload.error as
+                            | Record<string, unknown>
+                            | undefined;
+                        const isLongContextError =
+                            providerResponse.status === 429 &&
+                            errorObj?.type === "rate_limit_error" &&
+                            typeof errorObj?.message === "string" &&
+                            (errorObj.message as string).includes(
+                                "Extra usage",
+                            );
+                        const wasDowngraded =
+                            originalModel &&
+                            originalModel !==
+                                (targetModel || requestedModel);
+
+                        if (isLongContextError && wasDowngraded) {
+                            log(
+                                `[ALERT] Long-context fallback: downgraded model ${targetModel || requestedModel} rejected. Retrying with original model: ${originalModel}`,
+                            );
+                            const fallbackResolved =
+                                resolveExplicitModel(originalModel!);
+                            if (
+                                fallbackResolved?.provider === "anthropic"
+                            ) {
+                                const fallbackAuth = getAuthForModel(
+                                    fallbackResolved.model,
+                                    proxyConfig.auth,
+                                    useAnthropicEnvKey,
+                                );
+                                const fallbackResponse =
+                                    await forwardNativeAnthropicRequest(
+                                        stripThinkingIfUnsupported(
+                                            {
+                                                ...requestBody,
+                                                model: fallbackResolved.model,
+                                            },
+                                            fallbackResolved.model,
+                                        ),
+                                        ctx,
+                                        fallbackAuth.apiKey,
+                                        fallbackAuth.isMax,
+                                    );
+                                if (fallbackResponse.ok) {
+                                    targetModel = fallbackResolved.model;
+                                    const durationMs =
+                                        Date.now() - startTime;
+                                    if (isStreaming) {
+                                        res.writeHead(
+                                            fallbackResponse.status,
+                                            {
+                                                "Content-Type":
+                                                    "text/event-stream",
+                                                "Cache-Control": "no-cache",
+                                                Connection: "keep-alive",
+                                            },
+                                        );
+                                        const reader =
+                                            fallbackResponse.body?.getReader();
+                                        if (reader) {
+                                            const decoder = new TextDecoder();
+                                            while (true) {
+                                                const { done, value } =
+                                                    await reader.read();
+                                                if (done) break;
+                                                res.write(
+                                                    decoder.decode(value, {
+                                                        stream: true,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                        res.end();
+                                    } else {
+                                        const fallbackData =
+                                            (await fallbackResponse.json()) as Record<
+                                                string,
+                                                unknown
+                                            >;
+                                        res.writeHead(
+                                            fallbackResponse.status,
+                                            {
+                                                "Content-Type":
+                                                    "application/json",
+                                            },
+                                        );
+                                        res.end(
+                                            JSON.stringify(fallbackData),
+                                        );
+                                    }
+                                    logRequest(
+                                        originalModel ?? "unknown",
+                                        targetModel,
+                                        targetProvider,
+                                        durationMs,
+                                        true,
+                                        "passthrough",
+                                        undefined,
+                                        taskType,
+                                        complexity,
+                                    );
+                                    return;
+                                } else {
+                                    const fallbackErrPayload =
+                                        (await fallbackResponse
+                                            .json()
+                                            .catch(() => ({}))) as Record<
+                                            string,
+                                            unknown
+                                        >;
+                                    log(
+                                        `[ALERT] Fallback to ${fallbackResolved.model} also failed [${fallbackResponse.status}]: ${JSON.stringify(fallbackErrPayload)}`,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Sonnet fallback: when a non-passthrough routing decision
+                        // fails with a rate-limit or overload error, retry once
+                        // with claude-sonnet-4-6 before surfacing the error.
+                        const SONNET_FALLBACK_MODEL = "claude-sonnet-4-6";
+                        const isFallbackTriggerStatus = [
+                            429, 500, 503, 529,
+                        ].includes(providerResponse.status);
+                        const isAlreadySonnet =
+                            finalModel === SONNET_FALLBACK_MODEL;
+                        const isNonPassthrough =
+                            routingMode !== "passthrough";
+
+                        if (
+                            isFallbackTriggerStatus &&
+                            isNonPassthrough &&
+                            !isAlreadySonnet &&
+                            !isLongContextError
+                        ) {
+                            log(
+                                `[ALERT] Sonnet fallback: model ${finalModel} failed [${providerResponse.status}]. Retrying with ${SONNET_FALLBACK_MODEL}`,
+                            );
+                            const sonnetResolved =
+                                resolveExplicitModel(SONNET_FALLBACK_MODEL);
+                            if (sonnetResolved?.provider === "anthropic") {
+                                const sonnetAuth = getAuthForModel(
+                                    sonnetResolved.model,
+                                    proxyConfig.auth,
+                                    useAnthropicEnvKey,
+                                );
+                                const sonnetResponse =
+                                    await forwardNativeAnthropicRequest(
+                                        stripThinkingIfUnsupported(
+                                            {
+                                                ...requestBody,
+                                                model: sonnetResolved.model,
+                                            },
+                                            sonnetResolved.model,
+                                        ),
+                                        ctx,
+                                        sonnetAuth.apiKey,
+                                        sonnetAuth.isMax,
+                                    );
+                                if (sonnetResponse.ok) {
+                                    targetModel = sonnetResolved.model;
+                                    const durationMs =
+                                        Date.now() - startTime;
+                                    if (isStreaming) {
+                                        res.writeHead(
+                                            sonnetResponse.status,
+                                            {
+                                                "Content-Type":
+                                                    "text/event-stream",
+                                                "Cache-Control": "no-cache",
+                                                Connection: "keep-alive",
+                                            },
+                                        );
+                                        const reader =
+                                            sonnetResponse.body?.getReader();
+                                        if (reader) {
+                                            const decoder = new TextDecoder();
+                                            while (true) {
+                                                const { done, value } =
+                                                    await reader.read();
+                                                if (done) break;
+                                                res.write(
+                                                    decoder.decode(value, {
+                                                        stream: true,
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                        res.end();
+                                    } else {
+                                        const sonnetData =
+                                            (await sonnetResponse.json()) as Record<
+                                                string,
+                                                unknown
+                                            >;
+                                        res.writeHead(
+                                            sonnetResponse.status,
+                                            {
+                                                "Content-Type":
+                                                    "application/json",
+                                            },
+                                        );
+                                        res.end(
+                                            JSON.stringify(sonnetData),
+                                        );
+                                    }
+                                    logRequest(
+                                        originalModel ?? "unknown",
+                                        targetModel,
+                                        targetProvider,
+                                        durationMs,
+                                        true,
+                                        "passthrough",
+                                        undefined,
+                                        taskType,
+                                        complexity,
+                                    );
+                                    return;
+                                } else {
+                                    const sonnetErrPayload =
+                                        (await sonnetResponse
+                                            .json()
+                                            .catch(
+                                                () => ({}),
+                                            )) as Record<string, unknown>;
+                                    log(
+                                        `[ALERT] Sonnet fallback also failed [${sonnetResponse.status}]: ${JSON.stringify(sonnetErrPayload)}`,
+                                    );
+                                }
+                            }
+                        }
+
                         if (proxyConfig.reliability?.cooldowns?.enabled) {
                             cooldownManager.recordFailure(
                                 targetProvider,
@@ -3829,33 +4066,75 @@ export async function startProxy(
         }
 
         // === Model list endpoint ===
+        // Proxies the real Anthropic model list and prepends RelayPlane routing aliases
+        // so Claude Code's model picker shows both native Claude models and relayplane:auto etc.
         if (req.method === "GET" && url.includes("/models")) {
+            const relayplaneModels = [
+                {
+                    type: "model",
+                    id: "relayplane:auto",
+                    display_name: "RelayPlane Auto (smart routing)",
+                    created_at: "2025-01-01T00:00:00Z",
+                },
+                {
+                    type: "model",
+                    id: "relayplane:cost",
+                    display_name: "RelayPlane Cost (cheapest)",
+                    created_at: "2025-01-01T00:00:00Z",
+                },
+                {
+                    type: "model",
+                    id: "relayplane:fast",
+                    display_name: "RelayPlane Fast (lowest latency)",
+                    created_at: "2025-01-01T00:00:00Z",
+                },
+                {
+                    type: "model",
+                    id: "relayplane:quality",
+                    display_name: "RelayPlane Quality (best output)",
+                    created_at: "2025-01-01T00:00:00Z",
+                },
+            ];
+
+            try {
+                const headers = buildAnthropicHeaders(
+                    ctx,
+                    useAnthropicEnvKey,
+                );
+                const anthropicResponse = await fetch(
+                    "https://api.anthropic.com/v1/models",
+                    { headers },
+                );
+                if (anthropicResponse.ok) {
+                    const anthropicData = (await anthropicResponse.json()) as {
+                        data?: unknown[];
+                        has_more?: boolean;
+                        first_id?: string;
+                        last_id?: string;
+                    };
+                    const combinedData = [
+                        ...relayplaneModels,
+                        ...(anthropicData.data ?? []),
+                    ];
+                    res.writeHead(200, { "Content-Type": "application/json" });
+                    res.end(
+                        JSON.stringify({
+                            ...anthropicData,
+                            data: combinedData,
+                        }),
+                    );
+                    return;
+                }
+            } catch {
+                // Fall through to static list on network error
+            }
+
+            // Fallback: return RelayPlane aliases in Anthropic format
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
                 JSON.stringify({
-                    object: "list",
-                    data: [
-                        {
-                            id: "relayplane:auto",
-                            object: "model",
-                            owned_by: "relayplane",
-                        },
-                        {
-                            id: "relayplane:cost",
-                            object: "model",
-                            owned_by: "relayplane",
-                        },
-                        {
-                            id: "relayplane:fast",
-                            object: "model",
-                            owned_by: "relayplane",
-                        },
-                        {
-                            id: "relayplane:quality",
-                            object: "model",
-                            owned_by: "relayplane",
-                        },
-                    ],
+                    data: relayplaneModels,
+                    has_more: false,
                 }),
             );
             return;
@@ -3978,7 +4257,8 @@ export async function startProxy(
             }
         } else if (
             requestedModel === "auto" ||
-            requestedModel === "relayplane:auto"
+            requestedModel === "relayplane:auto" ||
+            requestedModel === "default"
         ) {
             routingMode = "auto";
         } else if (requestedModel === "cost") {
