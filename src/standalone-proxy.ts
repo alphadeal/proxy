@@ -3441,7 +3441,7 @@ export async function startProxy(
                 }
                 targetProvider = resolved.provider;
                 targetModel = resolved.model;
-            } else if (!useCascade) {
+            } else if (!useCascade && !targetModel) {
                 let selectedModel: string | null = null;
                 if (routingMode === "cost") {
                     selectedModel = getCostModel(proxyConfig);
@@ -3449,6 +3449,12 @@ export async function startProxy(
                     selectedModel = getFastModel(proxyConfig);
                 } else if (routingMode === "quality") {
                     selectedModel = getQualityModel(proxyConfig);
+                } else if (proxyConfig.routing?.complexity?.enabled) {
+                    // Complexity routing takes priority over relay learned rules,
+                    // which may reference deprecated models (e.g. claude-3-5-haiku-latest)
+                    const complexityModel =
+                        proxyConfig.routing?.complexity?.[complexity];
+                    selectedModel = complexityModel ?? null;
                 } else {
                     const rule = relay.routing.get(taskType);
                     const parsedRule = rule?.preferredModel
@@ -3456,10 +3462,6 @@ export async function startProxy(
                         : null;
                     if (parsedRule?.provider === "anthropic") {
                         selectedModel = parsedRule.model;
-                    } else if (proxyConfig.routing?.complexity?.enabled) {
-                        const complexityModel =
-                            proxyConfig.routing?.complexity?.[complexity];
-                        selectedModel = complexityModel ?? null;
                     } else {
                         selectedModel = DEFAULT_ROUTING[taskType].model;
                     }
@@ -4402,7 +4404,7 @@ export async function startProxy(
                 }
                 return;
             }
-        } else if (!useCascade) {
+        } else if (!useCascade && !targetModel) {
             let selectedModel: string | null = null;
             if (routingMode === "cost") {
                 selectedModel = getCostModel(proxyConfig);
@@ -4410,6 +4412,12 @@ export async function startProxy(
                 selectedModel = getFastModel(proxyConfig);
             } else if (routingMode === "quality") {
                 selectedModel = getQualityModel(proxyConfig);
+            } else if (proxyConfig.routing?.complexity?.enabled) {
+                // Complexity routing takes priority over relay learned rules,
+                // which may reference deprecated models (e.g. claude-3-5-haiku-latest)
+                const complexityModel =
+                    proxyConfig.routing?.complexity?.[complexity];
+                selectedModel = complexityModel ?? null;
             } else {
                 const rule = relay.routing.get(taskType);
                 if (rule && rule.preferredModel) {
@@ -4421,13 +4429,7 @@ export async function startProxy(
                     }
                 }
                 if (!targetModel) {
-                    if (proxyConfig.routing?.complexity?.enabled) {
-                        const complexityModel =
-                            proxyConfig.routing?.complexity?.[complexity];
-                        selectedModel = complexityModel ?? null;
-                    } else {
-                        selectedModel = DEFAULT_ROUTING[taskType].model;
-                    }
+                    selectedModel = DEFAULT_ROUTING[taskType].model;
                 }
             }
 
