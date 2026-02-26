@@ -1028,7 +1028,7 @@ export function classifyComplexity(
     if (toolResultTurns >= 6) score += 2; // deep agentic session → firmly complex
 
     if (score >= 5) return "complex";
-    if (score >= 2) return "moderate";
+    if (score >= 3) return "moderate";
     return "simple";
 }
 
