@@ -98,7 +98,118 @@ Map any model name to a different one. Useful for silently redirecting expensive
 }
 ```
 
+You can also route to OpenAI models using the `ad:auto` alias (see [AlphaDeal Routing](#alphadeal-routing) below):
+
+```json
+{
+  "modelOverrides": {
+    "claude-opus-4-5-20251101": "ad:auto"
+  }
+}
+```
+
+This works even for Claude Code clients using the native `/v1/messages` endpoint — the proxy transparently translates requests and responses between Anthropic and OpenAI formats.
+
 Overrides are applied before any other routing logic. The original requested model is logged for tracking.
+
+## AlphaDeal Routing
+
+AlphaDeal is an OpenAI-focused complexity-based routing strategy. When a model is overridden to `ad:auto`, the proxy classifies the request by complexity and routes to the appropriate OpenAI model tier.
+
+```json
+{
+  "routing": {
+    "alphadeal": {
+      "enabled": true,
+      "simple": "gpt-5-nano",
+      "moderate": "gpt-5.2",
+      "complex": "gpt-5.2"
+    }
+  }
+}
+```
+
+| Tier | Default model | When used |
+|------|--------------|-----------|
+| `simple` | `gpt-5-nano` | Short prompts, basic Q&A |
+| `moderate` | `gpt-5.2` | Multi-step reasoning, code review |
+| `complex` | `gpt-5.2` | Architecture, large context, many tools |
+
+**Supported `ad:*` aliases:**
+
+| Alias | Resolves to |
+|-------|------------|
+| `ad:auto` | Complexity-based routing (simple/moderate/complex tiers) |
+| `ad:fast` | `openai/gpt-5-nano` |
+| `ad:balanced` | `openai/gpt-5.2` |
+| `ad:best` | `openai/gpt-5.2-pro` |
+| `ad:analysis` | `openai/gpt-5.2-pro` |
+
+Set your OpenAI API key in the environment:
+
+```bash
+export OPENAI_API_KEY="sk-..."
+```
+
+Or if running as a systemd service:
+
+```bash
+systemctl --user set-environment OPENAI_API_KEY="sk-..."
+systemctl --user restart relayplane-proxy.service
+```
+
+
+## Profiles
+
+Profiles are named routing configurations that let you define model tiers for different use cases or teams. Use them with the `profile:strategy` syntax as your model name.
+
+```json
+{
+  "profiles": {
+    "devco": {
+      "cost": "gpt-5-nano",
+      "fast": "gpt-5-nano",
+      "quality": "claude-opus-4-6",
+      "auto": {
+        "simple": "gpt-5-nano",
+        "moderate": "gpt-5.2",
+        "complex": "claude-opus-4-6"
+      }
+    },
+    "opco": {
+      "cost": "gpt-4o-mini",
+      "fast": "gpt-4o-mini",
+      "quality": "gpt-5.2-pro",
+      "auto": {
+        "simple": "gpt-4o-mini",
+        "moderate": "gpt-5.2",
+        "complex": "gpt-5.2-pro"
+      }
+    }
+  }
+}
+```
+
+Then use the profile as the model name in your agent:
+
+```bash
+# Use devco profile with auto complexity routing
+ANTHROPIC_BASE_URL=http://localhost:4801 your-agent --model devco:auto
+
+# Use opco profile, always picking the quality model
+ANTHROPIC_BASE_URL=http://localhost:4801 your-agent --model opco:quality
+```
+
+**Available strategies:**
+
+| Strategy | Behaviour |
+|----------|-----------|
+| `auto` | Complexity-based — picks `simple`, `moderate`, or `complex` model based on the request |
+| `cost` | Always uses the cheapest model in the profile |
+| `fast` | Always uses the lowest-latency model in the profile |
+| `quality` | Always uses the highest-quality model in the profile |
+
+Profile names can be anything except the reserved prefixes `rp`, `ad`, and `relayplane`. Each profile must define all four strategies (`cost`, `fast`, `quality`, `auto`).
 
 ## Cascade Mode
 
