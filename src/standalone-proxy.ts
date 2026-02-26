@@ -19,6 +19,7 @@
  * @packageDocumentation
  */
 
+import * as crypto from "node:crypto";
 import * as http from "node:http";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -1333,6 +1334,16 @@ function convertNativeAnthropicToOpenAI(
                                 : JSON.stringify(b["content"]),
                     });
                 }
+                // Also emit any text blocks present in the same message
+                const textContent = textBlocks
+                    .map(
+                        (b: unknown) =>
+                            (b as Record<string, unknown>)["text"] as string,
+                    )
+                    .join("\n");
+                if (textContent) {
+                    messages.push({ role: "user", content: textContent });
+                }
                 continue;
             }
 
@@ -1462,7 +1473,7 @@ function convertOpenAIResponseToAnthropic(
         choice["finish_reason"] === "tool_calls" ? "tool_use" : "end_turn";
 
     return {
-        id: `msg_${Date.now()}`,
+        id: `msg_${crypto.randomUUID()}`,
         type: "message",
         role: "assistant",
         content,
@@ -1489,7 +1500,7 @@ async function pipeOpenAIStreamAsAnthropic(
     let buffer = "";
     let tokensIn = 0;
     let tokensOut = 0;
-    const messageId = `msg_${Date.now()}`;
+    const messageId = `msg_${crypto.randomUUID()}`;
 
     // Send message_start
     const messageStart = {
@@ -1516,11 +1527,12 @@ async function pipeOpenAIStreamAsAnthropic(
     res.write(`event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`);
 
     let hasToolCalls = false;
-    // tool call accumulation: id → { name, arguments }
-    const toolCallAccum: Record<
+    // tool call accumulation: index → { id, name, arguments }
+    // Using Map to avoid prototype pollution via __proto__ keys
+    const toolCallAccum = new Map<
         number,
         { id: string; name: string; arguments: string }
-    > = {};
+    >();
 
     try {
         while (true) {
@@ -1578,21 +1590,18 @@ async function pipeOpenAIStreamAsAnthropic(
                         const fn = tc["function"] as
                             | Record<string, unknown>
                             | undefined;
-                        if (!toolCallAccum[idx]) {
-                            toolCallAccum[idx] = {
+                        if (!toolCallAccum.has(idx)) {
+                            toolCallAccum.set(idx, {
                                 id: (tc["id"] as string) ?? "",
                                 name: "",
                                 arguments: "",
-                            };
+                            });
                         }
-                        if (tc["id"])
-                            toolCallAccum[idx].id = tc["id"] as string;
-                        if (fn?.["name"])
-                            toolCallAccum[idx].name += fn["name"] as string;
+                        const accum = toolCallAccum.get(idx)!;
+                        if (tc["id"]) accum.id = tc["id"] as string;
+                        if (fn?.["name"]) accum.name += fn["name"] as string;
                         if (fn?.["arguments"])
-                            toolCallAccum[idx].arguments += fn[
-                                "arguments"
-                            ] as string;
+                            accum.arguments += fn["arguments"] as string;
                     }
                 }
 
@@ -1609,7 +1618,7 @@ async function pipeOpenAIStreamAsAnthropic(
                     // Emit tool_use blocks if any
                     if (hasToolCalls) {
                         let blockIndex = 1;
-                        for (const tc of Object.values(toolCallAccum)) {
+                        for (const tc of toolCallAccum.values()) {
                             let input: unknown = {};
                             try {
                                 input = JSON.parse(tc.arguments);
@@ -3987,12 +3996,26 @@ export async function startProxy(
                     }
                     let providerResponse: Response;
                     if (targetProvider === "openai") {
+                        const openaiApiKey = process.env["OPENAI_API_KEY"];
+                        if (!openaiApiKey) {
+                            res.writeHead(500, {
+                                "Content-Type": "application/json",
+                            });
+                            res.end(
+                                JSON.stringify({
+                                    error: {
+                                        type: "configuration_error",
+                                        message:
+                                            "OPENAI_API_KEY is not configured on the proxy server",
+                                    },
+                                }),
+                            );
+                            return;
+                        }
                         const openaiReq = convertNativeAnthropicToOpenAI({
                             ...requestBody,
                             model: finalModel,
                         });
-                        const openaiApiKey =
-                            process.env["OPENAI_API_KEY"] ?? "";
                         if (isStreaming) {
                             openaiReq.stream = true;
                             providerResponse = await forwardToOpenAIStream(
