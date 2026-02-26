@@ -153,6 +153,10 @@ export const MODEL_MAPPING: Record<
     "gpt-4o": { provider: "openai", model: "gpt-4o" },
     "gpt-4o-mini": { provider: "openai", model: "gpt-4o-mini" },
     "gpt-4.1": { provider: "openai", model: "gpt-4.1" },
+    // OpenAI GPT-5 series
+    "gpt-5-nano": { provider: "openai", model: "gpt-5-nano" },
+    "gpt-5.2": { provider: "openai", model: "gpt-5.2" },
+    "gpt-5.2-pro": { provider: "openai", model: "gpt-5.2-pro" },
 };
 
 /**
@@ -182,6 +186,34 @@ export const SMART_ALIASES: Record<
         provider: "anthropic",
         model: "claude-sonnet-4-6",
     },
+};
+
+/**
+ * AlphaDeal routing aliases - OpenAI-focused complexity-based routing
+ * for underwriting and analysis workloads
+ */
+export const ALPHADEAL_ALIASES: Record<
+    string,
+    { provider: Provider; model: string }
+> = {
+    // Direct model aliases
+    "ad:fast": { provider: "openai", model: "gpt-5-nano" },
+    "ad:balanced": { provider: "openai", model: "gpt-5.2" },
+    "ad:best": { provider: "openai", model: "gpt-5.2-pro" },
+    "ad:analysis": { provider: "openai", model: "gpt-5.2-pro" },
+};
+
+/**
+ * AlphaDeal complexity-based routing defaults
+ * Maps task complexity to appropriate OpenAI model
+ */
+export const ALPHADEAL_COMPLEXITY: Record<
+    "simple" | "moderate" | "complex",
+    string
+> = {
+    simple: "gpt-5-nano",
+    moderate: "gpt-5.2",
+    complex: "gpt-5.2-pro",
 };
 
 /**
@@ -222,12 +254,15 @@ export function getAvailableModelNames(): string[] {
     return [
         ...Object.keys(MODEL_MAPPING),
         ...Object.keys(SMART_ALIASES),
+        ...Object.keys(ALPHADEAL_ALIASES),
         ...Object.keys(RELAYPLANE_ALIASES),
         // Add common model prefixes users might type
         "relayplane:auto",
         "relayplane:cost",
         "relayplane:fast",
         "relayplane:quality",
+        // AlphaDeal prefixes
+        "ad:auto",
     ];
 }
 
@@ -314,10 +349,18 @@ interface ComplexityConfig {
     complex: string;
 }
 
+interface AlphadealConfig {
+    enabled: boolean;
+    simple: string;
+    moderate: string;
+    complex: string;
+}
+
 interface RoutingConfig {
     mode: "standard" | "cascade";
     cascade: CascadeConfig;
     complexity: ComplexityConfig;
+    alphadeal: AlphadealConfig;
 }
 
 interface ReliabilityConfig {
@@ -732,6 +775,12 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
             moderate: "claude-sonnet-4-20250514",
             complex: "claude-opus-4-20250514",
         },
+        alphadeal: {
+            enabled: true,
+            simple: "gpt-5-nano",
+            moderate: "gpt-5.2",
+            complex: "gpt-5.2-pro",
+        },
     },
     reliability: {
         cooldowns: {
@@ -762,11 +811,16 @@ function normalizeProxyConfig(
         ...defaultRouting.complexity,
         ...(configRouting.complexity ?? {}),
     };
+    const alphadeal = {
+        ...defaultRouting.alphadeal,
+        ...(configRouting.alphadeal ?? {}),
+    };
     const routing: RoutingConfig = {
         ...defaultRouting,
         ...configRouting,
         cascade,
         complexity,
+        alphadeal,
     };
     const defaultReliability =
         DEFAULT_PROXY_CONFIG.reliability as ReliabilityConfig;
@@ -1212,6 +1266,385 @@ async function forwardNativeAnthropicRequest(
     });
 
     return response;
+}
+
+/**
+ * Convert a native Anthropic /v1/messages request body to OpenAI ChatRequest format.
+ * Used when /v1/messages needs to be routed to an OpenAI model.
+ */
+function convertNativeAnthropicToOpenAI(
+    body: Record<string, unknown>,
+): ChatRequest {
+    const messages: Array<{
+        role: string;
+        content: string | unknown;
+        [key: string]: unknown;
+    }> = [];
+
+    // Add system message if present
+    if (body["system"] && typeof body["system"] === "string") {
+        messages.push({ role: "system", content: body["system"] });
+    } else if (Array.isArray(body["system"])) {
+        // system can be an array of content blocks
+        const text = (body["system"] as Array<{ type: string; text?: string }>)
+            .filter((b) => b.type === "text")
+            .map((b) => b.text ?? "")
+            .join("\n");
+        if (text) messages.push({ role: "system", content: text });
+    }
+
+    // Convert Anthropic messages to OpenAI format
+    const anthropicMessages =
+        (body["messages"] as Array<Record<string, unknown>>) ?? [];
+    for (const msg of anthropicMessages) {
+        const role = msg["role"] as string;
+        const content = msg["content"];
+
+        if (typeof content === "string") {
+            messages.push({ role, content });
+            continue;
+        }
+
+        if (Array.isArray(content)) {
+            // Check for tool_use blocks (assistant tool calls)
+            const toolUseBlocks = content.filter(
+                (b: unknown) =>
+                    (b as Record<string, unknown>)["type"] === "tool_use",
+            );
+            const textBlocks = content.filter(
+                (b: unknown) =>
+                    (b as Record<string, unknown>)["type"] === "text",
+            );
+            const toolResultBlocks = content.filter(
+                (b: unknown) =>
+                    (b as Record<string, unknown>)["type"] === "tool_result",
+            );
+
+            if (toolResultBlocks.length > 0) {
+                // Anthropic tool_result → OpenAI tool messages
+                for (const block of toolResultBlocks) {
+                    const b = block as Record<string, unknown>;
+                    messages.push({
+                        role: "tool",
+                        tool_call_id: b["tool_use_id"] as string,
+                        content:
+                            typeof b["content"] === "string"
+                                ? b["content"]
+                                : JSON.stringify(b["content"]),
+                    });
+                }
+                continue;
+            }
+
+            if (role === "assistant" && toolUseBlocks.length > 0) {
+                const textContent = textBlocks
+                    .map(
+                        (b: unknown) =>
+                            (b as Record<string, unknown>)["text"] as string,
+                    )
+                    .join("");
+                const tool_calls = toolUseBlocks.map((b: unknown) => {
+                    const block = b as Record<string, unknown>;
+                    return {
+                        id: block["id"] as string,
+                        type: "function",
+                        function: {
+                            name: block["name"] as string,
+                            arguments: JSON.stringify(block["input"] ?? {}),
+                        },
+                    };
+                });
+                messages.push({
+                    role: "assistant",
+                    content: textContent || null,
+                    tool_calls,
+                });
+                continue;
+            }
+
+            // Regular content blocks — flatten to string
+            const text = (content as Array<Record<string, unknown>>)
+                .filter((b) => b["type"] === "text")
+                .map((b) => b["text"] as string)
+                .join("");
+            messages.push({ role, content: text });
+            continue;
+        }
+
+        messages.push({ role, content: content as string });
+    }
+
+    // Convert Anthropic tools to OpenAI format
+    let tools: unknown[] | undefined;
+    if (Array.isArray(body["tools"])) {
+        tools = (body["tools"] as Array<Record<string, unknown>>).map((t) => ({
+            type: "function",
+            function: {
+                name: t["name"],
+                description: t["description"],
+                parameters: t["input_schema"] ?? {
+                    type: "object",
+                    properties: {},
+                },
+            },
+        }));
+    }
+
+    const targetModel = body["model"] as string;
+    const maxTokens = Math.min((body["max_tokens"] as number) ?? 4096, 16384);
+    // GPT-5 and newer models use max_completion_tokens instead of max_tokens
+    const usesCompletionTokens =
+        targetModel.startsWith("gpt-5") ||
+        targetModel.startsWith("o1") ||
+        targetModel.startsWith("o3") ||
+        targetModel.startsWith("o4");
+    const req: ChatRequest = {
+        model: targetModel,
+        messages,
+        ...(usesCompletionTokens
+            ? { max_completion_tokens: maxTokens }
+            : { max_tokens: maxTokens }),
+        stream: (body["stream"] as boolean) ?? false,
+    };
+
+    if (body["temperature"] !== undefined) {
+        req.temperature = body["temperature"] as number;
+    }
+    if (tools && tools.length > 0) {
+        req.tools = tools;
+    }
+
+    return req;
+}
+
+/**
+ * Convert a non-streaming OpenAI response to native Anthropic /v1/messages format.
+ */
+function convertOpenAIResponseToAnthropic(
+    openaiResponse: Record<string, unknown>,
+    model: string,
+): Record<string, unknown> {
+    const choices =
+        (openaiResponse["choices"] as Array<Record<string, unknown>>) ?? [];
+    const choice = choices[0] ?? {};
+    const message = (choice["message"] as Record<string, unknown>) ?? {};
+    const usage = (openaiResponse["usage"] as Record<string, unknown>) ?? {};
+
+    const content: unknown[] = [];
+
+    // Text content
+    if (message["content"] && typeof message["content"] === "string") {
+        content.push({ type: "text", text: message["content"] });
+    }
+
+    // Tool calls → tool_use blocks
+    if (Array.isArray(message["tool_calls"])) {
+        for (const tc of message["tool_calls"] as Array<
+            Record<string, unknown>
+        >) {
+            const fn = tc["function"] as Record<string, unknown>;
+            let input: unknown = {};
+            try {
+                input = JSON.parse(fn["arguments"] as string);
+            } catch {
+                input = {};
+            }
+            content.push({
+                type: "tool_use",
+                id: tc["id"],
+                name: fn["name"],
+                input,
+            });
+        }
+    }
+
+    const stopReason =
+        choice["finish_reason"] === "tool_calls" ? "tool_use" : "end_turn";
+
+    return {
+        id: `msg_${Date.now()}`,
+        type: "message",
+        role: "assistant",
+        content,
+        model,
+        stop_reason: stopReason,
+        stop_sequence: null,
+        usage: {
+            input_tokens: usage["prompt_tokens"] ?? 0,
+            output_tokens: usage["completion_tokens"] ?? 0,
+        },
+    };
+}
+
+/**
+ * Read an OpenAI SSE stream and write it as Anthropic SSE events to res.
+ * Returns { tokensIn, tokensOut } extracted from the stream.
+ */
+async function pipeOpenAIStreamAsAnthropic(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    res: import("http").ServerResponse,
+    model: string,
+): Promise<{ tokensIn: number; tokensOut: number }> {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let tokensIn = 0;
+    let tokensOut = 0;
+    const messageId = `msg_${Date.now()}`;
+
+    // Send message_start
+    const messageStart = {
+        type: "message_start",
+        message: {
+            id: messageId,
+            type: "message",
+            role: "assistant",
+            content: [],
+            model,
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+        },
+    };
+    res.write(
+        `event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`,
+    );
+
+    // Send content_block_start for index 0
+    res.write(
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+    );
+    res.write(`event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`);
+
+    let hasToolCalls = false;
+    // tool call accumulation: id → { name, arguments }
+    const toolCallAccum: Record<
+        number,
+        { id: string; name: string; arguments: string }
+    > = {};
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+
+            for (const line of lines) {
+                if (!line.startsWith("data: ")) continue;
+                const data = line.slice(6).trim();
+                if (data === "[DONE]") continue;
+
+                let evt: Record<string, unknown>;
+                try {
+                    evt = JSON.parse(data) as Record<string, unknown>;
+                } catch {
+                    continue;
+                }
+
+                // Extract usage if present
+                if (evt["usage"]) {
+                    const u = evt["usage"] as Record<string, unknown>;
+                    tokensIn = (u["prompt_tokens"] as number) ?? tokensIn;
+                    tokensOut = (u["completion_tokens"] as number) ?? tokensOut;
+                }
+
+                const choices = evt["choices"] as
+                    | Array<Record<string, unknown>>
+                    | undefined;
+                if (!choices || choices.length === 0) continue;
+                const delta = choices[0]["delta"] as
+                    | Record<string, unknown>
+                    | undefined;
+                if (!delta) continue;
+
+                // Text delta
+                if (
+                    typeof delta["content"] === "string" &&
+                    delta["content"].length > 0
+                ) {
+                    res.write(
+                        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta["content"] } })}\n\n`,
+                    );
+                }
+
+                // Tool call deltas
+                if (Array.isArray(delta["tool_calls"])) {
+                    hasToolCalls = true;
+                    for (const tc of delta["tool_calls"] as Array<
+                        Record<string, unknown>
+                    >) {
+                        const idx = tc["index"] as number;
+                        const fn = tc["function"] as
+                            | Record<string, unknown>
+                            | undefined;
+                        if (!toolCallAccum[idx]) {
+                            toolCallAccum[idx] = {
+                                id: (tc["id"] as string) ?? "",
+                                name: "",
+                                arguments: "",
+                            };
+                        }
+                        if (tc["id"])
+                            toolCallAccum[idx].id = tc["id"] as string;
+                        if (fn?.["name"])
+                            toolCallAccum[idx].name += fn["name"] as string;
+                        if (fn?.["arguments"])
+                            toolCallAccum[idx].arguments += fn[
+                                "arguments"
+                            ] as string;
+                    }
+                }
+
+                // finish_reason
+                const finishReason = choices[0]["finish_reason"] as
+                    | string
+                    | null;
+                if (finishReason) {
+                    // Close text block
+                    res.write(
+                        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+                    );
+
+                    // Emit tool_use blocks if any
+                    if (hasToolCalls) {
+                        let blockIndex = 1;
+                        for (const tc of Object.values(toolCallAccum)) {
+                            let input: unknown = {};
+                            try {
+                                input = JSON.parse(tc.arguments);
+                            } catch {
+                                input = {};
+                            }
+                            res.write(
+                                `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: blockIndex, content_block: { type: "tool_use", id: tc.id, name: tc.name, input: {} } })}\n\n`,
+                            );
+                            res.write(
+                                `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: blockIndex, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } })}\n\n`,
+                            );
+                            res.write(
+                                `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`,
+                            );
+                            blockIndex++;
+                        }
+                    }
+
+                    const stopReason =
+                        finishReason === "tool_calls" ? "tool_use" : "end_turn";
+                    res.write(
+                        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: tokensOut } })}\n\n`,
+                    );
+                    res.write(
+                        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+                    );
+                }
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+
+    return { tokensIn, tokensOut };
 }
 
 /**
@@ -2299,6 +2732,11 @@ function resolveExplicitModel(
         return SMART_ALIASES[resolvedAlias];
     }
 
+    // Check ALPHADEAL_ALIASES (ad:fast, ad:balanced, ad:best, ad:analysis)
+    if (ALPHADEAL_ALIASES[resolvedAlias]) {
+        return ALPHADEAL_ALIASES[resolvedAlias];
+    }
+
     // Check MODEL_MAPPING (aliases)
     if (MODEL_MAPPING[resolvedAlias]) {
         return MODEL_MAPPING[resolvedAlias];
@@ -3251,6 +3689,7 @@ export async function startProxy(
                 | "cost"
                 | "fast"
                 | "quality"
+                | "alphadeal"
                 | "passthrough" = "auto";
             if (!relayplaneEnabled || relayplaneBypass) {
                 routingMode = "passthrough";
@@ -3265,6 +3704,15 @@ export async function startProxy(
                     routingMode = "quality";
                 }
                 // relayplane:auto stays as 'auto'
+            } else if (requestedModel.startsWith("ad:")) {
+                // Handle ad:* AlphaDeal aliases - OpenAI complexity-based routing
+                if (requestedModel === "ad:auto") {
+                    routingMode = "alphadeal";
+                } else {
+                    // ad:fast, ad:balanced, ad:best, ad:analysis go through passthrough
+                    // to resolve via ALPHADEAL_ALIASES
+                    routingMode = "passthrough";
+                }
             } else if (requestedModel.startsWith("rp:")) {
                 // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
                 if (
@@ -3370,20 +3818,21 @@ export async function startProxy(
                     );
                     return;
                 }
-                if (resolved.provider !== "anthropic") {
-                    res.writeHead(400, { "Content-Type": "application/json" });
-                    res.end(
-                        JSON.stringify({
-                            error: "Native /v1/messages only supports Anthropic models.",
-                        }),
-                    );
-                    return;
-                }
                 targetProvider = resolved.provider;
                 targetModel = resolved.model;
             } else if (!useCascade) {
                 let selectedModel: string | null = null;
-                if (routingMode === "cost") {
+                if (routingMode === "alphadeal") {
+                    // AlphaDeal: OpenAI complexity-based routing
+                    const alphadealConfig = proxyConfig.routing?.alphadeal;
+                    selectedModel =
+                        alphadealConfig?.[complexity] ??
+                        ALPHADEAL_COMPLEXITY[complexity];
+                    targetProvider = "openai";
+                    log(
+                        `AlphaDeal routing (messages): complexity=${complexity} → ${selectedModel}`,
+                    );
+                } else if (routingMode === "cost") {
                     selectedModel = getCostModel(proxyConfig);
                 } else if (routingMode === "fast") {
                     selectedModel = getFastModel(proxyConfig);
@@ -3416,11 +3865,11 @@ export async function startProxy(
                 }
 
                 const resolved = resolveConfigModel(selectedModel);
-                if (!resolved || resolved.provider !== "anthropic") {
+                if (!resolved) {
                     res.writeHead(500, { "Content-Type": "application/json" });
                     res.end(
                         JSON.stringify({
-                            error: "Resolved model is not supported for /v1/messages",
+                            error: "Failed to resolve routing model",
                         }),
                     );
                     return;
@@ -3536,8 +3985,31 @@ export async function startProxy(
                     if (modelAuth.isMax) {
                         log(`Using MAX token for ${finalModel}`);
                     }
-                    const providerResponse =
-                        await forwardNativeAnthropicRequest(
+                    let providerResponse: Response;
+                    if (targetProvider === "openai") {
+                        const openaiReq = convertNativeAnthropicToOpenAI({
+                            ...requestBody,
+                            model: finalModel,
+                        });
+                        const openaiApiKey =
+                            process.env["OPENAI_API_KEY"] ?? "";
+                        if (isStreaming) {
+                            openaiReq.stream = true;
+                            providerResponse = await forwardToOpenAIStream(
+                                openaiReq,
+                                finalModel,
+                                openaiApiKey,
+                            );
+                        } else {
+                            openaiReq.stream = false;
+                            providerResponse = await forwardToOpenAI(
+                                openaiReq,
+                                finalModel,
+                                openaiApiKey,
+                            );
+                        }
+                    } else {
+                        providerResponse = await forwardNativeAnthropicRequest(
                             stripThinkingIfUnsupported(
                                 { ...requestBody, model: finalModel },
                                 finalModel,
@@ -3546,6 +4018,7 @@ export async function startProxy(
                             modelAuth.apiKey,
                             modelAuth.isMax,
                         );
+                    }
                     if (!providerResponse.ok) {
                         const errorPayload =
                             (await providerResponse.json()) as Record<
@@ -3590,71 +4063,66 @@ export async function startProxy(
                         let streamTokensIn = 0;
                         let streamTokensOut = 0;
                         if (reader) {
-                            const decoder = new TextDecoder();
-                            let sseBuffer = "";
-                            try {
-                                while (true) {
-                                    const { done, value } = await reader.read();
-                                    if (done) break;
-                                    const chunk = decoder.decode(value, {
-                                        stream: true,
-                                    });
-                                    res.write(chunk);
-                                    // Parse SSE events to extract usage from message_delta / message_stop
-                                    sseBuffer += chunk;
-                                    const lines = sseBuffer.split("\n");
-                                    sseBuffer = lines.pop() ?? "";
-                                    for (const line of lines) {
-                                        if (line.startsWith("data: ")) {
-                                            try {
-                                                const evt = JSON.parse(
-                                                    line.slice(6),
-                                                );
-                                                // Anthropic: message_delta has usage.output_tokens
-                                                if (
-                                                    evt.type ===
-                                                        "message_delta" &&
-                                                    evt.usage
-                                                ) {
-                                                    streamTokensOut =
+                            if (targetProvider === "openai") {
+                                // Translate OpenAI SSE → Anthropic SSE
+                                const counts =
+                                    await pipeOpenAIStreamAsAnthropic(
+                                        reader,
+                                        res,
+                                        finalModel,
+                                    );
+                                streamTokensIn = counts.tokensIn;
+                                streamTokensOut = counts.tokensOut;
+                            } else {
+                                const decoder = new TextDecoder();
+                                let sseBuffer = "";
+                                try {
+                                    while (true) {
+                                        const { done, value } =
+                                            await reader.read();
+                                        if (done) break;
+                                        const chunk = decoder.decode(value, {
+                                            stream: true,
+                                        });
+                                        res.write(chunk);
+                                        sseBuffer += chunk;
+                                        const lines = sseBuffer.split("\n");
+                                        sseBuffer = lines.pop() ?? "";
+                                        for (const line of lines) {
+                                            if (line.startsWith("data: ")) {
+                                                try {
+                                                    const evt = JSON.parse(
+                                                        line.slice(6),
+                                                    );
+                                                    if (
+                                                        evt.type ===
+                                                            "message_delta" &&
                                                         evt.usage
-                                                            .output_tokens ??
-                                                        streamTokensOut;
+                                                    ) {
+                                                        streamTokensOut =
+                                                            evt.usage
+                                                                .output_tokens ??
+                                                            streamTokensOut;
+                                                    }
+                                                    if (
+                                                        evt.type ===
+                                                            "message_start" &&
+                                                        evt.message?.usage
+                                                    ) {
+                                                        streamTokensIn =
+                                                            evt.message.usage
+                                                                .input_tokens ??
+                                                            streamTokensIn;
+                                                    }
+                                                } catch {
+                                                    // not JSON, skip
                                                 }
-                                                // Anthropic: message_start has usage.input_tokens
-                                                if (
-                                                    evt.type ===
-                                                        "message_start" &&
-                                                    evt.message?.usage
-                                                ) {
-                                                    streamTokensIn =
-                                                        evt.message.usage
-                                                            .input_tokens ??
-                                                        streamTokensIn;
-                                                }
-                                                // OpenAI format: choices with usage
-                                                if (evt.usage) {
-                                                    streamTokensIn =
-                                                        evt.usage
-                                                            .prompt_tokens ??
-                                                        evt.usage
-                                                            .input_tokens ??
-                                                        streamTokensIn;
-                                                    streamTokensOut =
-                                                        evt.usage
-                                                            .completion_tokens ??
-                                                        evt.usage
-                                                            .output_tokens ??
-                                                        streamTokensOut;
-                                                }
-                                            } catch {
-                                                // not JSON, skip
                                             }
                                         }
                                     }
+                                } finally {
+                                    reader.releaseLock();
                                 }
-                            } finally {
-                                reader.releaseLock();
                             }
                         }
                         // Store streaming token counts so telemetry can use them
@@ -3666,11 +4134,24 @@ export async function startProxy(
                         } as Record<string, unknown>;
                         res.end();
                     } else {
-                        nativeResponseData =
-                            (await providerResponse.json()) as Record<
-                                string,
-                                unknown
-                            >;
+                        if (targetProvider === "openai") {
+                            const openaiResponseData =
+                                (await providerResponse.json()) as Record<
+                                    string,
+                                    unknown
+                                >;
+                            nativeResponseData =
+                                convertOpenAIResponseToAnthropic(
+                                    openaiResponseData,
+                                    finalModel,
+                                );
+                        } else {
+                            nativeResponseData =
+                                (await providerResponse.json()) as Record<
+                                    string,
+                                    unknown
+                                >;
+                        }
                         res.writeHead(providerResponse.status, {
                             "Content-Type": "application/json",
                         });
@@ -3917,8 +4398,13 @@ export async function startProxy(
             requestedModel = resolvedModel;
         }
 
-        let routingMode: "auto" | "cost" | "fast" | "quality" | "passthrough" =
-            "auto";
+        let routingMode:
+            | "auto"
+            | "cost"
+            | "fast"
+            | "quality"
+            | "alphadeal"
+            | "passthrough" = "auto";
         let targetModel: string = "";
         let targetProvider: Provider = "anthropic";
 
@@ -3935,6 +4421,15 @@ export async function startProxy(
                 routingMode = "quality";
             }
             // relayplane:auto stays as 'auto'
+        } else if (requestedModel.startsWith("ad:")) {
+            // Handle ad:* AlphaDeal aliases - OpenAI complexity-based routing
+            if (requestedModel === "ad:auto") {
+                routingMode = "alphadeal";
+            } else {
+                // ad:fast, ad:balanced, ad:best, ad:analysis go through passthrough
+                // to resolve via ALPHADEAL_ALIASES
+                routingMode = "passthrough";
+            }
         } else if (requestedModel.startsWith("rp:")) {
             // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
             if (requestedModel === "rp:cost" || requestedModel === "rp:cheap") {
@@ -4041,7 +4536,17 @@ export async function startProxy(
             }
         } else if (!useCascade) {
             let selectedModel: string | null = null;
-            if (routingMode === "cost") {
+            if (routingMode === "alphadeal") {
+                // AlphaDeal: OpenAI complexity-based routing for underwriting/analysis
+                const alphadealConfig = proxyConfig.routing?.alphadeal;
+                selectedModel =
+                    alphadealConfig?.[complexity] ??
+                    ALPHADEAL_COMPLEXITY[complexity];
+                targetProvider = "openai";
+                log(
+                    `AlphaDeal routing: complexity=${complexity} → ${selectedModel}`,
+                );
+            } else if (routingMode === "cost") {
                 selectedModel = getCostModel(proxyConfig);
             } else if (routingMode === "fast") {
                 selectedModel = getFastModel(proxyConfig);
