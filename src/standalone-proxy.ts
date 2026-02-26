@@ -2746,7 +2746,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 </div>
 </div>
 <div class="section"><h2>Model Breakdown</h2>
-<table><thead><tr><th>Model</th><th>Requests</th><th class="col-rt">Auto</th><th class="col-rt">Direct</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
+<table><thead><tr><th>Model</th><th>Requests</th><th class="col-rt" title="Requests where the proxy chose this model via auto-routing">Auto</th><th class="col-rt" title="Requests where the client explicitly requested this model">Direct</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
 <div class="section"><h2>Recent Runs</h2>
 <table><thead><tr><th>Time</th><th>Model</th><th class="col-rt">Source</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
@@ -2779,7 +2779,8 @@ async function load(){
     function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
     $('runs').innerHTML=(runsR.runs||[]).map(r=>{
       const src=r.routingSource==='auto'?'auto':'direct';
-      return '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-rt"><span class="badge rt-'+src+'">'+src+'</span></td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>';
+      const srcTip=src==='auto'?'Proxy selected this model via complexity routing (requested: '+r.original_model+')':'Client explicitly requested this model';
+      return '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-rt"><span class="badge rt-'+src+'" title="'+srcTip+'">'+src+'</span></td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>';
     }).join('')||'<tr><td colspan=10 style="color:#64748b">No runs yet</td></tr>';
     const alerts=[];
     (ovr.overrides||[]).forEach(o=>{
