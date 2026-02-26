@@ -1024,10 +1024,10 @@ export function classifyComplexity(
             )
         );
     }).length;
-    if (toolResultTurns >= 1) score += 1; // any file read → tip into complex with tools
-    if (toolResultTurns >= 4) score += 2; // deep multi-file session → firmly complex
+    if (toolResultTurns >= 3) score += 1; // multi-file session → nudge toward complex
+    if (toolResultTurns >= 6) score += 2; // deep agentic session → firmly complex
 
-    if (score >= 3) return "complex";
+    if (score >= 5) return "complex";
     if (score >= 2) return "moderate";
     return "simple";
 }
