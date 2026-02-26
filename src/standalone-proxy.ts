@@ -1020,7 +1020,10 @@ export function classifyComplexity(
 
     // --- Current-turn signals (what is the user asking NOW?) ---
 
-    // Code patterns in the current message
+    // Code patterns in the current message.
+    // Note: 'let ' is intentionally excluded — it triggers false positives in
+    // natural language (e.g. "let me fix it") when scoring the current user
+    // message. 'const' and 'import' reliably signal code without the ambiguity.
     if (
         /```/.test(currentText) ||
         /function |class |const |import /.test(currentText)
@@ -2750,7 +2753,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 .badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
 .badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
 .badge.rt-auto{background:#052e1633;color:#34d399}.badge.rt-direct{background:#1e293b;color:#94a3b8}
-.badge.auth-passthrough{background:#1e3a5f;color:#60a5fa}.badge.auth-apikey{background:#052e1633;color:#34d399}
+.badge.auth-passthrough{background:#1e3a5f;color:#60a5fa}.badge.auth-auto{background:#2d1b52;color:#a78bfa}.badge.auth-apikey{background:#052e1633;color:#34d399}
 .col-rt .sub{font-size:.7rem;color:#64748b}
 @media(max-width:768px){.col-tt,.col-cx,.col-rt{display:none}}
 .prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;gap:8px;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
@@ -2801,6 +2804,7 @@ const $ = id => document.getElementById(id);
 function fmt(n,d=2){return typeof n==='number'?n.toFixed(d):'-'}
 function fmtTime(s){const d=new Date(s);return d.toLocaleTimeString()}
 function dur(s){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?h+'h '+m+'m':m+'m'}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 async function load(){
   try{
     const [health,stats,runsR,sav,provH,ovr]=await Promise.all([
@@ -2819,14 +2823,14 @@ async function load(){
     $('avgLat').textContent=(stats.summary?.avgLatencyMs??0)+'ms';
     const total=stats.summary?.totalEvents||1;
     $('models').innerHTML=(stats.byModel||[]).map(m=>
-      '<tr><td>'+m.model+'</td><td>'+m.count+'</td><td class="col-rt">'+m.autoCount+'</td><td class="col-rt">'+m.directCount+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(m.count/total*100,1)+'%</td></tr>'
+      '<tr><td>'+esc(m.model)+'</td><td>'+m.count+'</td><td class="col-rt">'+m.autoCount+'</td><td class="col-rt">'+m.directCount+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(m.count/total*100,1)+'%</td></tr>'
     ).join('')||'<tr><td colspan=6 style="color:#64748b">No data yet</td></tr>';
     function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
     function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
     $('runs').innerHTML=(runsR.runs||[]).map(r=>{
       const src=r.routingSource==='auto'?'auto':'direct';
-      const srcTip=src==='auto'?'Proxy selected this model via complexity routing (requested: '+r.original_model+')':'Client explicitly requested this model';
-      return '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-rt"><span class="badge rt-'+src+'" title="'+srcTip+'">'+src+'</span></td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>';
+      const srcTip=src==='auto'?'Proxy selected this model via complexity routing (requested: '+esc(r.original_model)+')':'Client explicitly requested this model';
+      return '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+esc(r.model)+'</td><td class="col-rt"><span class="badge rt-'+src+'" title="'+srcTip+'">'+src+'</span></td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+esc((r.taskType||'general').replace(/_/g,' '))+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+esc(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+esc(r.status)+'</span></td></tr>';
     }).join('')||'<tr><td colspan=10 style="color:#64748b">No runs yet</td></tr>';
     const alerts=[];
     (ovr.overrides||[]).forEach(o=>{
@@ -2835,7 +2839,7 @@ async function load(){
       const detail=o.requestCount>0
         ?o.requestCount+' requests affected · $'+fmt(o.costImpact,4)+' cost impact'+(pct>0?' · '+pct+'% of potential savings lost':'')
         :'No requests affected yet';
-      alerts.push('<div class="alert alert-'+o.severity+'"><span class="alert-icon">'+icon+'</span><div><div>Override: <b>'+o.from+'</b> → <b>'+o.to+'</b></div><div class="alert-detail">'+detail+'</div></div></div>');
+      alerts.push('<div class="alert alert-'+o.severity+'"><span class="alert-icon">'+icon+'</span><div><div>Override: <b>'+esc(o.from)+'</b> → <b>'+esc(o.to)+'</b></div><div class="alert-detail">'+detail+'</div></div></div>');
     });
     if(ovr.totalSavingsLost>0){
       const lostPct=sav.total>0?Math.round(ovr.totalSavingsLost/sav.total*100):0;
@@ -2845,7 +2849,9 @@ async function load(){
     $('providers').innerHTML=(provH.providers||[]).map(p=>{
       const cls=p.status==='healthy'?'up':p.status==='degraded'?'degraded':p.status==='idle'?'idle':'down';
       const authBadge=p.authMode==='passthrough'
-        ?'<span class="badge auth-passthrough" title="OAuth token forwarded from client — no API key needed">passthrough</span>'
+        ?'<span class="badge auth-passthrough" title="OAuth token always forwarded from client — no API key needed">passthrough</span>'
+        :p.authMode==='auto'
+        ?'<span class="badge auth-auto" title="OAuth passthrough when client provides token; falls back to API key env var">auto</span>'
         :p.authMode==='api-key'
         ?'<span class="badge auth-apikey" title="Authenticated via API key environment variable">API key</span>'
         :'';
@@ -3121,6 +3127,12 @@ export async function startProxy(
 
         // === Telemetry endpoints for dashboard ===
         if (pathname.startsWith("/v1/telemetry/")) {
+            // Security note: these endpoints are intentionally unauthenticated.
+            // The proxy binds to 127.0.0.1 by default, making the network
+            // boundary (localhost-only) the security perimeter. If you expose
+            // the proxy on a non-loopback interface (--host 0.0.0.0), you MUST
+            // add your own authentication layer (e.g. a reverse proxy with auth)
+            // before these endpoints in production.
             const telemetryPath = pathname.replace("/v1/telemetry/", "");
             const queryString = url.includes("?")
                 ? (url.split("?")[1] ?? "")
@@ -3384,7 +3396,7 @@ export async function startProxy(
                 const providers: Array<{
                     provider: string;
                     status: string;
-                    authMode: "passthrough" | "api-key" | "none";
+                    authMode: "passthrough" | "auto" | "api-key" | "none";
                     latency: number;
                     successRate: number;
                     lastChecked: string;
@@ -3428,12 +3440,22 @@ export async function startProxy(
                         status = "unconfigured";
                     }
 
-                    const authMode: "passthrough" | "api-key" | "none" =
-                        hasPassthrough
-                            ? "passthrough"
-                            : hasKey
-                              ? "api-key"
-                              : "none";
+                    // Distinguish the three Anthropic auth modes:
+                    // "passthrough" — client OAuth token always forwarded (no env key needed)
+                    // "auto"        — passthrough when client provides token, env key as fallback
+                    // "api-key"     — always use ANTHROPIC_API_KEY env var
+                    const authMode: "passthrough" | "auto" | "api-key" | "none" =
+                        name !== "anthropic"
+                            ? hasKey
+                                ? "api-key"
+                                : "none"
+                            : anthropicAuthMode === "passthrough"
+                              ? "passthrough"
+                              : anthropicAuthMode === "auto"
+                                ? "auto"
+                                : hasKey
+                                  ? "api-key"
+                                  : "none";
                     providers.push({
                         provider: name,
                         status,
@@ -3955,6 +3977,12 @@ export async function startProxy(
                             >;
                         log(`Anthropic error [${providerResponse.status}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`);
 
+                        // TODO: The long-context fallback below and the Sonnet fallback
+                        // further down share identical request-forwarding and response-
+                        // handling logic. Extract a shared helper (e.g. retryWithModel())
+                        // to reduce duplication — tracked in
+                        // https://github.com/alphadeal/proxy/issues/6
+                        //
                         // Long-context fallback: if a downgraded model is rejected with
                         // "Extra usage is required for long context requests", retry using
                         // the original requested model which has extra usage enabled.

@@ -255,9 +255,12 @@ export class ProxyServer {
 
     // Initialize learning engine (Phase 5)
     if (this.config.enableLearning) {
-      // Ledger wraps LedgerStorage as a private field without a public accessor.
-      // createLearningEngine requires LedgerStorage, so extract it at runtime.
-      const ledgerStorage = (this.ledger as unknown as { storage: LedgerStorage }).storage;
+      // TODO: @relayplane/ledger does not expose a public accessor for its
+      // internal LedgerStorage. This cast is a temporary workaround until a
+      // getStorage() method is added to the Ledger interface — see
+      // https://github.com/alphadeal/proxy/issues/5 for tracking.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ledgerStorage = (this.ledger as any).storage as LedgerStorage;
       this.learningEngine = config.learningEngine ?? createLearningEngine(
         ledgerStorage,
         undefined,
