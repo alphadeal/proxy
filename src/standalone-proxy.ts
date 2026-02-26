@@ -576,8 +576,15 @@ const HISTORY_RETENTION_DAYS = 7;
 
 /** Model names that indicate proxy-routed (auto) requests vs direct user requests */
 const AUTO_ROUTING_MODELS = new Set([
-    "relayplane:auto", "relayplane:cost", "relayplane:fast", "relayplane:quality",
-    "rp:auto", "rp:balanced", "rp:best", "rp:fast", "rp:cheap",
+    "relayplane:auto",
+    "relayplane:cost",
+    "relayplane:fast",
+    "relayplane:quality",
+    "rp:auto",
+    "rp:balanced",
+    "rp:best",
+    "rp:fast",
+    "rp:cheap",
 ]);
 
 function isAutoRouted(originalModel: string): boolean {
@@ -987,7 +994,9 @@ export function parseModelSuffix(model: string): ParsedModel {
     for (const suffix of suffixes) {
         if (trimmed.endsWith(`:${suffix}`)) {
             return {
-                baseModel: stripContextAnnotation(trimmed.slice(0, -(suffix.length + 1))),
+                baseModel: stripContextAnnotation(
+                    trimmed.slice(0, -(suffix.length + 1)),
+                ),
                 suffix,
             };
         }
@@ -1083,8 +1092,7 @@ function findLastUserText(
             const isOnlyToolResult =
                 !hasText &&
                 (content as Array<{ type?: string }>).every(
-                    (p) =>
-                        p.type === "tool_result" || p.type === "tool_use",
+                    (p) => p.type === "tool_result" || p.type === "tool_use",
                 );
             if (isOnlyToolResult) continue;
         }
@@ -1182,6 +1190,43 @@ const THINKING_UNSUPPORTED_MODELS = [
     "claude-3-5-haiku-20241022",
     "claude-3-haiku-20240307",
 ];
+
+/**
+ * Models that do not support `tool_reference` content blocks.
+ * These are Sonnet 4+ / Opus 4+ only features as of the claude-haiku-4-5 era.
+ */
+const TOOL_REFERENCE_UNSUPPORTED_MODELS = [
+    "claude-haiku-4-5",
+    "claude-3-5-haiku",
+    "claude-3-haiku",
+];
+
+/**
+ * Returns true if the resolved model name is one that does NOT support
+ * tool_reference content blocks.
+ */
+function isModelToolReferenceUnsupported(model: string): boolean {
+    const lower = model.toLowerCase();
+    return TOOL_REFERENCE_UNSUPPORTED_MODELS.some((m) => lower.includes(m));
+}
+
+/**
+ * Scans all message content arrays for a `tool_reference` block.
+ * Works for both native Anthropic message format and OpenAI-compat format.
+ */
+function hasToolReferenceBlocks(
+    messages: Array<{ content?: unknown; role?: string }>,
+): boolean {
+    for (const msg of messages) {
+        const content = msg.content;
+        if (Array.isArray(content)) {
+            for (const block of content as Array<{ type?: string }>) {
+                if (block?.type === "tool_reference") return true;
+            }
+        }
+    }
+    return false;
+}
 
 function stripThinkingIfUnsupported(
     body: Record<string, unknown>,
@@ -2948,11 +2993,7 @@ function resolveConfigModel(
     return resolveExplicitModel(modelName) ?? parsePreferredModel(modelName);
 }
 
-const RESERVED_PROFILE_PREFIXES = new Set([
-    "rp",
-    "ad",
-    "relayplane",
-]);
+const RESERVED_PROFILE_PREFIXES = new Set(["rp", "ad", "relayplane"]);
 const VALID_PROFILE_STRATEGIES = new Set(["cost", "fast", "quality", "auto"]);
 
 /**
@@ -3682,11 +3723,21 @@ export async function startProxy(
                 // Model breakdown with auto vs direct split
                 const modelMap = new Map<
                     string,
-                    { count: number; cost: number; autoCount: number; directCount: number }
+                    {
+                        count: number;
+                        cost: number;
+                        autoCount: number;
+                        directCount: number;
+                    }
                 >();
                 for (const r of recent) {
                     const key = r.targetModel;
-                    const cur = modelMap.get(key) || { count: 0, cost: 0, autoCount: 0, directCount: 0 };
+                    const cur = modelMap.get(key) || {
+                        count: 0,
+                        cost: 0,
+                        autoCount: 0,
+                        directCount: 0,
+                    };
                     cur.count++;
                     cur.cost += r.costUsd;
                     if (isAutoRouted(r.originalModel)) {
@@ -3777,7 +3828,9 @@ export async function startProxy(
                         provider: r.provider,
                         routed_to: `${r.provider}/${r.targetModel}`,
                         original_model: r.originalModel,
-                        routingSource: isAutoRouted(r.originalModel) ? "auto" : "direct",
+                        routingSource: isAutoRouted(r.originalModel)
+                            ? "auto"
+                            : "direct",
                         taskType: r.taskType || "general",
                         complexity: r.complexity || "simple",
                         costUsd: r.costUsd,
@@ -3860,7 +3913,11 @@ export async function startProxy(
                 const h24ago = now - 86400000;
                 const byHourMap = new Map<
                     string,
-                    { requests: number; actualCost: number; originalCost: number }
+                    {
+                        requests: number;
+                        actualCost: number;
+                        originalCost: number;
+                    }
                 >();
                 for (const r of requestHistory) {
                     const ts = new Date(r.timestamp).getTime();
@@ -3889,8 +3946,7 @@ export async function startProxy(
                         hour,
                         label: hour.slice(11) + ":00",
                         requests: v.requests,
-                        actualCost:
-                            Math.round(v.actualCost * 10000) / 10000,
+                        actualCost: Math.round(v.actualCost * 10000) / 10000,
                         originalCost:
                             Math.round(v.originalCost * 10000) / 10000,
                         saved:
@@ -3937,8 +3993,7 @@ export async function startProxy(
                 for (const [name, ep] of Object.entries(DEFAULT_ENDPOINTS)) {
                     const hasKey = !!process.env[ep.apiKeyEnv];
                     const hasPassthrough =
-                        name === "anthropic" &&
-                        anthropicAuthMode !== "env";
+                        name === "anthropic" && anthropicAuthMode !== "env";
                     const recentRequests = requestHistory.filter(
                         (r) =>
                             r.provider === name &&
@@ -3977,7 +4032,11 @@ export async function startProxy(
                     // "passthrough" — client OAuth token always forwarded (no env key needed)
                     // "auto"        — passthrough when client provides token, env key as fallback
                     // "api-key"     — always use ANTHROPIC_API_KEY env var
-                    const authMode: "passthrough" | "auto" | "api-key" | "none" =
+                    const authMode:
+                        | "passthrough"
+                        | "auto"
+                        | "api-key"
+                        | "none" =
                         name !== "anthropic"
                             ? hasKey
                                 ? "api-key"
@@ -3994,8 +4053,7 @@ export async function startProxy(
                         status,
                         authMode,
                         latency: avgLatency,
-                        successRate:
-                            Math.round(successRate * 10000) / 10000,
+                        successRate: Math.round(successRate * 10000) / 10000,
                         lastChecked: new Date().toISOString(),
                     });
                 }
@@ -4152,7 +4210,9 @@ export async function startProxy(
                 const colonIdx = requestedModel.indexOf(":");
                 if (colonIdx > 0) {
                     const candidateName = requestedModel.substring(0, colonIdx);
-                    const candidateStrategy = requestedModel.substring(colonIdx + 1);
+                    const candidateStrategy = requestedModel.substring(
+                        colonIdx + 1,
+                    );
                     if (
                         proxyConfig.profiles?.[candidateName] &&
                         VALID_PROFILE_STRATEGIES.has(candidateStrategy)
@@ -4177,9 +4237,7 @@ export async function startProxy(
                         proxyConfig.modelOverrides?.[preStripModel] ??
                         proxyConfig.modelOverrides?.[requestedModel];
                     if (override) {
-                        log(
-                            `Model override: ${preStripModel} → ${override}`,
-                        );
+                        log(`Model override: ${preStripModel} → ${override}`);
                         const overrideParsed = parseModelSuffix(override);
                         if (!routingSuffix && overrideParsed.suffix) {
                             routingSuffix = overrideParsed.suffix;
@@ -4279,8 +4337,14 @@ export async function startProxy(
                 // Check if model is valid before passthrough
                 // Invalid models trigger auto mode with sonnet fallback
                 const modelResolved = resolveExplicitModel(requestedModel);
-                if (!modelResolved || (modelResolved.provider === "anthropic" && requestedModel.includes("latest"))) {
-                    log(`Invalid model "${requestedModel}" detected, switching to auto mode with fallback`);
+                if (
+                    !modelResolved ||
+                    (modelResolved.provider === "anthropic" &&
+                        requestedModel.includes("latest"))
+                ) {
+                    log(
+                        `Invalid model "${requestedModel}" detected, switching to auto mode with fallback`,
+                    );
                     routingMode = "auto";
                     requestedModel = "claude-sonnet-4-6";
                 } else {
@@ -4459,6 +4523,25 @@ export async function startProxy(
                 return;
             }
 
+            // Tool-reference guard: haiku models don't support tool_reference
+            // blocks (only Sonnet 4+ / Opus 4+). If the request contains any,
+            // upgrade to the balanced sonnet before sending.
+            if (
+                !useCascade &&
+                isModelToolReferenceUnsupported(targetModel) &&
+                hasToolReferenceBlocks(messages)
+            ) {
+                const upgradeTarget = "claude-sonnet-4-6";
+                const upgradeResolved = resolveExplicitModel(upgradeTarget);
+                if (upgradeResolved) {
+                    log(
+                        `[tool_reference upgrade] ${targetModel} does not support tool_reference blocks → upgrading to ${upgradeResolved.model}`,
+                    );
+                    targetProvider = upgradeResolved.provider;
+                    targetModel = upgradeResolved.model;
+                }
+            }
+
             const startTime = Date.now();
             let nativeResponseData: Record<string, unknown> | undefined;
 
@@ -4606,7 +4689,9 @@ export async function startProxy(
                                 string,
                                 unknown
                             >;
-                        log(`Anthropic error [${providerResponse.status}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`);
+                        log(
+                            `Anthropic error [${providerResponse.status}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`,
+                        );
 
                         // TODO: The long-context fallback below and the Sonnet fallback
                         // further down share identical request-forwarding and response-
@@ -4629,18 +4714,16 @@ export async function startProxy(
                             );
                         const wasDowngraded =
                             originalModel &&
-                            originalModel !==
-                                (targetModel || requestedModel);
+                            originalModel !== (targetModel || requestedModel);
 
                         if (isLongContextError && wasDowngraded) {
                             log(
                                 `[ALERT] Long-context fallback: downgraded model ${targetModel || requestedModel} rejected. Retrying with original model: ${originalModel}`,
                             );
-                            const fallbackResolved =
-                                resolveExplicitModel(originalModel!);
-                            if (
-                                fallbackResolved?.provider === "anthropic"
-                            ) {
+                            const fallbackResolved = resolveExplicitModel(
+                                originalModel!,
+                            );
+                            if (fallbackResolved?.provider === "anthropic") {
                                 const fallbackAuth = getAuthForModel(
                                     fallbackResolved.model,
                                     proxyConfig.auth,
@@ -4661,18 +4744,13 @@ export async function startProxy(
                                     );
                                 if (fallbackResponse.ok) {
                                     targetModel = fallbackResolved.model;
-                                    const durationMs =
-                                        Date.now() - startTime;
+                                    const durationMs = Date.now() - startTime;
                                     if (isStreaming) {
-                                        res.writeHead(
-                                            fallbackResponse.status,
-                                            {
-                                                "Content-Type":
-                                                    "text/event-stream",
-                                                "Cache-Control": "no-cache",
-                                                Connection: "keep-alive",
-                                            },
-                                        );
+                                        res.writeHead(fallbackResponse.status, {
+                                            "Content-Type": "text/event-stream",
+                                            "Cache-Control": "no-cache",
+                                            Connection: "keep-alive",
+                                        });
                                         const reader =
                                             fallbackResponse.body?.getReader();
                                         if (reader) {
@@ -4695,16 +4773,10 @@ export async function startProxy(
                                                 string,
                                                 unknown
                                             >;
-                                        res.writeHead(
-                                            fallbackResponse.status,
-                                            {
-                                                "Content-Type":
-                                                    "application/json",
-                                            },
-                                        );
-                                        res.end(
-                                            JSON.stringify(fallbackData),
-                                        );
+                                        res.writeHead(fallbackResponse.status, {
+                                            "Content-Type": "application/json",
+                                        });
+                                        res.end(JSON.stringify(fallbackData));
                                     }
                                     logRequest(
                                         originalModel ?? "unknown",
@@ -4742,8 +4814,7 @@ export async function startProxy(
                         ].includes(providerResponse.status);
                         const isAlreadySonnet =
                             finalModel === SONNET_FALLBACK_MODEL;
-                        const isNonPassthrough =
-                            routingMode !== "passthrough";
+                        const isNonPassthrough = routingMode !== "passthrough";
 
                         if (
                             isFallbackTriggerStatus &&
@@ -4754,8 +4825,9 @@ export async function startProxy(
                             log(
                                 `[ALERT] Sonnet fallback: model ${finalModel} failed [${providerResponse.status}]. Retrying with ${SONNET_FALLBACK_MODEL}`,
                             );
-                            const sonnetResolved =
-                                resolveExplicitModel(SONNET_FALLBACK_MODEL);
+                            const sonnetResolved = resolveExplicitModel(
+                                SONNET_FALLBACK_MODEL,
+                            );
                             if (sonnetResolved?.provider === "anthropic") {
                                 const sonnetAuth = getAuthForModel(
                                     sonnetResolved.model,
@@ -4777,18 +4849,13 @@ export async function startProxy(
                                     );
                                 if (sonnetResponse.ok) {
                                     targetModel = sonnetResolved.model;
-                                    const durationMs =
-                                        Date.now() - startTime;
+                                    const durationMs = Date.now() - startTime;
                                     if (isStreaming) {
-                                        res.writeHead(
-                                            sonnetResponse.status,
-                                            {
-                                                "Content-Type":
-                                                    "text/event-stream",
-                                                "Cache-Control": "no-cache",
-                                                Connection: "keep-alive",
-                                            },
-                                        );
+                                        res.writeHead(sonnetResponse.status, {
+                                            "Content-Type": "text/event-stream",
+                                            "Cache-Control": "no-cache",
+                                            Connection: "keep-alive",
+                                        });
                                         const reader =
                                             sonnetResponse.body?.getReader();
                                         if (reader) {
@@ -4811,16 +4878,10 @@ export async function startProxy(
                                                 string,
                                                 unknown
                                             >;
-                                        res.writeHead(
-                                            sonnetResponse.status,
-                                            {
-                                                "Content-Type":
-                                                    "application/json",
-                                            },
-                                        );
-                                        res.end(
-                                            JSON.stringify(sonnetData),
-                                        );
+                                        res.writeHead(sonnetResponse.status, {
+                                            "Content-Type": "application/json",
+                                        });
+                                        res.end(JSON.stringify(sonnetData));
                                     }
                                     logRequest(
                                         originalModel ?? "unknown",
@@ -4838,9 +4899,10 @@ export async function startProxy(
                                     const sonnetErrPayload =
                                         (await sonnetResponse
                                             .json()
-                                            .catch(
-                                                () => ({}),
-                                            )) as Record<string, unknown>;
+                                            .catch(() => ({}))) as Record<
+                                            string,
+                                            unknown
+                                        >;
                                     log(
                                         `[ALERT] Sonnet fallback also failed [${sonnetResponse.status}]: ${JSON.stringify(sonnetErrPayload)}`,
                                     );
@@ -5123,10 +5185,26 @@ export async function startProxy(
                 { id: `${name}:quality`, object: "model", owned_by: name },
             ]);
             const relayplaneModels = [
-                { id: "relayplane:auto", object: "model", owned_by: "relayplane" },
-                { id: "relayplane:cost", object: "model", owned_by: "relayplane" },
-                { id: "relayplane:fast", object: "model", owned_by: "relayplane" },
-                { id: "relayplane:quality", object: "model", owned_by: "relayplane" },
+                {
+                    id: "relayplane:auto",
+                    object: "model",
+                    owned_by: "relayplane",
+                },
+                {
+                    id: "relayplane:cost",
+                    object: "model",
+                    owned_by: "relayplane",
+                },
+                {
+                    id: "relayplane:fast",
+                    object: "model",
+                    owned_by: "relayplane",
+                },
+                {
+                    id: "relayplane:quality",
+                    object: "model",
+                    owned_by: "relayplane",
+                },
                 ...profileModels,
             ];
 
@@ -5226,9 +5304,7 @@ export async function startProxy(
                     proxyConfig.modelOverrides?.[preStripModel] ??
                     proxyConfig.modelOverrides?.[requestedModel];
                 if (override) {
-                    log(
-                        `Model override: ${preStripModel} → ${override}`,
-                    );
+                    log(`Model override: ${preStripModel} → ${override}`);
                     const overrideParsed = parseModelSuffix(override);
                     if (!routingSuffix && overrideParsed.suffix) {
                         routingSuffix = overrideParsed.suffix;
@@ -5240,9 +5316,7 @@ export async function startProxy(
             // Resolve aliases (e.g., relayplane:auto → rp:balanced)
             const resolvedModel = resolveModelAlias(requestedModel);
             if (resolvedModel !== requestedModel) {
-                log(
-                    `Alias resolution: ${requestedModel} → ${resolvedModel}`,
-                );
+                log(`Alias resolution: ${requestedModel} → ${resolvedModel}`);
                 requestedModel = resolvedModel;
             }
         }
@@ -5324,8 +5398,14 @@ export async function startProxy(
             // Check if model is valid before passthrough
             // Invalid models trigger auto mode with sonnet fallback
             const modelResolved = resolveExplicitModel(requestedModel);
-            if (!modelResolved || (modelResolved.provider === "anthropic" && requestedModel.includes("latest"))) {
-                log(`Invalid model "${requestedModel}" detected, switching to auto mode with fallback`);
+            if (
+                !modelResolved ||
+                (modelResolved.provider === "anthropic" &&
+                    requestedModel.includes("latest"))
+            ) {
+                log(
+                    `Invalid model "${requestedModel}" detected, switching to auto mode with fallback`,
+                );
                 routingMode = "auto";
                 requestedModel = "claude-sonnet-4-6";
             } else {
@@ -5491,6 +5571,30 @@ export async function startProxy(
             log(
                 `Cascade routing enabled with models: ${cascadeConfig?.models?.join(", ") ?? ""}`,
             );
+        }
+
+        // Tool-reference guard: haiku models don't support tool_reference
+        // blocks (only Sonnet 4+ / Opus 4+). If the request contains any,
+        // upgrade to the balanced sonnet before sending.
+        if (
+            !useCascade &&
+            isModelToolReferenceUnsupported(targetModel) &&
+            hasToolReferenceBlocks(
+                (request.messages ?? []) as Array<{
+                    content?: unknown;
+                    role?: string;
+                }>,
+            )
+        ) {
+            const upgradeTarget = "claude-sonnet-4-6";
+            const upgradeResolved = resolveExplicitModel(upgradeTarget);
+            if (upgradeResolved) {
+                log(
+                    `[tool_reference upgrade] ${targetModel} does not support tool_reference blocks → upgrading to ${upgradeResolved.model}`,
+                );
+                targetProvider = upgradeResolved.provider;
+                targetModel = upgradeResolved.model;
+            }
         }
 
         const cooldownsEnabled =
