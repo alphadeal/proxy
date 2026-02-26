@@ -19,6 +19,7 @@
  * @packageDocumentation
  */
 
+import * as crypto from "node:crypto";
 import * as http from "node:http";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -153,6 +154,10 @@ export const MODEL_MAPPING: Record<
     "gpt-4o": { provider: "openai", model: "gpt-4o" },
     "gpt-4o-mini": { provider: "openai", model: "gpt-4o-mini" },
     "gpt-4.1": { provider: "openai", model: "gpt-4.1" },
+    // OpenAI GPT-5 series
+    "gpt-5-nano": { provider: "openai", model: "gpt-5-nano" },
+    "gpt-5.2": { provider: "openai", model: "gpt-5.2" },
+    "gpt-5.2-pro": { provider: "openai", model: "gpt-5.2-pro" },
 };
 
 /**
@@ -182,6 +187,34 @@ export const SMART_ALIASES: Record<
         provider: "anthropic",
         model: "claude-sonnet-4-6",
     },
+};
+
+/**
+ * AlphaDeal routing aliases - OpenAI-focused complexity-based routing
+ * for underwriting and analysis workloads
+ */
+export const ALPHADEAL_ALIASES: Record<
+    string,
+    { provider: Provider; model: string }
+> = {
+    // Direct model aliases
+    "ad:fast": { provider: "openai", model: "gpt-5-nano" },
+    "ad:balanced": { provider: "openai", model: "gpt-5.2" },
+    "ad:best": { provider: "openai", model: "gpt-5.2-pro" },
+    "ad:analysis": { provider: "openai", model: "gpt-5.2-pro" },
+};
+
+/**
+ * AlphaDeal complexity-based routing defaults
+ * Maps task complexity to appropriate OpenAI model
+ */
+export const ALPHADEAL_COMPLEXITY: Record<
+    "simple" | "moderate" | "complex",
+    string
+> = {
+    simple: "gpt-5-nano",
+    moderate: "gpt-5.2",
+    complex: "gpt-5.2-pro",
 };
 
 /**
@@ -218,16 +251,33 @@ function sendCloudTelemetry(
 /**
  * Get all available model names for error suggestions
  */
-export function getAvailableModelNames(): string[] {
+export function getAvailableModelNames(
+    config?: RelayPlaneProxyConfigFile,
+): string[] {
+    const profileEntries: string[] = [];
+    if (config?.profiles) {
+        for (const name of Object.keys(config.profiles)) {
+            profileEntries.push(
+                `${name}:auto`,
+                `${name}:cost`,
+                `${name}:fast`,
+                `${name}:quality`,
+            );
+        }
+    }
     return [
         ...Object.keys(MODEL_MAPPING),
         ...Object.keys(SMART_ALIASES),
+        ...Object.keys(ALPHADEAL_ALIASES),
         ...Object.keys(RELAYPLANE_ALIASES),
+        ...profileEntries,
         // Add common model prefixes users might type
         "relayplane:auto",
         "relayplane:cost",
         "relayplane:fast",
         "relayplane:quality",
+        // AlphaDeal prefixes
+        "ad:auto",
     ];
 }
 
@@ -314,14 +364,37 @@ interface ComplexityConfig {
     complex: string;
 }
 
+interface AlphadealConfig {
+    enabled: boolean;
+    simple: string;
+    moderate: string;
+    complex: string;
+}
+
 interface RoutingConfig {
     mode: "standard" | "cascade";
     cascade: CascadeConfig;
     complexity: ComplexityConfig;
+    alphadeal: AlphadealConfig;
 }
 
 interface ReliabilityConfig {
     cooldowns: CooldownConfig;
+}
+
+/** Complexity-based auto-routing configuration for a profile */
+interface ProfileAutoConfig {
+    simple: string;
+    moderate: string;
+    complex: string;
+}
+
+/** A named routing profile mapping strategies to concrete model names */
+interface RoutingProfile {
+    cost: string;
+    fast: string;
+    quality: string;
+    auto: ProfileAutoConfig;
 }
 
 type Complexity = "simple" | "moderate" | "complex";
@@ -437,6 +510,7 @@ interface RelayPlaneProxyConfigFile {
     routing?: Partial<RoutingConfig>;
     reliability?: { cooldowns?: Partial<CooldownConfig> };
     auth?: HybridAuthConfig;
+    profiles?: Record<string, RoutingProfile>;
     [key: string]: unknown;
 }
 
@@ -724,6 +798,7 @@ function updateLastHistoryEntry(
 const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
     enabled: true,
     modelOverrides: {},
+    profiles: {},
     routing: {
         mode: "cascade",
         cascade: {
@@ -741,6 +816,12 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
             simple: "claude-3-5-haiku-20241022",
             moderate: "claude-sonnet-4-20250514",
             complex: "claude-opus-4-20250514",
+        },
+        alphadeal: {
+            enabled: true,
+            simple: "gpt-5-nano",
+            moderate: "gpt-5.2",
+            complex: "gpt-5.2-pro",
         },
     },
     reliability: {
@@ -772,11 +853,16 @@ function normalizeProxyConfig(
         ...defaultRouting.complexity,
         ...(configRouting.complexity ?? {}),
     };
+    const alphadeal = {
+        ...defaultRouting.alphadeal,
+        ...(configRouting.alphadeal ?? {}),
+    };
     const routing: RoutingConfig = {
         ...defaultRouting,
         ...configRouting,
         cascade,
         complexity,
+        alphadeal,
     };
     const defaultReliability =
         DEFAULT_PROXY_CONFIG.reliability as ReliabilityConfig;
@@ -804,6 +890,7 @@ function normalizeProxyConfig(
         },
         routing,
         reliability,
+        profiles: (config?.profiles ?? {}) as Record<string, RoutingProfile>,
         enabled:
             config?.enabled !== undefined
                 ? !!config.enabled
@@ -1303,6 +1390,393 @@ async function forwardNativeAnthropicRequest(
     });
 
     return response;
+}
+
+/**
+ * Convert a native Anthropic /v1/messages request body to OpenAI ChatRequest format.
+ * Used when /v1/messages needs to be routed to an OpenAI model.
+ */
+function convertNativeAnthropicToOpenAI(
+    body: Record<string, unknown>,
+): ChatRequest {
+    const messages: Array<{
+        role: string;
+        content: string | unknown;
+        [key: string]: unknown;
+    }> = [];
+
+    // Add system message if present
+    if (body["system"] && typeof body["system"] === "string") {
+        messages.push({ role: "system", content: body["system"] });
+    } else if (Array.isArray(body["system"])) {
+        // system can be an array of content blocks
+        const text = (body["system"] as Array<{ type: string; text?: string }>)
+            .filter((b) => b.type === "text")
+            .map((b) => b.text ?? "")
+            .join("\n");
+        if (text) messages.push({ role: "system", content: text });
+    }
+
+    // Convert Anthropic messages to OpenAI format
+    const anthropicMessages =
+        (body["messages"] as Array<Record<string, unknown>>) ?? [];
+    for (const msg of anthropicMessages) {
+        const role = msg["role"] as string;
+        const content = msg["content"];
+
+        if (typeof content === "string") {
+            messages.push({ role, content });
+            continue;
+        }
+
+        if (Array.isArray(content)) {
+            // Check for tool_use blocks (assistant tool calls)
+            const toolUseBlocks = content.filter(
+                (b: unknown) =>
+                    (b as Record<string, unknown>)["type"] === "tool_use",
+            );
+            const textBlocks = content.filter(
+                (b: unknown) =>
+                    (b as Record<string, unknown>)["type"] === "text",
+            );
+            const toolResultBlocks = content.filter(
+                (b: unknown) =>
+                    (b as Record<string, unknown>)["type"] === "tool_result",
+            );
+
+            if (toolResultBlocks.length > 0) {
+                // Anthropic tool_result → OpenAI tool messages
+                for (const block of toolResultBlocks) {
+                    const b = block as Record<string, unknown>;
+                    messages.push({
+                        role: "tool",
+                        tool_call_id: b["tool_use_id"] as string,
+                        content:
+                            typeof b["content"] === "string"
+                                ? b["content"]
+                                : JSON.stringify(b["content"]),
+                    });
+                }
+                // Also emit any text blocks present in the same message
+                const textContent = textBlocks
+                    .map(
+                        (b: unknown) =>
+                            (b as Record<string, unknown>)["text"] as string,
+                    )
+                    .join("\n");
+                if (textContent) {
+                    messages.push({ role: "user", content: textContent });
+                }
+                continue;
+            }
+
+            if (role === "assistant" && toolUseBlocks.length > 0) {
+                const textContent = textBlocks
+                    .map(
+                        (b: unknown) =>
+                            (b as Record<string, unknown>)["text"] as string,
+                    )
+                    .join("");
+                const tool_calls = toolUseBlocks.map((b: unknown) => {
+                    const block = b as Record<string, unknown>;
+                    return {
+                        id: block["id"] as string,
+                        type: "function",
+                        function: {
+                            name: block["name"] as string,
+                            arguments: JSON.stringify(block["input"] ?? {}),
+                        },
+                    };
+                });
+                messages.push({
+                    role: "assistant",
+                    content: textContent || null,
+                    tool_calls,
+                });
+                continue;
+            }
+
+            // Regular content blocks — flatten to string
+            const text = (content as Array<Record<string, unknown>>)
+                .filter((b) => b["type"] === "text")
+                .map((b) => b["text"] as string)
+                .join("");
+            messages.push({ role, content: text });
+            continue;
+        }
+
+        messages.push({ role, content: content as string });
+    }
+
+    // Convert Anthropic tools to OpenAI format
+    let tools: unknown[] | undefined;
+    if (Array.isArray(body["tools"])) {
+        tools = (body["tools"] as Array<Record<string, unknown>>).map((t) => ({
+            type: "function",
+            function: {
+                name: t["name"],
+                description: t["description"],
+                parameters: t["input_schema"] ?? {
+                    type: "object",
+                    properties: {},
+                },
+            },
+        }));
+    }
+
+    const targetModel = body["model"] as string;
+    const maxTokens = Math.min((body["max_tokens"] as number) ?? 4096, 16384);
+    // GPT-5 and newer models use max_completion_tokens instead of max_tokens
+    const usesCompletionTokens =
+        targetModel.startsWith("gpt-5") ||
+        targetModel.startsWith("o1") ||
+        targetModel.startsWith("o3") ||
+        targetModel.startsWith("o4");
+    const req: ChatRequest = {
+        model: targetModel,
+        messages,
+        ...(usesCompletionTokens
+            ? { max_completion_tokens: maxTokens }
+            : { max_tokens: maxTokens }),
+        stream: (body["stream"] as boolean) ?? false,
+    };
+
+    if (body["temperature"] !== undefined) {
+        req.temperature = body["temperature"] as number;
+    }
+    if (tools && tools.length > 0) {
+        req.tools = tools;
+    }
+
+    return req;
+}
+
+/**
+ * Convert a non-streaming OpenAI response to native Anthropic /v1/messages format.
+ */
+function convertOpenAIResponseToAnthropic(
+    openaiResponse: Record<string, unknown>,
+    model: string,
+): Record<string, unknown> {
+    const choices =
+        (openaiResponse["choices"] as Array<Record<string, unknown>>) ?? [];
+    const choice = choices[0] ?? {};
+    const message = (choice["message"] as Record<string, unknown>) ?? {};
+    const usage = (openaiResponse["usage"] as Record<string, unknown>) ?? {};
+
+    const content: unknown[] = [];
+
+    // Text content
+    if (message["content"] && typeof message["content"] === "string") {
+        content.push({ type: "text", text: message["content"] });
+    }
+
+    // Tool calls → tool_use blocks
+    if (Array.isArray(message["tool_calls"])) {
+        for (const tc of message["tool_calls"] as Array<
+            Record<string, unknown>
+        >) {
+            const fn = tc["function"] as Record<string, unknown>;
+            let input: unknown = {};
+            try {
+                input = JSON.parse(fn["arguments"] as string);
+            } catch {
+                input = {};
+            }
+            content.push({
+                type: "tool_use",
+                id: tc["id"],
+                name: fn["name"],
+                input,
+            });
+        }
+    }
+
+    const stopReason =
+        choice["finish_reason"] === "tool_calls" ? "tool_use" : "end_turn";
+
+    return {
+        id: `msg_${crypto.randomUUID()}`,
+        type: "message",
+        role: "assistant",
+        content,
+        model,
+        stop_reason: stopReason,
+        stop_sequence: null,
+        usage: {
+            input_tokens: usage["prompt_tokens"] ?? 0,
+            output_tokens: usage["completion_tokens"] ?? 0,
+        },
+    };
+}
+
+/**
+ * Read an OpenAI SSE stream and write it as Anthropic SSE events to res.
+ * Returns { tokensIn, tokensOut } extracted from the stream.
+ */
+async function pipeOpenAIStreamAsAnthropic(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+    res: import("http").ServerResponse,
+    model: string,
+): Promise<{ tokensIn: number; tokensOut: number }> {
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let tokensIn = 0;
+    let tokensOut = 0;
+    const messageId = `msg_${crypto.randomUUID()}`;
+
+    // Send message_start
+    const messageStart = {
+        type: "message_start",
+        message: {
+            id: messageId,
+            type: "message",
+            role: "assistant",
+            content: [],
+            model,
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+        },
+    };
+    res.write(
+        `event: message_start\ndata: ${JSON.stringify(messageStart)}\n\n`,
+    );
+
+    // Send content_block_start for index 0
+    res.write(
+        `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}\n\n`,
+    );
+    res.write(`event: ping\ndata: ${JSON.stringify({ type: "ping" })}\n\n`);
+
+    let hasToolCalls = false;
+    // tool call accumulation: index → { id, name, arguments }
+    // Using Map to avoid prototype pollution via __proto__ keys
+    const toolCallAccum = new Map<
+        number,
+        { id: string; name: string; arguments: string }
+    >();
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split("\n");
+            buffer = lines.pop() ?? "";
+
+            for (const line of lines) {
+                if (!line.startsWith("data: ")) continue;
+                const data = line.slice(6).trim();
+                if (data === "[DONE]") continue;
+
+                let evt: Record<string, unknown>;
+                try {
+                    evt = JSON.parse(data) as Record<string, unknown>;
+                } catch {
+                    continue;
+                }
+
+                // Extract usage if present
+                if (evt["usage"]) {
+                    const u = evt["usage"] as Record<string, unknown>;
+                    tokensIn = (u["prompt_tokens"] as number) ?? tokensIn;
+                    tokensOut = (u["completion_tokens"] as number) ?? tokensOut;
+                }
+
+                const choices = evt["choices"] as
+                    | Array<Record<string, unknown>>
+                    | undefined;
+                if (!choices || choices.length === 0) continue;
+                const delta = choices[0]["delta"] as
+                    | Record<string, unknown>
+                    | undefined;
+                if (!delta) continue;
+
+                // Text delta
+                if (
+                    typeof delta["content"] === "string" &&
+                    delta["content"].length > 0
+                ) {
+                    res.write(
+                        `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta["content"] } })}\n\n`,
+                    );
+                }
+
+                // Tool call deltas
+                if (Array.isArray(delta["tool_calls"])) {
+                    hasToolCalls = true;
+                    for (const tc of delta["tool_calls"] as Array<
+                        Record<string, unknown>
+                    >) {
+                        const idx = tc["index"] as number;
+                        const fn = tc["function"] as
+                            | Record<string, unknown>
+                            | undefined;
+                        if (!toolCallAccum.has(idx)) {
+                            toolCallAccum.set(idx, {
+                                id: (tc["id"] as string) ?? "",
+                                name: "",
+                                arguments: "",
+                            });
+                        }
+                        const accum = toolCallAccum.get(idx)!;
+                        if (tc["id"]) accum.id = tc["id"] as string;
+                        if (fn?.["name"]) accum.name += fn["name"] as string;
+                        if (fn?.["arguments"])
+                            accum.arguments += fn["arguments"] as string;
+                    }
+                }
+
+                // finish_reason
+                const finishReason = choices[0]["finish_reason"] as
+                    | string
+                    | null;
+                if (finishReason) {
+                    // Close text block
+                    res.write(
+                        `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`,
+                    );
+
+                    // Emit tool_use blocks if any
+                    if (hasToolCalls) {
+                        let blockIndex = 1;
+                        for (const tc of toolCallAccum.values()) {
+                            let input: unknown = {};
+                            try {
+                                input = JSON.parse(tc.arguments);
+                            } catch {
+                                input = {};
+                            }
+                            res.write(
+                                `event: content_block_start\ndata: ${JSON.stringify({ type: "content_block_start", index: blockIndex, content_block: { type: "tool_use", id: tc.id, name: tc.name, input: {} } })}\n\n`,
+                            );
+                            res.write(
+                                `event: content_block_delta\ndata: ${JSON.stringify({ type: "content_block_delta", index: blockIndex, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } })}\n\n`,
+                            );
+                            res.write(
+                                `event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: blockIndex })}\n\n`,
+                            );
+                            blockIndex++;
+                        }
+                    }
+
+                    const stopReason =
+                        finishReason === "tool_calls" ? "tool_use" : "end_turn";
+                    res.write(
+                        `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: tokensOut } })}\n\n`,
+                    );
+                    res.write(
+                        `event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`,
+                    );
+                }
+            }
+        }
+    } finally {
+        reader.releaseLock();
+    }
+
+    return { tokensIn, tokensOut };
 }
 
 /**
@@ -2390,6 +2864,11 @@ function resolveExplicitModel(
         return SMART_ALIASES[resolvedAlias];
     }
 
+    // Check ALPHADEAL_ALIASES (ad:fast, ad:balanced, ad:best, ad:analysis)
+    if (ALPHADEAL_ALIASES[resolvedAlias]) {
+        return ALPHADEAL_ALIASES[resolvedAlias];
+    }
+
     // Check MODEL_MAPPING (aliases)
     if (MODEL_MAPPING[resolvedAlias]) {
         return MODEL_MAPPING[resolvedAlias];
@@ -2467,6 +2946,60 @@ function resolveConfigModel(
     modelName: string,
 ): { provider: Provider; model: string } | null {
     return resolveExplicitModel(modelName) ?? parsePreferredModel(modelName);
+}
+
+const RESERVED_PROFILE_PREFIXES = new Set([
+    "rp",
+    "ad",
+    "relayplane",
+]);
+const VALID_PROFILE_STRATEGIES = new Set(["cost", "fast", "quality", "auto"]);
+
+/**
+ * Resolve a profile:strategy model reference to a concrete provider/model.
+ * Returns null if not a valid profile reference.
+ */
+function resolveProfileModel(
+    modelName: string,
+    config: RelayPlaneProxyConfigFile,
+    complexity: Complexity,
+): { provider: Provider; model: string; strategy: string } | null {
+    const colonIdx = modelName.indexOf(":");
+    if (colonIdx <= 0) return null;
+
+    const profileName = modelName.substring(0, colonIdx);
+    const strategy = modelName.substring(colonIdx + 1);
+
+    if (RESERVED_PROFILE_PREFIXES.has(profileName)) return null;
+    if (!VALID_PROFILE_STRATEGIES.has(strategy)) return null;
+
+    const profile = config.profiles?.[profileName];
+    if (!profile) return null;
+
+    let targetModelName: string | undefined;
+    switch (strategy) {
+        case "cost":
+            targetModelName = profile.cost;
+            break;
+        case "fast":
+            targetModelName = profile.fast;
+            break;
+        case "quality":
+            targetModelName = profile.quality;
+            break;
+        case "auto":
+            targetModelName = profile.auto?.[complexity];
+            break;
+        default:
+            return null;
+    }
+
+    if (!targetModelName) return null;
+
+    const resolved = resolveExplicitModel(targetModelName);
+    if (!resolved) return null;
+
+    return { provider: resolved.provider, model: resolved.model, strategy };
 }
 
 function extractResponseText(responseData: Record<string, unknown>): string {
@@ -3613,37 +4146,60 @@ export async function startProxy(
                 );
             }
 
-            const preStripModel = requestedModel;
-            const parsedModel = parseModelSuffix(requestedModel);
-            let routingSuffix = parsedModel.suffix;
-            requestedModel = parsedModel.baseModel;
-
-            if (relayplaneEnabled && !relayplaneBypass && requestedModel) {
-                // Check original model name (e.g. claude-opus-4-6[1m]) before the
-                // stripped name so config overrides for annotated variants take priority
-                // over overrides for the base model (e.g. claude-opus-4-6 → relayplane:auto).
-                const override =
-                    proxyConfig.modelOverrides?.[preStripModel] ??
-                    proxyConfig.modelOverrides?.[requestedModel];
-                if (override) {
-                    log(`Model override: ${preStripModel} → ${override}`);
-                    const overrideParsed = parseModelSuffix(override);
-                    if (!routingSuffix && overrideParsed.suffix) {
-                        routingSuffix = overrideParsed.suffix;
+            // Check for profile:strategy before parseModelSuffix strips the colon
+            let profileMatch = false;
+            {
+                const colonIdx = requestedModel.indexOf(":");
+                if (colonIdx > 0) {
+                    const candidateName = requestedModel.substring(0, colonIdx);
+                    const candidateStrategy = requestedModel.substring(colonIdx + 1);
+                    if (
+                        proxyConfig.profiles?.[candidateName] &&
+                        VALID_PROFILE_STRATEGIES.has(candidateStrategy)
+                    ) {
+                        profileMatch = true;
                     }
-                    requestedModel = overrideParsed.baseModel;
                 }
             }
 
-            // Resolve aliases (e.g., relayplane:auto → rp:balanced)
-            const resolvedModel = resolveModelAlias(requestedModel);
-            if (resolvedModel !== requestedModel) {
-                log(`Alias resolution: ${requestedModel} → ${resolvedModel}`);
-                requestedModel = resolvedModel;
-            }
+            let routingSuffix: RoutingSuffix | null = null;
+            if (!profileMatch) {
+                // Track annotated model name (e.g. claude-opus-4-6[1m]) before
+                // parseModelSuffix strips the annotation, so config overrides for
+                // annotated variants take priority over base-model overrides.
+                const preStripModel = requestedModel;
+                const parsedModel = parseModelSuffix(requestedModel);
+                routingSuffix = parsedModel.suffix;
+                requestedModel = parsedModel.baseModel;
 
-            if (requestedModel && requestedModel !== originalModel) {
-                requestBody["model"] = requestedModel;
+                if (relayplaneEnabled && !relayplaneBypass && requestedModel) {
+                    const override =
+                        proxyConfig.modelOverrides?.[preStripModel] ??
+                        proxyConfig.modelOverrides?.[requestedModel];
+                    if (override) {
+                        log(
+                            `Model override: ${preStripModel} → ${override}`,
+                        );
+                        const overrideParsed = parseModelSuffix(override);
+                        if (!routingSuffix && overrideParsed.suffix) {
+                            routingSuffix = overrideParsed.suffix;
+                        }
+                        requestedModel = overrideParsed.baseModel;
+                    }
+                }
+
+                // Resolve aliases (e.g., relayplane:auto → rp:balanced)
+                const resolvedModel = resolveModelAlias(requestedModel);
+                if (resolvedModel !== requestedModel) {
+                    log(
+                        `Alias resolution: ${requestedModel} → ${resolvedModel}`,
+                    );
+                    requestedModel = resolvedModel;
+                }
+
+                if (requestedModel && requestedModel !== originalModel) {
+                    requestBody["model"] = requestedModel;
+                }
             }
 
             let routingMode:
@@ -3651,8 +4207,12 @@ export async function startProxy(
                 | "cost"
                 | "fast"
                 | "quality"
+                | "alphadeal"
+                | "profile"
                 | "passthrough" = "auto";
-            if (!relayplaneEnabled || relayplaneBypass) {
+            if (profileMatch) {
+                routingMode = "profile";
+            } else if (!relayplaneEnabled || relayplaneBypass) {
                 routingMode = "passthrough";
             } else if (routingSuffix) {
                 routingMode = routingSuffix;
@@ -3665,6 +4225,15 @@ export async function startProxy(
                     routingMode = "quality";
                 }
                 // relayplane:auto stays as 'auto'
+            } else if (requestedModel.startsWith("ad:")) {
+                // Handle ad:* AlphaDeal aliases - OpenAI complexity-based routing
+                if (requestedModel === "ad:auto") {
+                    routingMode = "alphadeal";
+                } else {
+                    // ad:fast, ad:balanced, ad:best, ad:analysis go through passthrough
+                    // to resolve via ALPHADEAL_ALIASES
+                    routingMode = "passthrough";
+                }
             } else if (requestedModel.startsWith("rp:")) {
                 // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
                 if (
@@ -3777,7 +4346,30 @@ export async function startProxy(
                 }
             }
 
-            if (routingMode === "passthrough") {
+            if (routingMode === "profile") {
+                const resolved = resolveProfileModel(
+                    requestedModel,
+                    proxyConfig,
+                    complexity,
+                );
+                if (!resolved) {
+                    res.writeHead(400, { "Content-Type": "application/json" });
+                    res.end(
+                        JSON.stringify(
+                            buildModelNotFoundError(
+                                requestedModel,
+                                getAvailableModelNames(proxyConfig),
+                            ),
+                        ),
+                    );
+                    return;
+                }
+                targetProvider = resolved.provider;
+                targetModel = resolved.model;
+                log(
+                    `Profile routing (messages): ${requestedModel} → ${targetProvider}/${targetModel} (strategy: ${resolved.strategy}, complexity: ${complexity})`,
+                );
+            } else if (routingMode === "passthrough") {
                 const resolved = resolveExplicitModel(requestedModel);
                 if (!resolved) {
                     res.writeHead(400, { "Content-Type": "application/json" });
@@ -3785,18 +4377,9 @@ export async function startProxy(
                         JSON.stringify(
                             buildModelNotFoundError(
                                 requestedModel,
-                                getAvailableModelNames(),
+                                getAvailableModelNames(proxyConfig),
                             ),
                         ),
-                    );
-                    return;
-                }
-                if (resolved.provider !== "anthropic") {
-                    res.writeHead(400, { "Content-Type": "application/json" });
-                    res.end(
-                        JSON.stringify({
-                            error: "Native /v1/messages only supports Anthropic models.",
-                        }),
                     );
                     return;
                 }
@@ -3804,7 +4387,17 @@ export async function startProxy(
                 targetModel = resolved.model;
             } else if (!useCascade && !targetModel) {
                 let selectedModel: string | null = null;
-                if (routingMode === "cost") {
+                if (routingMode === "alphadeal") {
+                    // AlphaDeal: OpenAI complexity-based routing
+                    const alphadealConfig = proxyConfig.routing?.alphadeal;
+                    selectedModel =
+                        alphadealConfig?.[complexity] ??
+                        ALPHADEAL_COMPLEXITY[complexity];
+                    targetProvider = "openai";
+                    log(
+                        `AlphaDeal routing (messages): complexity=${complexity} → ${selectedModel}`,
+                    );
+                } else if (routingMode === "cost") {
                     selectedModel = getCostModel(proxyConfig);
                 } else if (routingMode === "fast") {
                     selectedModel = getFastModel(proxyConfig);
@@ -3839,11 +4432,11 @@ export async function startProxy(
                 }
 
                 const resolved = resolveConfigModel(selectedModel);
-                if (!resolved || resolved.provider !== "anthropic") {
+                if (!resolved) {
                     res.writeHead(500, { "Content-Type": "application/json" });
                     res.end(
                         JSON.stringify({
-                            error: "Resolved model is not supported for /v1/messages",
+                            error: "Failed to resolve routing model",
                         }),
                     );
                     return;
@@ -3959,8 +4552,45 @@ export async function startProxy(
                     if (modelAuth.isMax) {
                         log(`Using MAX token for ${finalModel}`);
                     }
-                    const providerResponse =
-                        await forwardNativeAnthropicRequest(
+                    let providerResponse: Response;
+                    if (targetProvider === "openai") {
+                        const openaiApiKey = process.env["OPENAI_API_KEY"];
+                        if (!openaiApiKey) {
+                            res.writeHead(500, {
+                                "Content-Type": "application/json",
+                            });
+                            res.end(
+                                JSON.stringify({
+                                    error: {
+                                        type: "configuration_error",
+                                        message:
+                                            "OPENAI_API_KEY is not configured on the proxy server",
+                                    },
+                                }),
+                            );
+                            return;
+                        }
+                        const openaiReq = convertNativeAnthropicToOpenAI({
+                            ...requestBody,
+                            model: finalModel,
+                        });
+                        if (isStreaming) {
+                            openaiReq.stream = true;
+                            providerResponse = await forwardToOpenAIStream(
+                                openaiReq,
+                                finalModel,
+                                openaiApiKey,
+                            );
+                        } else {
+                            openaiReq.stream = false;
+                            providerResponse = await forwardToOpenAI(
+                                openaiReq,
+                                finalModel,
+                                openaiApiKey,
+                            );
+                        }
+                    } else {
+                        providerResponse = await forwardNativeAnthropicRequest(
                             stripThinkingIfUnsupported(
                                 { ...requestBody, model: finalModel },
                                 finalModel,
@@ -3969,6 +4599,7 @@ export async function startProxy(
                             modelAuth.apiKey,
                             modelAuth.isMax,
                         );
+                    }
                     if (!providerResponse.ok) {
                         const errorPayload =
                             (await providerResponse.json()) as Record<
@@ -4255,71 +4886,66 @@ export async function startProxy(
                         let streamTokensIn = 0;
                         let streamTokensOut = 0;
                         if (reader) {
-                            const decoder = new TextDecoder();
-                            let sseBuffer = "";
-                            try {
-                                while (true) {
-                                    const { done, value } = await reader.read();
-                                    if (done) break;
-                                    const chunk = decoder.decode(value, {
-                                        stream: true,
-                                    });
-                                    res.write(chunk);
-                                    // Parse SSE events to extract usage from message_delta / message_stop
-                                    sseBuffer += chunk;
-                                    const lines = sseBuffer.split("\n");
-                                    sseBuffer = lines.pop() ?? "";
-                                    for (const line of lines) {
-                                        if (line.startsWith("data: ")) {
-                                            try {
-                                                const evt = JSON.parse(
-                                                    line.slice(6),
-                                                );
-                                                // Anthropic: message_delta has usage.output_tokens
-                                                if (
-                                                    evt.type ===
-                                                        "message_delta" &&
-                                                    evt.usage
-                                                ) {
-                                                    streamTokensOut =
+                            if (targetProvider === "openai") {
+                                // Translate OpenAI SSE → Anthropic SSE
+                                const counts =
+                                    await pipeOpenAIStreamAsAnthropic(
+                                        reader,
+                                        res,
+                                        finalModel,
+                                    );
+                                streamTokensIn = counts.tokensIn;
+                                streamTokensOut = counts.tokensOut;
+                            } else {
+                                const decoder = new TextDecoder();
+                                let sseBuffer = "";
+                                try {
+                                    while (true) {
+                                        const { done, value } =
+                                            await reader.read();
+                                        if (done) break;
+                                        const chunk = decoder.decode(value, {
+                                            stream: true,
+                                        });
+                                        res.write(chunk);
+                                        sseBuffer += chunk;
+                                        const lines = sseBuffer.split("\n");
+                                        sseBuffer = lines.pop() ?? "";
+                                        for (const line of lines) {
+                                            if (line.startsWith("data: ")) {
+                                                try {
+                                                    const evt = JSON.parse(
+                                                        line.slice(6),
+                                                    );
+                                                    if (
+                                                        evt.type ===
+                                                            "message_delta" &&
                                                         evt.usage
-                                                            .output_tokens ??
-                                                        streamTokensOut;
+                                                    ) {
+                                                        streamTokensOut =
+                                                            evt.usage
+                                                                .output_tokens ??
+                                                            streamTokensOut;
+                                                    }
+                                                    if (
+                                                        evt.type ===
+                                                            "message_start" &&
+                                                        evt.message?.usage
+                                                    ) {
+                                                        streamTokensIn =
+                                                            evt.message.usage
+                                                                .input_tokens ??
+                                                            streamTokensIn;
+                                                    }
+                                                } catch {
+                                                    // not JSON, skip
                                                 }
-                                                // Anthropic: message_start has usage.input_tokens
-                                                if (
-                                                    evt.type ===
-                                                        "message_start" &&
-                                                    evt.message?.usage
-                                                ) {
-                                                    streamTokensIn =
-                                                        evt.message.usage
-                                                            .input_tokens ??
-                                                        streamTokensIn;
-                                                }
-                                                // OpenAI format: choices with usage
-                                                if (evt.usage) {
-                                                    streamTokensIn =
-                                                        evt.usage
-                                                            .prompt_tokens ??
-                                                        evt.usage
-                                                            .input_tokens ??
-                                                        streamTokensIn;
-                                                    streamTokensOut =
-                                                        evt.usage
-                                                            .completion_tokens ??
-                                                        evt.usage
-                                                            .output_tokens ??
-                                                        streamTokensOut;
-                                                }
-                                            } catch {
-                                                // not JSON, skip
                                             }
                                         }
                                     }
+                                } finally {
+                                    reader.releaseLock();
                                 }
-                            } finally {
-                                reader.releaseLock();
                             }
                         }
                         // Store streaming token counts so telemetry can use them
@@ -4331,11 +4957,24 @@ export async function startProxy(
                         } as Record<string, unknown>;
                         res.end();
                     } else {
-                        nativeResponseData =
-                            (await providerResponse.json()) as Record<
-                                string,
-                                unknown
-                            >;
+                        if (targetProvider === "openai") {
+                            const openaiResponseData =
+                                (await providerResponse.json()) as Record<
+                                    string,
+                                    unknown
+                                >;
+                            nativeResponseData =
+                                convertOpenAIResponseToAnthropic(
+                                    openaiResponseData,
+                                    finalModel,
+                                );
+                        } else {
+                            nativeResponseData =
+                                (await providerResponse.json()) as Record<
+                                    string,
+                                    unknown
+                                >;
+                        }
                         res.writeHead(providerResponse.status, {
                             "Content-Type": "application/json",
                         });
@@ -4474,72 +5113,28 @@ export async function startProxy(
         // Proxies the real Anthropic model list and prepends RelayPlane routing aliases
         // so Claude Code's model picker shows both native Claude models and relayplane:auto etc.
         if (req.method === "GET" && url.includes("/models")) {
+            // Build profile model entries from named routing profiles in config
+            const profileModels = Object.keys(
+                proxyConfig.profiles ?? {},
+            ).flatMap((name) => [
+                { id: `${name}:auto`, object: "model", owned_by: name },
+                { id: `${name}:cost`, object: "model", owned_by: name },
+                { id: `${name}:fast`, object: "model", owned_by: name },
+                { id: `${name}:quality`, object: "model", owned_by: name },
+            ]);
             const relayplaneModels = [
-                {
-                    type: "model",
-                    id: "relayplane:auto",
-                    display_name: "RelayPlane Auto (smart routing)",
-                    created_at: "2025-01-01T00:00:00Z",
-                },
-                {
-                    type: "model",
-                    id: "relayplane:cost",
-                    display_name: "RelayPlane Cost (cheapest)",
-                    created_at: "2025-01-01T00:00:00Z",
-                },
-                {
-                    type: "model",
-                    id: "relayplane:fast",
-                    display_name: "RelayPlane Fast (lowest latency)",
-                    created_at: "2025-01-01T00:00:00Z",
-                },
-                {
-                    type: "model",
-                    id: "relayplane:quality",
-                    display_name: "RelayPlane Quality (best output)",
-                    created_at: "2025-01-01T00:00:00Z",
-                },
+                { id: "relayplane:auto", object: "model", owned_by: "relayplane" },
+                { id: "relayplane:cost", object: "model", owned_by: "relayplane" },
+                { id: "relayplane:fast", object: "model", owned_by: "relayplane" },
+                { id: "relayplane:quality", object: "model", owned_by: "relayplane" },
+                ...profileModels,
             ];
 
-            try {
-                const headers = buildAnthropicHeaders(
-                    ctx,
-                    useAnthropicEnvKey,
-                );
-                const anthropicResponse = await fetch(
-                    "https://api.anthropic.com/v1/models",
-                    { headers },
-                );
-                if (anthropicResponse.ok) {
-                    const anthropicData = (await anthropicResponse.json()) as {
-                        data?: unknown[];
-                        has_more?: boolean;
-                        first_id?: string;
-                        last_id?: string;
-                    };
-                    const combinedData = [
-                        ...relayplaneModels,
-                        ...(anthropicData.data ?? []),
-                    ];
-                    res.writeHead(200, { "Content-Type": "application/json" });
-                    res.end(
-                        JSON.stringify({
-                            ...anthropicData,
-                            data: combinedData,
-                        }),
-                    );
-                    return;
-                }
-            } catch {
-                // Fall through to static list on network error
-            }
-
-            // Fallback: return RelayPlane aliases in Anthropic format
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(
                 JSON.stringify({
+                    object: "list",
                     data: relayplaneModels,
-                    has_more: false,
                 }),
             );
             return;
@@ -4601,38 +5196,71 @@ export async function startProxy(
             return;
         }
 
-        const preStripModel = requestedModel;
-        const parsedModel = parseModelSuffix(requestedModel);
-        let routingSuffix = parsedModel.suffix;
-        requestedModel = parsedModel.baseModel;
-
-        if (!bypassRouting) {
-            const override =
-                proxyConfig.modelOverrides?.[preStripModel] ??
-                proxyConfig.modelOverrides?.[requestedModel];
-            if (override) {
-                log(`Model override: ${preStripModel} → ${override}`);
-                const overrideParsed = parseModelSuffix(override);
-                if (!routingSuffix && overrideParsed.suffix) {
-                    routingSuffix = overrideParsed.suffix;
+        // Check for profile:strategy before parseModelSuffix strips the colon
+        let profileMatch = false;
+        {
+            const colonIdx = requestedModel.indexOf(":");
+            if (colonIdx > 0) {
+                const candidateName = requestedModel.substring(0, colonIdx);
+                const candidateStrategy = requestedModel.substring(
+                    colonIdx + 1,
+                );
+                if (
+                    proxyConfig.profiles?.[candidateName] &&
+                    VALID_PROFILE_STRATEGIES.has(candidateStrategy)
+                ) {
+                    profileMatch = true;
                 }
-                requestedModel = overrideParsed.baseModel;
             }
         }
 
-        // Resolve aliases (e.g., relayplane:auto → rp:balanced)
-        const resolvedModel = resolveModelAlias(requestedModel);
-        if (resolvedModel !== requestedModel) {
-            log(`Alias resolution: ${requestedModel} → ${resolvedModel}`);
-            requestedModel = resolvedModel;
+        let routingSuffix: RoutingSuffix | null = null;
+        if (!profileMatch) {
+            const preStripModel = requestedModel;
+            const parsedModel = parseModelSuffix(requestedModel);
+            routingSuffix = parsedModel.suffix;
+            requestedModel = parsedModel.baseModel;
+
+            if (!bypassRouting) {
+                const override =
+                    proxyConfig.modelOverrides?.[preStripModel] ??
+                    proxyConfig.modelOverrides?.[requestedModel];
+                if (override) {
+                    log(
+                        `Model override: ${preStripModel} → ${override}`,
+                    );
+                    const overrideParsed = parseModelSuffix(override);
+                    if (!routingSuffix && overrideParsed.suffix) {
+                        routingSuffix = overrideParsed.suffix;
+                    }
+                    requestedModel = overrideParsed.baseModel;
+                }
+            }
+
+            // Resolve aliases (e.g., relayplane:auto → rp:balanced)
+            const resolvedModel = resolveModelAlias(requestedModel);
+            if (resolvedModel !== requestedModel) {
+                log(
+                    `Alias resolution: ${requestedModel} → ${resolvedModel}`,
+                );
+                requestedModel = resolvedModel;
+            }
         }
 
-        let routingMode: "auto" | "cost" | "fast" | "quality" | "passthrough" =
-            "auto";
+        let routingMode:
+            | "auto"
+            | "cost"
+            | "fast"
+            | "quality"
+            | "alphadeal"
+            | "profile"
+            | "passthrough" = "auto";
         let targetModel: string = "";
         let targetProvider: Provider = "anthropic";
 
-        if (bypassRouting) {
+        if (profileMatch) {
+            routingMode = "profile";
+        } else if (bypassRouting) {
             routingMode = "passthrough";
         } else if (routingSuffix) {
             routingMode = routingSuffix;
@@ -4645,6 +5273,15 @@ export async function startProxy(
                 routingMode = "quality";
             }
             // relayplane:auto stays as 'auto'
+        } else if (requestedModel.startsWith("ad:")) {
+            // Handle ad:* AlphaDeal aliases - OpenAI complexity-based routing
+            if (requestedModel === "ad:auto") {
+                routingMode = "alphadeal";
+            } else {
+                // ad:fast, ad:balanced, ad:best, ad:analysis go through passthrough
+                // to resolve via ALPHADEAL_ALIASES
+                routingMode = "passthrough";
+            }
         } else if (requestedModel.startsWith("rp:")) {
             // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
             if (requestedModel === "rp:cost" || requestedModel === "rp:cheap") {
@@ -4737,7 +5374,30 @@ export async function startProxy(
             }
         }
 
-        if (routingMode === "passthrough") {
+        if (routingMode === "profile") {
+            const resolved = resolveProfileModel(
+                requestedModel,
+                proxyConfig,
+                complexity,
+            );
+            if (!resolved) {
+                res.writeHead(400, { "Content-Type": "application/json" });
+                res.end(
+                    JSON.stringify(
+                        buildModelNotFoundError(
+                            requestedModel,
+                            getAvailableModelNames(proxyConfig),
+                        ),
+                    ),
+                );
+                return;
+            }
+            targetProvider = resolved.provider;
+            targetModel = resolved.model;
+            log(
+                `Profile routing (completions): ${requestedModel} → ${targetProvider}/${targetModel} (strategy: ${resolved.strategy}, complexity: ${complexity})`,
+            );
+        } else if (routingMode === "passthrough") {
             const resolved = resolveExplicitModel(requestedModel);
             if (resolved) {
                 targetProvider = resolved.provider;
@@ -4750,7 +5410,7 @@ export async function startProxy(
                 if (bypassRouting) {
                     const modelError = buildModelNotFoundError(
                         requestedModel,
-                        getAvailableModelNames(),
+                        getAvailableModelNames(proxyConfig),
                     );
                     res.end(
                         JSON.stringify({
@@ -4764,7 +5424,7 @@ export async function startProxy(
                         JSON.stringify(
                             buildModelNotFoundError(
                                 requestedModel,
-                                getAvailableModelNames(),
+                                getAvailableModelNames(proxyConfig),
                             ),
                         ),
                     );
@@ -4773,7 +5433,17 @@ export async function startProxy(
             }
         } else if (!useCascade && !targetModel) {
             let selectedModel: string | null = null;
-            if (routingMode === "cost") {
+            if (routingMode === "alphadeal") {
+                // AlphaDeal: OpenAI complexity-based routing for underwriting/analysis
+                const alphadealConfig = proxyConfig.routing?.alphadeal;
+                selectedModel =
+                    alphadealConfig?.[complexity] ??
+                    ALPHADEAL_COMPLEXITY[complexity];
+                targetProvider = "openai";
+                log(
+                    `AlphaDeal routing: complexity=${complexity} → ${selectedModel}`,
+                );
+            } else if (routingMode === "cost") {
                 selectedModel = getCostModel(proxyConfig);
             } else if (routingMode === "fast") {
                 selectedModel = getFastModel(proxyConfig);
@@ -5082,6 +5752,12 @@ export async function startProxy(
             console.log(
                 `  Models: relayplane:auto, relayplane:cost, relayplane:fast, relayplane:quality`,
             );
+            const profileNames = Object.keys(proxyConfig.profiles ?? {});
+            if (profileNames.length > 0) {
+                console.log(
+                    `  Profiles: ${profileNames.map((n) => `${n}:*`).join(", ")}`,
+                );
+            }
             console.log(
                 `  Auth: Passthrough for Anthropic, env vars for other providers`,
             );
