@@ -960,54 +960,101 @@ function extractPromptText(messages: ChatRequest["messages"]): string {
         .join("\n");
 }
 
+function extractSingleMessageText(msg: { content?: unknown }): string {
+    const content = msg.content;
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+        return (content as Array<{ type?: string; text?: string }>)
+            .filter((c) => c.type === "text")
+            .map((c) => c.text ?? "")
+            .join(" ");
+    }
+    return "";
+}
+
 function extractMessageText(messages: Array<{ content?: unknown }>): string {
-    return messages
-        .map((msg) => {
-            const content = msg.content;
-            if (typeof content === "string") return content;
-            if (Array.isArray(content)) {
-                return content
-                    .map((c: unknown) => {
-                        const part = c as { type?: string; text?: string };
-                        return part.type === "text" ? (part.text ?? "") : "";
-                    })
-                    .join(" ");
-            }
-            return "";
-        })
-        .join(" ");
+    return messages.map(extractSingleMessageText).join(" ");
+}
+
+/**
+ * Find the last user message in the conversation.
+ * Claude Code alternates user/assistant messages; the last user message
+ * is the one that determines what we're actually being asked to do NOW.
+ * We look for the last message that has text content (not just tool_result).
+ */
+function findLastUserText(
+    messages: Array<{ content?: unknown; role?: string }>,
+): string {
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const msg = messages[i];
+        // Skip pure tool_result messages (assistant continuations)
+        const content = msg.content;
+        if (Array.isArray(content)) {
+            const hasText = (content as Array<{ type?: string }>).some(
+                (p) => p.type === "text",
+            );
+            const isOnlyToolResult =
+                !hasText &&
+                (content as Array<{ type?: string }>).every(
+                    (p) =>
+                        p.type === "tool_result" || p.type === "tool_use",
+                );
+            if (isOnlyToolResult) continue;
+        }
+        const text = extractSingleMessageText(msg);
+        if (text.trim().length > 0) return text;
+    }
+    return "";
 }
 
 export function classifyComplexity(
-    messages: Array<{ content?: unknown }>,
+    messages: Array<{ content?: unknown; role?: string }>,
     bodyTools?: unknown,
 ): Complexity {
-    const text = extractMessageText(messages).toLowerCase();
-    const tokens = Math.ceil(text.length / 4);
+    // Score the CURRENT turn, not the accumulated history.
+    // This prevents long sessions from always routing to Opus.
+    const currentText = findLastUserText(messages).toLowerCase();
+    const currentTokens = Math.ceil(currentText.length / 4);
 
     let score = 0;
 
-    // Message count — long agentic sessions are inherently complex
-    if (messages.length >= 6) score += 1;
-    if (messages.length >= 12) score += 2;
+    // --- Current-turn signals (what is the user asking NOW?) ---
 
-    if (/```/.test(text) || /function |class |const |let |import /.test(text))
+    // Code patterns in the current message
+    if (
+        /```/.test(currentText) ||
+        /function |class |const |import /.test(currentText)
+    )
         score += 2;
-    if (/analyze|compare|evaluate|assess|review|audit/.test(text)) score += 1;
-    if (/calculate|compute|solve|equation|prove|derive/.test(text)) score += 2;
-    if (/first.*then|step \d|1\).*2\)|phase \d/.test(text)) score += 1;
-    if (tokens > 2000) score += 1;
-    if (tokens > 5000) score += 2;
-    if (tokens > 10000) score += 2;
+
+    // Analytical keywords
+    if (/analyze|compare|evaluate|assess|review|audit/.test(currentText))
+        score += 1;
+
+    // Computation keywords
+    if (/calculate|compute|solve|equation|prove|derive/.test(currentText))
+        score += 2;
+
+    // Multi-step instructions
+    if (/first.*then|step \d|1\).*2\)|phase \d/.test(currentText)) score += 1;
+
+    // Current message token size
+    if (currentTokens > 2000) score += 1;
+    if (currentTokens > 5000) score += 2;
+
+    // Creative/engineering keywords
     if (
         /write a (story|essay|article|report)|create a|design a|build a/.test(
-            text,
+            currentText,
         )
     )
         score += 1;
-    if (/refactor|migrate|architect|implement|integrate/.test(text)) score += 1;
+    if (/refactor|migrate|architect|implement|integrate/.test(currentText))
+        score += 1;
 
-    // Tool use: check body-level tools array, or tool_use/tool_result turns in messages
+    // --- Session-level signals (lightweight context from history) ---
+
+    // Tool presence: does this session involve tool use?
     const hasTools =
         Array.isArray(bodyTools) ||
         messages.some((m) => {
@@ -1021,11 +1068,10 @@ export function classifyComplexity(
         });
     if (hasTools) score += 2;
 
-    // Tool result turns: each turn where actual file/command output was returned.
-    // extractMessageText ignores tool_result blocks, so code content inside them
-    // never reaches the keyword detectors above. Counting these turns directly is
-    // the only reliable signal for "this is an agentic file-editing session".
-    const toolResultTurns = messages.filter((m) => {
+    // Recent tool activity: only count tool_results in the LAST 6 messages
+    // (the current agentic turn), not the entire conversation history.
+    const recentMessages = messages.slice(-6);
+    const recentToolResults = recentMessages.filter((m) => {
         const c = m.content;
         return (
             Array.isArray(c) &&
@@ -1034,8 +1080,7 @@ export function classifyComplexity(
             )
         );
     }).length;
-    if (toolResultTurns >= 3) score += 1; // multi-file session → nudge toward complex
-    if (toolResultTurns >= 6) score += 2; // deep agentic session → firmly complex
+    if (recentToolResults >= 3) score += 1;
 
     if (score >= 5) return "complex";
     if (score >= 3) return "moderate";
