@@ -159,6 +159,58 @@ systemctl --user restart relayplane-proxy.service
 ```
 
 
+## Profiles
+
+Profiles are named routing configurations that let you define model tiers for different use cases or teams. Use them with the `profile:strategy` syntax as your model name.
+
+```json
+{
+  "profiles": {
+    "devco": {
+      "cost": "gpt-5-nano",
+      "fast": "gpt-5-nano",
+      "quality": "claude-opus-4-6",
+      "auto": {
+        "simple": "gpt-5-nano",
+        "moderate": "gpt-5.2",
+        "complex": "claude-opus-4-6"
+      }
+    },
+    "opco": {
+      "cost": "gpt-4o-mini",
+      "fast": "gpt-4o-mini",
+      "quality": "gpt-5.2-pro",
+      "auto": {
+        "simple": "gpt-4o-mini",
+        "moderate": "gpt-5.2",
+        "complex": "gpt-5.2-pro"
+      }
+    }
+  }
+}
+```
+
+Then use the profile as the model name in your agent:
+
+```bash
+# Use devco profile with auto complexity routing
+ANTHROPIC_BASE_URL=http://localhost:4801 your-agent --model devco:auto
+
+# Use opco profile, always picking the quality model
+ANTHROPIC_BASE_URL=http://localhost:4801 your-agent --model opco:quality
+```
+
+**Available strategies:**
+
+| Strategy | Behaviour |
+|----------|-----------|
+| `auto` | Complexity-based — picks `simple`, `moderate`, or `complex` model based on the request |
+| `cost` | Always uses the cheapest model in the profile |
+| `fast` | Always uses the lowest-latency model in the profile |
+| `quality` | Always uses the highest-quality model in the profile |
+
+Profile names can be anything except the reserved prefixes `rp`, `ad`, and `relayplane`. Each profile must define all four strategies (`cost`, `fast`, `quality`, `auto`).
+
 ## Cascade Mode
 
 Start with the cheapest model and escalate only when the response shows uncertainty or refusal. This gives you the cost savings of a cheap model with a safety net.
