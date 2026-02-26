@@ -3319,8 +3319,19 @@ export async function startProxy(
                 ) {
                     routingMode = "quality";
                 } else {
-                    // rp:balanced and others go through passthrough to resolve via SMART_ALIASES
-                    routingMode = "passthrough";
+                    // rp:balanced reached here via alias resolution of relayplane:auto/rp:auto.
+                    // Recover the original auto-routing intent rather than hardcoding passthrough.
+                    const preAliasModel = originalModel ?? "";
+                    if (
+                        preAliasModel === "relayplane:auto" ||
+                        preAliasModel === "rp:auto" ||
+                        preAliasModel === "auto" ||
+                        preAliasModel === "default"
+                    ) {
+                        routingMode = "auto";
+                    } else {
+                        routingMode = "passthrough";
+                    }
                 }
             } else if (
                 requestedModel === "auto" ||
@@ -4277,8 +4288,19 @@ export async function startProxy(
             ) {
                 routingMode = "quality";
             } else {
-                // rp:balanced and others go through passthrough to resolve via SMART_ALIASES
-                routingMode = "passthrough";
+                // rp:balanced reached here via alias resolution of relayplane:auto/rp:auto.
+                // Recover the original auto-routing intent rather than hardcoding passthrough.
+                const preAliasModel = originalRequestedModel ?? "";
+                if (
+                    preAliasModel === "relayplane:auto" ||
+                    preAliasModel === "rp:auto" ||
+                    preAliasModel === "auto" ||
+                    preAliasModel === "default"
+                ) {
+                    routingMode = "auto";
+                } else {
+                    routingMode = "passthrough";
+                }
             }
         } else if (
             requestedModel === "auto" ||
