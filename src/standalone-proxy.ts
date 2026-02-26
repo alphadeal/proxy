@@ -499,6 +499,16 @@ interface RequestHistoryEntry {
 const requestHistory: RequestHistoryEntry[] = [];
 const MAX_HISTORY = 10000;
 const HISTORY_RETENTION_DAYS = 7;
+
+/** Model names that indicate proxy-routed (auto) requests vs direct user requests */
+const AUTO_ROUTING_MODELS = new Set([
+    "relayplane:auto", "relayplane:cost", "relayplane:fast", "relayplane:quality",
+    "rp:auto", "rp:balanced", "rp:best", "rp:fast", "rp:cheap",
+]);
+
+function isAutoRouted(originalModel: string): boolean {
+    return AUTO_ROUTING_MODELS.has(originalModel);
+}
 let requestIdCounter = 0;
 
 // --- Persistent history (JSONL) ---
@@ -2694,7 +2704,9 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 .badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}
 .badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
 .badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
-@media(max-width:768px){.col-tt,.col-cx{display:none}}
+.badge.rt-auto{background:#052e1633;color:#34d399}.badge.rt-direct{background:#1e293b;color:#94a3b8}
+.col-rt .sub{font-size:.7rem;color:#64748b}
+@media(max-width:768px){.col-tt,.col-cx,.col-rt{display:none}}
 .prov{display:flex;gap:16px;flex-wrap:wrap}.prov-item{display:flex;align-items:center;font-size:.85rem;background:#111318;padding:8px 14px;border-radius:8px;border:1px solid #1e293b}
 .alerts{display:flex;flex-direction:column;gap:8px;margin-bottom:24px}
 .alert{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:8px;font-size:.85rem;line-height:1.4}
@@ -2734,10 +2746,10 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 </div>
 </div>
 <div class="section"><h2>Model Breakdown</h2>
-<table><thead><tr><th>Model</th><th>Requests</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
+<table><thead><tr><th>Model</th><th>Requests</th><th class="col-rt">Auto</th><th class="col-rt">Direct</th><th>Cost</th><th>% of Total</th></tr></thead><tbody id="models"></tbody></table></div>
 <div class="section"><h2>Provider Status</h2><div class="prov" id="providers"></div></div>
 <div class="section"><h2>Recent Runs</h2>
-<table><thead><tr><th>Time</th><th>Model</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
+<table><thead><tr><th>Time</th><th>Model</th><th class="col-rt">Source</th><th class="col-tt">Task Type</th><th class="col-cx">Complexity</th><th>Tokens In</th><th>Tokens Out</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="runs"></tbody></table></div>
 <script>
 const $ = id => document.getElementById(id);
 function fmt(n,d=2){return typeof n==='number'?n.toFixed(d):'-'}
@@ -2761,13 +2773,14 @@ async function load(){
     $('avgLat').textContent=(stats.summary?.avgLatencyMs??0)+'ms';
     const total=stats.summary?.totalEvents||1;
     $('models').innerHTML=(stats.byModel||[]).map(m=>
-      '<tr><td>'+m.model+'</td><td>'+m.count+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(m.count/total*100,1)+'%</td></tr>'
-    ).join('')||'<tr><td colspan=4 style="color:#64748b">No data yet</td></tr>';
+      '<tr><td>'+m.model+'</td><td>'+m.count+'</td><td class="col-rt">'+m.autoCount+'</td><td class="col-rt">'+m.directCount+'</td><td>$'+fmt(m.costUsd,4)+'</td><td>'+fmt(m.count/total*100,1)+'%</td></tr>'
+    ).join('')||'<tr><td colspan=6 style="color:#64748b">No data yet</td></tr>';
     function ttCls(t){const m={code_generation:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
     function cxCls(c){const m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
-    $('runs').innerHTML=(runsR.runs||[]).map(r=>
-      '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>'
-    ).join('')||'<tr><td colspan=9 style="color:#64748b">No runs yet</td></tr>';
+    $('runs').innerHTML=(runsR.runs||[]).map(r=>{
+      const src=r.routingSource==='auto'?'auto':'direct';
+      return '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+r.model+'</td><td class="col-rt"><span class="badge rt-'+src+'">'+src+'</span></td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+(r.taskType||'general').replace(/_/g,' ')+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+r.status+'</span></td></tr>';
+    }).join('')||'<tr><td colspan=10 style="color:#64748b">No runs yet</td></tr>';
     const alerts=[];
     (ovr.overrides||[]).forEach(o=>{
       const icon=o.severity==='high'?'!!':o.severity==='medium'?'!':'i';
@@ -3068,16 +3081,21 @@ export async function startProxy(
                     (r) => new Date(r.timestamp).getTime() >= cutoff,
                 );
 
-                // Model breakdown
+                // Model breakdown with auto vs direct split
                 const modelMap = new Map<
                     string,
-                    { count: number; cost: number }
+                    { count: number; cost: number; autoCount: number; directCount: number }
                 >();
                 for (const r of recent) {
                     const key = r.targetModel;
-                    const cur = modelMap.get(key) || { count: 0, cost: 0 };
+                    const cur = modelMap.get(key) || { count: 0, cost: 0, autoCount: 0, directCount: 0 };
                     cur.count++;
                     cur.cost += r.costUsd;
+                    if (isAutoRouted(r.originalModel)) {
+                        cur.autoCount++;
+                    } else {
+                        cur.directCount++;
+                    }
                     modelMap.set(key, cur);
                 }
 
@@ -3117,6 +3135,8 @@ export async function startProxy(
                             model,
                             count: v.count,
                             costUsd: v.cost,
+                            autoCount: v.autoCount,
+                            directCount: v.directCount,
                             savings: 0,
                         }),
                     ),
@@ -3136,13 +3156,9 @@ export async function startProxy(
             if (req.method === "GET" && telemetryPath === "runs") {
                 const limit = parseInt(params.get("limit") || "50", 10);
                 const offset = parseInt(params.get("offset") || "0", 10);
-                const autoAliases = new Set([
-                    "relayplane:auto", "relayplane:cost", "relayplane:fast", "relayplane:quality",
-                    "rp:auto", "rp:balanced", "rp:best", "rp:fast", "rp:cheap",
-                ]);
                 const sorted = [...requestHistory].reverse();
                 const runs = sorted.slice(offset, offset + limit).map((r) => {
-                    const baseline = autoAliases.has(r.originalModel)
+                    const baseline = isAutoRouted(r.originalModel)
                         ? "claude-opus-4-6"
                         : r.originalModel;
                     const origCost = estimateCost(
@@ -3158,11 +3174,12 @@ export async function startProxy(
                         status: r.success ? "success" : "error",
                         success: r.success,
                         started_at: r.timestamp,
-                        timestamp: r.timestamp, // used by the run detail view
+                        timestamp: r.timestamp,
                         model: r.targetModel,
-                        provider: r.provider, // used by the run detail view
+                        provider: r.provider,
                         routed_to: `${r.provider}/${r.targetModel}`,
                         original_model: r.originalModel,
+                        routingSource: isAutoRouted(r.originalModel) ? "auto" : "direct",
                         taskType: r.taskType || "general",
                         complexity: r.complexity || "simple",
                         costUsd: r.costUsd,
@@ -3188,10 +3205,6 @@ export async function startProxy(
                 // For auto-routing aliases, the baseline is the most capable model
                 // the user would need without smart routing (Opus).
                 // For direct model requests, the baseline is the requested model itself.
-                const AUTO_ROUTING_ALIASES = new Set([
-                    "relayplane:auto", "relayplane:cost", "relayplane:fast", "relayplane:quality",
-                    "rp:auto", "rp:balanced", "rp:best", "rp:fast", "rp:cheap",
-                ]);
                 const BASELINE_MODEL = "claude-opus-4-6";
 
                 let totalOriginalCost = 0;
@@ -3207,7 +3220,7 @@ export async function startProxy(
                 >();
 
                 for (const r of requestHistory) {
-                    const baselineModel = AUTO_ROUTING_ALIASES.has(r.originalModel)
+                    const baselineModel = isAutoRouted(r.originalModel)
                         ? BASELINE_MODEL
                         : r.originalModel;
                     const origCost = estimateCost(
@@ -3262,7 +3275,7 @@ export async function startProxy(
                     };
                     bucket.requests++;
                     bucket.actualCost += r.costUsd;
-                    const baseM = AUTO_ROUTING_ALIASES.has(r.originalModel)
+                    const baseM = isAutoRouted(r.originalModel)
                         ? BASELINE_MODEL
                         : r.originalModel;
                     bucket.originalCost += estimateCost(
