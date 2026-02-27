@@ -23,6 +23,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { getDeviceId, isTelemetryEnabled, getConfigDir } from './config.js';
+import { defaultLogger } from './logger.js';
 
 /**
  * Telemetry event schema (matches PITCH-v2.md)
@@ -225,9 +226,9 @@ export function recordTelemetry(event: Omit<TelemetryEvent, 'device_id' | 'times
   if (auditMode) {
     // In audit mode, buffer events and print them
     auditBuffer.push(fullEvent);
-    console.log('\n📊 [TELEMETRY AUDIT] The following data would be collected:');
-    console.log(JSON.stringify(fullEvent, null, 2));
-    console.log('');
+    defaultLogger.info(
+      `\n📊 [TELEMETRY AUDIT] The following data would be collected:\n${JSON.stringify(fullEvent, null, 2)}\n`,
+    );
     return;
   }
   
@@ -432,7 +433,7 @@ export async function flushTelemetryToCloud(): Promise<void> {
       // Successfully uploaded
     } else {
       // Partial failure - log but continue
-      console.warn('[Telemetry] Partial upload failure:', result.errors);
+      defaultLogger.warn(`Partial telemetry upload failure: ${JSON.stringify(result.errors)}`);
     }
   } catch (err) {
     // Network error - re-queue events
@@ -489,7 +490,7 @@ export function getPendingUploadCount(): number {
  * Print telemetry disclosure message
  */
 export function printTelemetryDisclosure(): void {
-  console.log(`
+  defaultLogger.info(`
 ╭─────────────────────────────────────────────────────────────────────╮
 │                    📊 TELEMETRY DISCLOSURE                          │
 ╰─────────────────────────────────────────────────────────────────────╯
@@ -516,6 +517,5 @@ To opt out completely:
   $ relayplane-proxy telemetry off
 
 Learn more: https://relayplane.com/privacy
-
 `);
 }

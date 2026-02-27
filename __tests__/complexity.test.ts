@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { classifyComplexity } from "../src/standalone-proxy.js";
+import { classifyComplexity } from "../src/routing/complexity-classifier.js";
 
 type Message = { content?: unknown; role?: string };
 
