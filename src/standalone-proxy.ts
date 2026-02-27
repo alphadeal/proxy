@@ -1105,12 +1105,15 @@ function isModelToolReferenceUnsupported(model: string): boolean {
 }
 
 /**
- * Scans all message content arrays for a `tool_reference` block.
- * Works for both native Anthropic message format and OpenAI-compat format.
+ * Scans the full request body for `tool_reference` blocks.
+ * Checks messages content arrays, the system parameter (when it is an array
+ * of content blocks), and the top-level tools array.
  */
 function hasToolReferenceBlocks(
     messages: Array<{ content?: unknown; role?: string }>,
+    body?: Record<string, unknown>,
 ): boolean {
+    // Scan message content blocks
     for (const msg of messages) {
         const content = msg.content;
         if (Array.isArray(content)) {
@@ -1119,6 +1122,25 @@ function hasToolReferenceBlocks(
             }
         }
     }
+
+    if (body) {
+        // Scan system parameter (can be an array of content blocks)
+        const system = body["system"];
+        if (Array.isArray(system)) {
+            for (const block of system as Array<{ type?: string }>) {
+                if (block?.type === "tool_reference") return true;
+            }
+        }
+
+        // Scan top-level tools array for tool_reference entries
+        const tools = body["tools"];
+        if (Array.isArray(tools)) {
+            for (const tool of tools as Array<{ type?: string }>) {
+                if (tool?.type === "tool_reference") return true;
+            }
+        }
+    }
+
     return false;
 }
 
@@ -4458,7 +4480,7 @@ export async function startProxy(
             if (
                 !useCascade &&
                 isModelToolReferenceUnsupported(targetModel) &&
-                hasToolReferenceBlocks(messages)
+                hasToolReferenceBlocks(messages, requestBody)
             ) {
                 const upgradeTarget = "claude-sonnet-4-6";
                 const upgradeResolved = resolveExplicitModel(upgradeTarget);
@@ -5398,6 +5420,7 @@ export async function startProxy(
                     content?: unknown;
                     role?: string;
                 }>,
+                request as Record<string, unknown>,
             )
         ) {
             const upgradeTarget = "claude-sonnet-4-6";
