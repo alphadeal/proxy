@@ -1,10 +1,16 @@
 /**
- * RelayPlane Agent Ops Proxy Server
+ * RelayPlane Agent Ops Proxy Server — ADVANCED / LIBRARY USE ONLY
  *
- * OpenAI-compatible proxy server with integrated observability via the Learning Ledger
- * and auth enforcement via Auth Gate.
+ * This is NOT the standalone CLI proxy. It is a library entrypoint for consumers
+ * who have the full @relayplane optional package suite installed:
+ *   - @relayplane/ledger    (observability / Learning Ledger)
+ *   - @relayplane/auth-gate (consumer vs API auth detection)
+ *   - @relayplane/policy-engine, @relayplane/routing-engine, @relayplane/explainability
  *
- * Features:
+ * For the standalone CLI proxy (default for `relayplane-proxy` users), see:
+ *   src/standalone-proxy.ts
+ *
+ * Features of this advanced server:
  * - OpenAI-compatible `/v1/chat/completions` endpoint
  * - Auth Gate integration for consumer vs API auth detection
  * - Learning Ledger integration for run tracking

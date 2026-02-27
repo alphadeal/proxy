@@ -79,6 +79,9 @@ export { proxyStatsCollector } from './standalone-proxy.js';
 // Re-export core types
 export type { Provider, TaskType } from '@relayplane/core';
 
-// Advanced proxy server (requires @relayplane/ledger, @relayplane/auth-gate, etc.)
+// Advanced proxy server — library entrypoint for full-suite consumers.
+// Requires the OPTIONAL @relayplane/* packages (ledger, auth-gate, policy-engine,
+// routing-engine, explainability). NOT used by the standalone CLI proxy.
+// If you are running `relayplane-proxy` as a CLI tool, see standalone-proxy.ts instead.
 export { ProxyServer, createProxyServer, createSandboxedProxyServer } from './server.js';
 export type { ProxyServerConfig } from './server.js';

@@ -37,6 +37,13 @@ import {
     estimateCost,
 } from "./telemetry.js";
 import { StatsCollector } from "./stats.js";
+import { defaultLogger } from "./logger.js";
+import {
+    classifyComplexity,
+    extractMessageText,
+    isContentBlockArray,
+} from "./routing/complexity-classifier.js";
+import type { Complexity } from "./routing/complexity-classifier.js";
 const PROXY_VERSION: string = (() => {
     try {
         const pkgPath = path.join(__dirname, "..", "package.json");
@@ -294,29 +301,35 @@ export function resolveModelAlias(model: string): string {
 }
 
 /**
- * Default routing based on task type
- * Uses Haiku 4.5 as safe fallback (never use "latest" suffixes - Anthropic deprecated them)
+ * Default routing based on task type.
+ * Tasks that require deep reasoning, multi-step code generation, or sustained
+ * analysis are routed to Sonnet. Fast, short-output tasks stay on Haiku.
  */
 const DEFAULT_ROUTING: Record<TaskType, { provider: Provider; model: string }> =
     {
+        // Sonnet tier — tasks that need multi-step reasoning or produce large outputs
         code_generation: {
             provider: "anthropic",
-            model: "claude-haiku-4-5-20251001",
+            model: "claude-sonnet-4-6",
         },
         code_review: {
             provider: "anthropic",
-            model: "claude-haiku-4-5-20251001",
+            model: "claude-sonnet-4-6",
         },
-        summarization: {
+        analysis: {
             provider: "anthropic",
-            model: "claude-haiku-4-5-20251001",
+            model: "claude-sonnet-4-6",
         },
-        analysis: { provider: "anthropic", model: "claude-haiku-4-5-20251001" },
         creative_writing: {
             provider: "anthropic",
-            model: "claude-haiku-4-5-20251001",
+            model: "claude-sonnet-4-6",
         },
         data_extraction: {
+            provider: "anthropic",
+            model: "claude-sonnet-4-6",
+        },
+        // Haiku tier — fast, high-volume, short-output tasks
+        summarization: {
             provider: "anthropic",
             model: "claude-haiku-4-5-20251001",
         },
@@ -397,7 +410,7 @@ interface RoutingProfile {
     auto: ProfileAutoConfig;
 }
 
-type Complexity = "simple" | "moderate" | "complex";
+// Complexity type imported from ./routing/complexity-classifier.js
 
 const UNCERTAINTY_PATTERNS = [
     /i'?m not (entirely |completely |really )?sure/i,
@@ -439,8 +452,8 @@ class CooldownManager {
 
         if (h.failures.length >= this.config.allowedFails) {
             h.cooledUntil = now + this.config.cooldownSeconds * 1000;
-            console.log(
-                `[RelayPlane] Provider ${provider} cooled down for ${this.config.cooldownSeconds}s`,
+            defaultLogger.warn(
+                `Provider ${provider} cooled down for ${this.config.cooldownSeconds}s`,
             );
         }
     }
@@ -511,6 +524,13 @@ interface RelayPlaneProxyConfigFile {
     reliability?: { cooldowns?: Partial<CooldownConfig> };
     auth?: HybridAuthConfig;
     profiles?: Record<string, RoutingProfile>;
+    /**
+     * Telemetry settings.
+     * baselineModel: the model to compare against for savings calculation.
+     * Defaults to claude-opus-4-6 (full-Opus baseline) if not set.
+     * Set to "claude-sonnet-4-6" if you were previously using Sonnet.
+     */
+    telemetry?: { baselineModel?: string };
     [key: string]: unknown;
 }
 
@@ -646,12 +666,12 @@ function loadHistoryFromDisk(): void {
         }
         // Rewrite file with only valid/recent entries
         rewriteHistoryFile();
-        console.log(
-            `[RelayPlane] Loaded ${requestHistory.length} history entries from disk`,
+        defaultLogger.info(
+            `Loaded ${requestHistory.length} history entries from disk`,
         );
     } catch (err) {
-        console.log(
-            `[RelayPlane] Could not load history: ${(err as Error).message}`,
+        defaultLogger.warn(
+            `Could not load history: ${(err as Error).message}`,
         );
     }
 }
@@ -664,8 +684,8 @@ function rewriteHistoryFile(): void {
             (requestHistory.length ? "\n" : "");
         fs.writeFileSync(HISTORY_FILE, data, "utf-8");
     } catch (err) {
-        console.log(
-            `[RelayPlane] Could not rewrite history file: ${(err as Error).message}`,
+        defaultLogger.warn(
+            `Could not rewrite history file: ${(err as Error).message}`,
         );
     }
 }
@@ -678,8 +698,8 @@ function flushHistoryBuffer(): void {
             historyWriteBuffer.map((e) => JSON.stringify(e)).join("\n") + "\n";
         fs.appendFileSync(HISTORY_FILE, data, "utf-8");
     } catch (err) {
-        console.log(
-            `[RelayPlane] Could not flush history: ${(err as Error).message}`,
+        defaultLogger.warn(
+            `Could not flush history: ${(err as Error).message}`,
         );
     }
     historyWriteBuffer = [];
@@ -735,8 +755,8 @@ function logRequest(
     const timestamp = new Date().toISOString();
     const status = success ? "✓" : "✗";
     const escalateTag = escalated ? " [ESCALATED]" : "";
-    console.log(
-        `[RelayPlane] ${timestamp} ${status} ${originalModel} → ${provider}/${targetModel} (${mode}) ${latencyMs}ms${escalateTag}`,
+    defaultLogger.info(
+        `${timestamp} ${status} ${originalModel} → ${provider}/${targetModel} (${mode}) ${latencyMs}ms${escalateTag}`,
     );
 
     // Update stats
@@ -1056,134 +1076,8 @@ function extractPromptText(messages: ChatRequest["messages"]): string {
         .join("\n");
 }
 
-function extractSingleMessageText(msg: { content?: unknown }): string {
-    const content = msg.content;
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-        return (content as Array<{ type?: string; text?: string }>)
-            .filter((c) => c.type === "text")
-            .map((c) => c.text ?? "")
-            .join(" ");
-    }
-    return "";
-}
-
-function extractMessageText(messages: Array<{ content?: unknown }>): string {
-    return messages.map(extractSingleMessageText).join(" ");
-}
-
-/**
- * Find the last user message in the conversation.
- * Claude Code alternates user/assistant messages; the last user message
- * is the one that determines what we're actually being asked to do NOW.
- * We look for the last message that has text content (not just tool_result).
- */
-function findLastUserText(
-    messages: Array<{ content?: unknown; role?: string }>,
-): string {
-    for (let i = messages.length - 1; i >= 0; i--) {
-        const msg = messages[i];
-        // Skip pure tool_result messages (assistant continuations)
-        const content = msg.content;
-        if (Array.isArray(content)) {
-            const hasText = (content as Array<{ type?: string }>).some(
-                (p) => p.type === "text",
-            );
-            const isOnlyToolResult =
-                !hasText &&
-                (content as Array<{ type?: string }>).every(
-                    (p) => p.type === "tool_result" || p.type === "tool_use",
-                );
-            if (isOnlyToolResult) continue;
-        }
-        const text = extractSingleMessageText(msg);
-        if (text.trim().length > 0) return text;
-    }
-    return "";
-}
-
-export function classifyComplexity(
-    messages: Array<{ content?: unknown; role?: string }>,
-    bodyTools?: unknown,
-): Complexity {
-    // Score the CURRENT turn, not the accumulated history.
-    // This prevents long sessions from always routing to Opus.
-    const currentText = findLastUserText(messages).toLowerCase();
-    const currentTokens = Math.ceil(currentText.length / 4);
-
-    let score = 0;
-
-    // --- Current-turn signals (what is the user asking NOW?) ---
-
-    // Code patterns in the current message.
-    // Note: 'let ' is intentionally excluded — it triggers false positives in
-    // natural language (e.g. "let me fix it") when scoring the current user
-    // message. 'const' and 'import' reliably signal code without the ambiguity.
-    if (
-        /```/.test(currentText) ||
-        /function |class |const |import /.test(currentText)
-    )
-        score += 2;
-
-    // Analytical keywords
-    if (/analyze|compare|evaluate|assess|review|audit/.test(currentText))
-        score += 1;
-
-    // Computation keywords
-    if (/calculate|compute|solve|equation|prove|derive/.test(currentText))
-        score += 2;
-
-    // Multi-step instructions
-    if (/first.*then|step \d|1\).*2\)|phase \d/.test(currentText)) score += 1;
-
-    // Current message token size
-    if (currentTokens > 2000) score += 1;
-    if (currentTokens > 5000) score += 2;
-
-    // Creative/engineering keywords
-    if (
-        /write a (story|essay|article|report)|create a|design a|build a/.test(
-            currentText,
-        )
-    )
-        score += 1;
-    if (/refactor|migrate|architect|implement|integrate/.test(currentText))
-        score += 1;
-
-    // --- Session-level signals (lightweight context from history) ---
-
-    // Tool presence: does this session involve tool use?
-    const hasTools =
-        Array.isArray(bodyTools) ||
-        messages.some((m) => {
-            const c = m.content;
-            return (
-                Array.isArray(c) &&
-                (c as Array<{ type?: string }>).some(
-                    (p) => p.type === "tool_result" || p.type === "tool_use",
-                )
-            );
-        });
-    if (hasTools) score += 2;
-
-    // Recent tool activity: only count tool_results in the LAST 6 messages
-    // (the current agentic turn), not the entire conversation history.
-    const recentMessages = messages.slice(-6);
-    const recentToolResults = recentMessages.filter((m) => {
-        const c = m.content;
-        return (
-            Array.isArray(c) &&
-            (c as Array<{ type?: string }>).some(
-                (p) => p.type === "tool_result",
-            )
-        );
-    }).length;
-    if (recentToolResults >= 3) score += 1;
-
-    if (score >= 5) return "complex";
-    if (score >= 3) return "moderate";
-    return "simple";
-}
+// classifyComplexity, extractMessageText, isContentBlockArray imported from
+// ./routing/complexity-classifier.js
 
 const THINKING_UNSUPPORTED_MODELS = [
     "claude-haiku-4-5-20251001",
@@ -3043,6 +2937,158 @@ function resolveProfileModel(
     return { provider: resolved.provider, model: resolved.model, strategy };
 }
 
+/**
+ * Routing mode types used by both Anthropic and OpenAI handlers.
+ */
+type RoutingMode =
+    | "auto"
+    | "cost"
+    | "fast"
+    | "quality"
+    | "alphadeal"
+    | "profile"
+    | "passthrough";
+
+interface RoutingResolution {
+    resolvedModel: string;
+    routingMode: RoutingMode;
+    profileMatch: boolean;
+}
+
+/**
+ * Unified routing resolution for all request handlers.
+ *
+ * Determines how a request should be routed based on the requested model name,
+ * config overrides, aliases, and profile matching. This single function replaces
+ * the previously duplicated routing logic in both the Anthropic-native and
+ * OpenAI-compatible handlers.
+ *
+ * @param requestedModel - The model name from the request (may include suffixes)
+ * @param originalModel  - The original model before any header overrides
+ * @param proxyConfig    - The loaded proxy config file
+ * @param bypassRouting  - True if routing should be bypassed (relay disabled or header override)
+ * @param log            - Verbose logging function
+ */
+function resolveRoutingMode(
+    requestedModel: string,
+    originalModel: string,
+    proxyConfig: RelayPlaneProxyConfigFile,
+    bypassRouting: boolean,
+    log: (msg: string) => void,
+): RoutingResolution {
+    // Check for profile:strategy before parseModelSuffix strips the colon
+    const colonIdx = requestedModel.indexOf(":");
+    if (colonIdx > 0) {
+        const candidateName = requestedModel.substring(0, colonIdx);
+        const candidateStrategy = requestedModel.substring(colonIdx + 1);
+        if (
+            proxyConfig.profiles?.[candidateName] &&
+            VALID_PROFILE_STRATEGIES.has(candidateStrategy)
+        ) {
+            return {
+                resolvedModel: requestedModel,
+                routingMode: "profile",
+                profileMatch: true,
+            };
+        }
+    }
+
+    // Parse suffix, apply overrides, resolve aliases
+    const preStripModel = requestedModel;
+    const parsedModel = parseModelSuffix(requestedModel);
+    let routingSuffix: RoutingSuffix | null = parsedModel.suffix;
+    let resolved = parsedModel.baseModel;
+
+    if (!bypassRouting) {
+        const override =
+            proxyConfig.modelOverrides?.[preStripModel] ??
+            proxyConfig.modelOverrides?.[resolved];
+        if (override) {
+            log(`Model override: ${preStripModel} → ${override}`);
+            const overrideParsed = parseModelSuffix(override);
+            if (!routingSuffix && overrideParsed.suffix) {
+                routingSuffix = overrideParsed.suffix;
+            }
+            resolved = overrideParsed.baseModel;
+        }
+    }
+
+    const aliasResolved = resolveModelAlias(resolved);
+    if (aliasResolved !== resolved) {
+        log(`Alias resolution: ${resolved} → ${aliasResolved}`);
+        resolved = aliasResolved;
+    }
+
+    const result = (mode: RoutingMode): RoutingResolution => ({
+        resolvedModel: resolved,
+        routingMode: mode,
+        profileMatch: false,
+    });
+
+    // Determine routing mode
+    if (bypassRouting) return result("passthrough");
+    if (routingSuffix) return result(routingSuffix);
+
+    if (resolved.startsWith("relayplane:")) {
+        if (resolved.includes(":cost")) return result("cost");
+        if (resolved.includes(":fast")) return result("fast");
+        if (resolved.includes(":quality")) return result("quality");
+        return result("auto"); // relayplane:auto
+    }
+
+    if (resolved.startsWith("ad:")) {
+        if (resolved === "ad:auto") return result("alphadeal");
+        return result("passthrough");
+    }
+
+    if (resolved.startsWith("rp:")) {
+        if (resolved === "rp:cost" || resolved === "rp:cheap")
+            return result("cost");
+        if (resolved === "rp:fast") return result("fast");
+        if (resolved === "rp:quality" || resolved === "rp:best")
+            return result("quality");
+        // rp:balanced — recover auto intent if original was a known auto alias
+        const autoAliases = [
+            "relayplane:auto",
+            "rp:auto",
+            "auto",
+            "default",
+        ];
+        if (autoAliases.includes(originalModel)) return result("auto");
+        return result("passthrough");
+    }
+
+    if (
+        resolved === "auto" ||
+        resolved === "relayplane:auto" ||
+        resolved === "default"
+    ) {
+        return result("auto");
+    }
+    if (resolved === "cost") return result("cost");
+    if (resolved === "fast") return result("fast");
+    if (resolved === "quality") return result("quality");
+
+    // Invalid model → auto with sonnet fallback
+    const modelResolved = resolveExplicitModel(resolved);
+    if (
+        !modelResolved ||
+        (modelResolved.provider === "anthropic" &&
+            resolved.includes("latest"))
+    ) {
+        log(
+            `Invalid model "${resolved}" detected, switching to auto mode with fallback`,
+        );
+        return {
+            resolvedModel: "claude-sonnet-4-6",
+            routingMode: "auto",
+            profileMatch: false,
+        };
+    }
+
+    return result("passthrough");
+}
+
 function extractResponseText(responseData: Record<string, unknown>): string {
     const openAiChoices = responseData["choices"] as
         | Array<Record<string, unknown>>
@@ -3853,10 +3899,11 @@ export async function startProxy(
 
             if (req.method === "GET" && telemetryPath === "savings") {
                 // Savings = cost(baseline model) - cost(actual routed-to model)
-                // For auto-routing aliases, the baseline is the most capable model
-                // the user would need without smart routing (Opus).
-                // For direct model requests, the baseline is the requested model itself.
-                const BASELINE_MODEL = "claude-opus-4-6";
+                // For auto-routing aliases, the baseline is the model the user would
+                // have used without smart routing. Configurable via config.json
+                // telemetry.baselineModel; defaults to Opus for a conservative estimate.
+                const BASELINE_MODEL =
+                    proxyConfig.telemetry?.baselineModel ?? "claude-opus-4-6";
 
                 let totalOriginalCost = 0;
                 let totalActualCost = 0;
@@ -4204,152 +4251,20 @@ export async function startProxy(
                 );
             }
 
-            // Check for profile:strategy before parseModelSuffix strips the colon
-            let profileMatch = false;
-            {
-                const colonIdx = requestedModel.indexOf(":");
-                if (colonIdx > 0) {
-                    const candidateName = requestedModel.substring(0, colonIdx);
-                    const candidateStrategy = requestedModel.substring(
-                        colonIdx + 1,
-                    );
-                    if (
-                        proxyConfig.profiles?.[candidateName] &&
-                        VALID_PROFILE_STRATEGIES.has(candidateStrategy)
-                    ) {
-                        profileMatch = true;
-                    }
-                }
-            }
+            const bypassRouting = !relayplaneEnabled || relayplaneBypass;
+            const routing = resolveRoutingMode(
+                requestedModel,
+                originalModel ?? "",
+                proxyConfig,
+                bypassRouting,
+                log,
+            );
+            requestedModel = routing.resolvedModel;
+            const { profileMatch } = routing;
+            let routingMode: RoutingMode = routing.routingMode;
 
-            let routingSuffix: RoutingSuffix | null = null;
-            if (!profileMatch) {
-                // Track annotated model name (e.g. claude-opus-4-6[1m]) before
-                // parseModelSuffix strips the annotation, so config overrides for
-                // annotated variants take priority over base-model overrides.
-                const preStripModel = requestedModel;
-                const parsedModel = parseModelSuffix(requestedModel);
-                routingSuffix = parsedModel.suffix;
-                requestedModel = parsedModel.baseModel;
-
-                if (relayplaneEnabled && !relayplaneBypass && requestedModel) {
-                    const override =
-                        proxyConfig.modelOverrides?.[preStripModel] ??
-                        proxyConfig.modelOverrides?.[requestedModel];
-                    if (override) {
-                        log(`Model override: ${preStripModel} → ${override}`);
-                        const overrideParsed = parseModelSuffix(override);
-                        if (!routingSuffix && overrideParsed.suffix) {
-                            routingSuffix = overrideParsed.suffix;
-                        }
-                        requestedModel = overrideParsed.baseModel;
-                    }
-                }
-
-                // Resolve aliases (e.g., relayplane:auto → rp:balanced)
-                const resolvedModel = resolveModelAlias(requestedModel);
-                if (resolvedModel !== requestedModel) {
-                    log(
-                        `Alias resolution: ${requestedModel} → ${resolvedModel}`,
-                    );
-                    requestedModel = resolvedModel;
-                }
-
-                if (requestedModel && requestedModel !== originalModel) {
-                    requestBody["model"] = requestedModel;
-                }
-            }
-
-            let routingMode:
-                | "auto"
-                | "cost"
-                | "fast"
-                | "quality"
-                | "alphadeal"
-                | "profile"
-                | "passthrough" = "auto";
-            if (profileMatch) {
-                routingMode = "profile";
-            } else if (!relayplaneEnabled || relayplaneBypass) {
-                routingMode = "passthrough";
-            } else if (routingSuffix) {
-                routingMode = routingSuffix;
-            } else if (requestedModel.startsWith("relayplane:")) {
-                if (requestedModel.includes(":cost")) {
-                    routingMode = "cost";
-                } else if (requestedModel.includes(":fast")) {
-                    routingMode = "fast";
-                } else if (requestedModel.includes(":quality")) {
-                    routingMode = "quality";
-                }
-                // relayplane:auto stays as 'auto'
-            } else if (requestedModel.startsWith("ad:")) {
-                // Handle ad:* AlphaDeal aliases - OpenAI complexity-based routing
-                if (requestedModel === "ad:auto") {
-                    routingMode = "alphadeal";
-                } else {
-                    // ad:fast, ad:balanced, ad:best, ad:analysis go through passthrough
-                    // to resolve via ALPHADEAL_ALIASES
-                    routingMode = "passthrough";
-                }
-            } else if (requestedModel.startsWith("rp:")) {
-                // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
-                if (
-                    requestedModel === "rp:cost" ||
-                    requestedModel === "rp:cheap"
-                ) {
-                    routingMode = "cost";
-                } else if (requestedModel === "rp:fast") {
-                    routingMode = "fast";
-                } else if (
-                    requestedModel === "rp:quality" ||
-                    requestedModel === "rp:best"
-                ) {
-                    routingMode = "quality";
-                } else {
-                    // rp:balanced reached here via alias resolution of relayplane:auto/rp:auto.
-                    // Recover the original auto-routing intent rather than hardcoding passthrough.
-                    const preAliasModel = originalModel ?? "";
-                    if (
-                        preAliasModel === "relayplane:auto" ||
-                        preAliasModel === "rp:auto" ||
-                        preAliasModel === "auto" ||
-                        preAliasModel === "default"
-                    ) {
-                        routingMode = "auto";
-                    } else {
-                        routingMode = "passthrough";
-                    }
-                }
-            } else if (
-                requestedModel === "auto" ||
-                requestedModel === "relayplane:auto" ||
-                requestedModel === "default"
-            ) {
-                routingMode = "auto";
-            } else if (requestedModel === "cost") {
-                routingMode = "cost";
-            } else if (requestedModel === "fast") {
-                routingMode = "fast";
-            } else if (requestedModel === "quality") {
-                routingMode = "quality";
-            } else {
-                // Check if model is valid before passthrough
-                // Invalid models trigger auto mode with sonnet fallback
-                const modelResolved = resolveExplicitModel(requestedModel);
-                if (
-                    !modelResolved ||
-                    (modelResolved.provider === "anthropic" &&
-                        requestedModel.includes("latest"))
-                ) {
-                    log(
-                        `Invalid model "${requestedModel}" detected, switching to auto mode with fallback`,
-                    );
-                    routingMode = "auto";
-                    requestedModel = "claude-sonnet-4-6";
-                } else {
-                    routingMode = "passthrough";
-                }
+            if (requestedModel !== originalModel) {
+                requestBody["model"] = requestedModel;
             }
 
             const isStreaming = requestBody["stream"] === true;
@@ -4371,7 +4286,21 @@ export async function startProxy(
                 promptText = extractMessageText(messages);
                 taskType = inferTaskType(promptText);
                 confidence = getInferenceConfidence(promptText, taskType);
-                complexity = classifyComplexity(messages, requestBody["tools"]);
+                const rawSystem = requestBody["system"];
+                const systemStr =
+                    typeof rawSystem === "string"
+                        ? rawSystem
+                        : isContentBlockArray(rawSystem)
+                          ? rawSystem
+                                .filter((b) => b.type === "text")
+                                .map((b) => b.text ?? "")
+                                .join(" ")
+                          : "";
+                complexity = classifyComplexity(
+                    messages,
+                    requestBody["tools"],
+                    systemStr,
+                );
                 log(
                     `Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`,
                 );
@@ -5274,144 +5203,18 @@ export async function startProxy(
             return;
         }
 
-        // Check for profile:strategy before parseModelSuffix strips the colon
-        let profileMatch = false;
-        {
-            const colonIdx = requestedModel.indexOf(":");
-            if (colonIdx > 0) {
-                const candidateName = requestedModel.substring(0, colonIdx);
-                const candidateStrategy = requestedModel.substring(
-                    colonIdx + 1,
-                );
-                if (
-                    proxyConfig.profiles?.[candidateName] &&
-                    VALID_PROFILE_STRATEGIES.has(candidateStrategy)
-                ) {
-                    profileMatch = true;
-                }
-            }
-        }
-
-        let routingSuffix: RoutingSuffix | null = null;
-        if (!profileMatch) {
-            const preStripModel = requestedModel;
-            const parsedModel = parseModelSuffix(requestedModel);
-            routingSuffix = parsedModel.suffix;
-            requestedModel = parsedModel.baseModel;
-
-            if (!bypassRouting) {
-                const override =
-                    proxyConfig.modelOverrides?.[preStripModel] ??
-                    proxyConfig.modelOverrides?.[requestedModel];
-                if (override) {
-                    log(`Model override: ${preStripModel} → ${override}`);
-                    const overrideParsed = parseModelSuffix(override);
-                    if (!routingSuffix && overrideParsed.suffix) {
-                        routingSuffix = overrideParsed.suffix;
-                    }
-                    requestedModel = overrideParsed.baseModel;
-                }
-            }
-
-            // Resolve aliases (e.g., relayplane:auto → rp:balanced)
-            const resolvedModel = resolveModelAlias(requestedModel);
-            if (resolvedModel !== requestedModel) {
-                log(`Alias resolution: ${requestedModel} → ${resolvedModel}`);
-                requestedModel = resolvedModel;
-            }
-        }
-
-        let routingMode:
-            | "auto"
-            | "cost"
-            | "fast"
-            | "quality"
-            | "alphadeal"
-            | "profile"
-            | "passthrough" = "auto";
+        const routing = resolveRoutingMode(
+            requestedModel,
+            originalRequestedModel,
+            proxyConfig,
+            bypassRouting,
+            log,
+        );
+        requestedModel = routing.resolvedModel;
+        const { profileMatch } = routing;
+        let routingMode: RoutingMode = routing.routingMode;
         let targetModel: string = "";
         let targetProvider: Provider = "anthropic";
-
-        if (profileMatch) {
-            routingMode = "profile";
-        } else if (bypassRouting) {
-            routingMode = "passthrough";
-        } else if (routingSuffix) {
-            routingMode = routingSuffix;
-        } else if (requestedModel.startsWith("relayplane:")) {
-            if (requestedModel.includes(":cost")) {
-                routingMode = "cost";
-            } else if (requestedModel.includes(":fast")) {
-                routingMode = "fast";
-            } else if (requestedModel.includes(":quality")) {
-                routingMode = "quality";
-            }
-            // relayplane:auto stays as 'auto'
-        } else if (requestedModel.startsWith("ad:")) {
-            // Handle ad:* AlphaDeal aliases - OpenAI complexity-based routing
-            if (requestedModel === "ad:auto") {
-                routingMode = "alphadeal";
-            } else {
-                // ad:fast, ad:balanced, ad:best, ad:analysis go through passthrough
-                // to resolve via ALPHADEAL_ALIASES
-                routingMode = "passthrough";
-            }
-        } else if (requestedModel.startsWith("rp:")) {
-            // Handle rp:* smart aliases - route through passthrough to use SMART_ALIASES
-            if (requestedModel === "rp:cost" || requestedModel === "rp:cheap") {
-                routingMode = "cost";
-            } else if (requestedModel === "rp:fast") {
-                routingMode = "fast";
-            } else if (
-                requestedModel === "rp:quality" ||
-                requestedModel === "rp:best"
-            ) {
-                routingMode = "quality";
-            } else {
-                // rp:balanced reached here via alias resolution of relayplane:auto/rp:auto.
-                // Recover the original auto-routing intent rather than hardcoding passthrough.
-                const preAliasModel = originalRequestedModel ?? "";
-                if (
-                    preAliasModel === "relayplane:auto" ||
-                    preAliasModel === "rp:auto" ||
-                    preAliasModel === "auto" ||
-                    preAliasModel === "default"
-                ) {
-                    routingMode = "auto";
-                } else {
-                    routingMode = "passthrough";
-                }
-            }
-        } else if (
-            requestedModel === "auto" ||
-            requestedModel === "relayplane:auto" ||
-            requestedModel === "default"
-        ) {
-            routingMode = "auto";
-        } else if (requestedModel === "cost") {
-            routingMode = "cost";
-        } else if (requestedModel === "fast") {
-            routingMode = "fast";
-        } else if (requestedModel === "quality") {
-            routingMode = "quality";
-        } else {
-            // Check if model is valid before passthrough
-            // Invalid models trigger auto mode with sonnet fallback
-            const modelResolved = resolveExplicitModel(requestedModel);
-            if (
-                !modelResolved ||
-                (modelResolved.provider === "anthropic" &&
-                    requestedModel.includes("latest"))
-            ) {
-                log(
-                    `Invalid model "${requestedModel}" detected, switching to auto mode with fallback`,
-                );
-                routingMode = "auto";
-                requestedModel = "claude-sonnet-4-6";
-            } else {
-                routingMode = "passthrough";
-            }
-        }
 
         log(
             `Received request for model: ${requestedModel} (mode: ${routingMode}, stream: ${isStreaming})`,
@@ -5427,7 +5230,18 @@ export async function startProxy(
             promptText = extractPromptText(request.messages);
             taskType = inferTaskType(promptText);
             confidence = getInferenceConfidence(promptText, taskType);
-            complexity = classifyComplexity(request.messages);
+            const systemMsg = request.messages.find(
+                (m: { role?: string }) => m.role === "system",
+            );
+            const systemStr =
+                typeof systemMsg?.content === "string"
+                    ? systemMsg.content
+                    : "";
+            complexity = classifyComplexity(
+                request.messages,
+                request.tools,
+                systemStr,
+            );
             log(
                 `Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`,
             );
@@ -5843,29 +5657,23 @@ export async function startProxy(
     return new Promise((resolve, reject) => {
         server.on("error", reject);
         server.listen(port, host, () => {
-            console.log(`RelayPlane proxy listening on http://${host}:${port}`);
-            console.log(`  Endpoints:`);
-            console.log(
-                `    POST /v1/messages          - Native Anthropic API (Claude Code)`,
-            );
-            console.log(
-                `    POST /v1/chat/completions  - OpenAI-compatible API`,
-            );
-            console.log(`    POST /v1/messages/count_tokens - Token counting`);
-            console.log(`    GET  /v1/models            - Model list`);
-            console.log(
-                `  Models: relayplane:auto, relayplane:cost, relayplane:fast, relayplane:quality`,
-            );
             const profileNames = Object.keys(proxyConfig.profiles ?? {});
-            if (profileNames.length > 0) {
-                console.log(
-                    `  Profiles: ${profileNames.map((n) => `${n}:*`).join(", ")}`,
-                );
-            }
-            console.log(
-                `  Auth: Passthrough for Anthropic, env vars for other providers`,
+            const profileLine =
+                profileNames.length > 0
+                    ? `\n  Profiles: ${profileNames.map((n) => `${n}:*`).join(", ")}`
+                    : "";
+            defaultLogger.info(
+                `Proxy listening on http://${host}:${port}\n` +
+                    `  Endpoints:\n` +
+                    `    POST /v1/messages          - Native Anthropic API (Claude Code)\n` +
+                    `    POST /v1/chat/completions  - OpenAI-compatible API\n` +
+                    `    POST /v1/messages/count_tokens - Token counting\n` +
+                    `    GET  /v1/models            - Model list\n` +
+                    `  Models: relayplane:auto, relayplane:cost, relayplane:fast, relayplane:quality` +
+                    profileLine +
+                    `\n  Auth: Passthrough for Anthropic, env vars for other providers\n` +
+                    `  Streaming: ✅ Enabled`,
             );
-            console.log(`  Streaming: ✅ Enabled`);
             resolve(server);
         });
     });
