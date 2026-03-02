@@ -1824,6 +1824,22 @@ interface OpenAIMessage {
     name?: string;
 }
 
+interface AnthropicToolResultBlock {
+    type: "tool_result";
+    tool_use_id?: string;
+    content: string;
+}
+
+interface AnthropicContentBlock {
+    type: string;
+    [key: string]: unknown;
+}
+
+interface AnthropicMessage {
+    role: "user" | "assistant";
+    content: string | Array<AnthropicContentBlock | AnthropicToolResultBlock>;
+}
+
 /**
  * Convert OpenAI messages array to Anthropic format
  * Handles: user, assistant, tool_calls, tool results
@@ -1835,7 +1851,7 @@ function convertMessagesToAnthropic(
         [key: string]: unknown;
     }>,
 ): unknown[] {
-    const result: unknown[] = [];
+    const result: AnthropicMessage[] = [];
 
     for (const msg of messages) {
         const m = msg as OpenAIMessage;
@@ -1845,11 +1861,15 @@ function convertMessagesToAnthropic(
 
         // Tool result message → Anthropic user message with tool_result content
         if (m.role === "tool") {
-            const lastMsg = result.length > 0 ? result[result.length - 1] as any : null;
+            const lastMsg = result.length > 0 ? result[result.length - 1] : null;
 
             // If the last message we created was a user message with tool_results,
             // merge this tool result into the existing user message.
-            if (lastMsg?.role === "user" && Array.isArray(lastMsg.content) && lastMsg.content.some((c: any) => c.type === "tool_result")) {
+            if (
+                lastMsg?.role === "user" &&
+                Array.isArray(lastMsg.content) &&
+                lastMsg.content.some((c) => c.type === "tool_result")
+            ) {
                 lastMsg.content.push({
                     type: "tool_result",
                     tool_use_id: m.tool_call_id,
