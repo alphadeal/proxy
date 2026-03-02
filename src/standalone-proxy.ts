@@ -4403,6 +4403,7 @@ export async function startProxy(
                 : [];
             const sanitizedMessages = sanitizeAnthropicToolResultMessages(rawMessages);
             const messages = sanitizedMessages.messages;
+            requestBody["messages"] = messages;
             if (
                 sanitizedMessages.droppedToolResults > 0 ||
                 sanitizedMessages.droppedMessages > 0
@@ -4410,7 +4411,6 @@ export async function startProxy(
                 log(
                     `[tool_result sanitize] Dropped ${sanitizedMessages.droppedToolResults} orphan tool_result block(s) across ${sanitizedMessages.droppedMessages} message(s)`,
                 );
-                requestBody["messages"] = messages;
             }
 
             let promptText = "";
