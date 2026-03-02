@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { classifyComplexity } from "../src/routing/complexity-classifier.js";
+import {
+    classifyComplexity,
+    classifyComplexityWithDetails,
+} from "../src/routing/complexity-classifier.js";
 
 type Message = { content?: unknown; role?: string };
 
@@ -190,14 +193,14 @@ describe("classifyComplexity", () => {
     describe("moderate tier — score 3-4", () => {
         it("classifies tools plus keyword as moderate (score 3)", () => {
             const messages = [textMessage("analyze this codebase")];
-            // tools: +2 + "analyze": +1 = score 3 → moderate
-            expect(classifyComplexity(messages, [{}])).toBe("moderate");
+            // tools: +1 + "analyze": +1 = score 2 → simple
+            expect(classifyComplexity(messages, [{}])).toBe("simple");
         });
 
         it("classifies tools plus engineering keyword as moderate", () => {
             const messages = [textMessage("implement the new feature")];
-            // tools: +2 + "implement": +1 = score 3 → moderate
-            expect(classifyComplexity(messages, [{}])).toBe("moderate");
+            // tools: +1 + "implement": +1 = score 2 → simple
+            expect(classifyComplexity(messages, [{}])).toBe("simple");
         });
 
         it("classifies tools plus 3 recent tool_results as moderate (score 3)", () => {
@@ -211,8 +214,8 @@ describe("classifyComplexity", () => {
                 toolResultMessage("const c = 3"),
             ];
             const tools = [{ name: "read" }];
-            // tools: +2, recentResults(3 in last 6) >= 3: +1 = score 3 → moderate
-            expect(classifyComplexity(messages, tools)).toBe("moderate");
+            // tools: +1, recentResults(3) < 4 = score 1 → simple
+            expect(classifyComplexity(messages, tools)).toBe("simple");
         });
 
         it("classifies text block with tools plus keyword as moderate", () => {
@@ -221,8 +224,8 @@ describe("classifyComplexity", () => {
             ];
             // "implement": +1 = score 1 → simple without tools
             expect(classifyComplexity(messages)).toBe("simple");
-            // With tools: +2 + "implement": +1 = score 3 → moderate
-            expect(classifyComplexity(messages, [{}])).toBe("moderate");
+            // With tools: +1 + "implement": +1 = score 2 → simple
+            expect(classifyComplexity(messages, [{}])).toBe("simple");
         });
 
         it("classifies tools plus computation keyword as moderate (score 4)", () => {
@@ -242,15 +245,15 @@ describe("classifyComplexity", () => {
         it("classifies large current message with tools as moderate (score 3)", () => {
             const longText = "x".repeat(8100);
             const messages = [textMessage(longText)];
-            // tools: +2 + currentTokens > 2000: +1 = score 3 → moderate
-            expect(classifyComplexity(messages, [{}])).toBe("moderate");
+            // tools: +1 + currentTokens > 2000: +1 = score 2 → simple
+            expect(classifyComplexity(messages, [{}])).toBe("simple");
         });
 
         it("classifies very large current message as moderate (score 3)", () => {
             const longText = "x".repeat(20100);
             const messages = [textMessage(longText)];
-            // currentTokens > 2000: +1, currentTokens > 5000: +2 = score 3 → moderate
-            expect(classifyComplexity(messages)).toBe("moderate");
+            // currentTokens > 2000: +1, currentTokens > 5000: +1 = score 2 → simple
+            expect(classifyComplexity(messages)).toBe("simple");
         });
 
         it("classifies agentic session where last message has keyword as moderate", () => {
@@ -270,8 +273,8 @@ describe("classifyComplexity", () => {
                 { name: "read" },
                 { name: "edit" },
             ];
-            // tools: +2, "review" in last message: +1 = score 3 → moderate
-            expect(classifyComplexity(messages, tools)).toBe("moderate");
+            // tools: +1, "review" in last message: +1 = score 2 → simple
+            expect(classifyComplexity(messages, tools)).toBe("simple");
         });
     });
 
@@ -283,8 +286,8 @@ describe("classifyComplexity", () => {
                 ),
             ];
             const tools = [{ name: "bash" }];
-            // tools: +2, "refactor": +1, codePattern (function/const): +2 = score 5 → complex
-            expect(classifyComplexity(messages, tools)).toBe("complex");
+            // tools: +1, "refactor": +1, codePattern: +2 = score 4 → moderate
+            expect(classifyComplexity(messages, tools)).toBe("moderate");
         });
 
         it("classifies architecture review request with tools as complex", () => {
@@ -307,8 +310,8 @@ describe("classifyComplexity", () => {
                 textMessage(longText + " analyze this codebase"),
             ];
             const tools = [{ name: "bash" }];
-            // tools: +2, currentTokens>2000: +1, currentTokens>5000: +2, "analyze": +1 = score 6 → complex
-            expect(classifyComplexity(messages, tools)).toBe("complex");
+            // tools: +1, currentTokens>2000: +1, currentTokens>5000: +1, "analyze": +1 = score 4 → moderate
+            expect(classifyComplexity(messages, tools)).toBe("moderate");
         });
 
         it("classifies tools plus computation keyword plus code as complex", () => {
@@ -333,11 +336,8 @@ describe("classifyComplexity", () => {
                 toolResultMessage("class AuthService {}"),
             ];
             const tools = [{ name: "bash" }];
-            // tools: +2, "refactor": +1, recentResults(3 in last 6): +1, last text = "refactor the auth module"
-            // Wait — last user text is "refactor the auth module" (first message) because tool messages are skipped
-            // tools: +2, "refactor": +1, recentResults(3): +1 = score 4 → moderate
-            // Need more signal for complex. Let's adjust.
-            expect(classifyComplexity(messages, tools)).toBe("moderate");
+            // tools: +1, "refactor": +1, recentResults(3) < 4 = score 2 → simple
+            expect(classifyComplexity(messages, tools)).toBe("simple");
         });
 
         it("classifies multi-step instructions with tools as complex", () => {
@@ -358,8 +358,8 @@ describe("classifyComplexity", () => {
                 ),
             ];
             const tools = [{ name: "bash" }];
-            // tools: +2, "implement": +1, code fence: +2 = score 5 → complex
-            expect(classifyComplexity(messages, tools)).toBe("complex");
+            // tools: +1, "implement": +1, code fence: +2 = score 4 → moderate
+            expect(classifyComplexity(messages, tools)).toBe("moderate");
         });
 
         it("classifies design request with computation as complex", () => {
@@ -369,8 +369,8 @@ describe("classifyComplexity", () => {
                 ),
             ];
             const tools = [{ name: "bash" }];
-            // tools: +2, "design a": +1, "calculate": +2 = score 5 → complex
-            expect(classifyComplexity(messages, tools)).toBe("complex");
+            // tools: +1, "design a": +1, "calculate": +2 = score 4 → moderate
+            expect(classifyComplexity(messages, tools)).toBe("moderate");
         });
     });
 
@@ -415,9 +415,9 @@ describe("classifyComplexity", () => {
             }
             messages.push(textMessage("now review the auth module"));
             const tools = [{ name: "bash" }, { name: "read" }];
-            // tools: +2, "review": +1 = score 3 → moderate
+            // tools: +1, "review": +1 = score 2 → simple
             // NOT complex, even though there are 45+ messages and 15 tool_results
-            expect(classifyComplexity(messages, tools)).toBe("moderate");
+            expect(classifyComplexity(messages, tools)).toBe("simple");
         });
 
         it("classifies complex request in long session correctly as complex", () => {
@@ -435,6 +435,40 @@ describe("classifyComplexity", () => {
             const tools = [{ name: "bash" }];
             // tools: +2, "analyze": +1, "refactor": +1, "first.*then": +1 = score 5 → complex
             expect(classifyComplexity(messages, tools)).toBe("complex");
+        });
+    });
+
+    describe("intent hints and score inflation guards", () => {
+        it("marks commit/push prompts as git_ops", () => {
+            const tools = Array.from({ length: 15 }, (_, i) => ({
+                name: `tool-${i}`,
+            }));
+            const details = classifyComplexityWithDetails(
+                [textMessage("please commit and push the changes")],
+                tools,
+            );
+            expect(details.intentHints).toContain("git_ops");
+            expect(details.complexity).not.toBe("complex");
+        });
+
+        it("marks basic refactor prompts as small_refactor", () => {
+            const details = classifyComplexityWithDetails([
+                textMessage("do a basic refactor to improve naming"),
+            ]);
+            expect(details.intentHints).toContain("small_refactor");
+        });
+
+        it("does not inflate tiny prompts to complex from large system prompt alone", () => {
+            const tools = Array.from({ length: 15 }, (_, i) => ({
+                name: `tool-${i}`,
+            }));
+            const longSystem = "x".repeat(13000);
+            const details = classifyComplexityWithDetails(
+                [textMessage("what time is it?")],
+                tools,
+                longSystem,
+            );
+            expect(details.complexity).not.toBe("complex");
         });
     });
 });

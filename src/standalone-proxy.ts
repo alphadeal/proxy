@@ -39,11 +39,15 @@ import {
 import { StatsCollector } from "./stats.js";
 import { defaultLogger } from "./logger.js";
 import {
-    classifyComplexity,
+    classifyComplexityWithDetails,
     extractMessageText,
     isContentBlockArray,
 } from "./routing/complexity-classifier.js";
-import type { Complexity } from "./routing/complexity-classifier.js";
+import type {
+    Complexity,
+    ComplexityAssessment,
+    IntentHint,
+} from "./routing/complexity-classifier.js";
 const PROXY_VERSION: string = (() => {
     try {
         const pkgPath = path.join(__dirname, "..", "package.json");
@@ -375,6 +379,13 @@ interface ComplexityConfig {
     simple: string;
     moderate: string;
     complex: string;
+    opusGate?: {
+        enabled?: boolean;
+        minScore?: number;
+        requireSignals?: IntentHint[];
+        maxTokensInBypass?: number;
+        blockIntents?: IntentHint[];
+    };
 }
 
 interface AlphadealConfig {
@@ -574,7 +585,7 @@ const globalStats: RequestStats = {
 };
 
 /** Rolling request history for telemetry endpoints (max 10000 entries) */
-interface RequestHistoryEntry {
+export interface RequestHistoryEntry {
     id: string;
     originalModel: string;
     targetModel: string;
@@ -589,6 +600,15 @@ interface RequestHistoryEntry {
     costUsd: number;
     taskType?: string;
     complexity?: string;
+    routingReason?: string;
+    opusGateDecision?: string;
+    intentHints?: string[];
+}
+
+export interface RoutingMetadata {
+    routingReason?: string;
+    opusGateDecision?: string;
+    intentHints?: IntentHint[];
 }
 const requestHistory: RequestHistoryEntry[] = [];
 const MAX_HISTORY = 10000;
@@ -751,6 +771,7 @@ function logRequest(
     escalated?: boolean,
     taskType?: string,
     complexity?: string,
+    routingMeta?: RoutingMetadata,
 ): void {
     const timestamp = new Date().toISOString();
     const status = success ? "✓" : "✗";
@@ -800,6 +821,9 @@ function logRequest(
         costUsd: 0,
         taskType: taskType || "general",
         complexity: complexity || "simple",
+        routingReason: routingMeta?.routingReason,
+        opusGateDecision: routingMeta?.opusGateDecision,
+        intentHints: routingMeta?.intentHints,
     };
     requestHistory.push(entry);
     if (requestHistory.length > MAX_HISTORY) {
@@ -843,6 +867,18 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
             simple: "claude-3-5-haiku-20241022",
             moderate: "claude-sonnet-4-20250514",
             complex: "claude-opus-4-20250514",
+            opusGate: {
+                enabled: true,
+                minScore: 7,
+                requireSignals: [
+                    "architecture",
+                    "multi_step",
+                    "large_context",
+                    "cross_file_refactor",
+                ],
+                maxTokensInBypass: 300,
+                blockIntents: ["git_ops", "housekeeping", "small_refactor"],
+            },
         },
         alphadeal: {
             enabled: true,
@@ -879,6 +915,11 @@ function normalizeProxyConfig(
     const complexity = {
         ...defaultRouting.complexity,
         ...(configRouting.complexity ?? {}),
+        opusGate: {
+            ...(defaultRouting.complexity?.opusGate ?? {}),
+            ...((configRouting.complexity as ComplexityConfig | undefined)
+                ?.opusGate ?? {}),
+        },
     };
     const alphadeal = {
         ...defaultRouting.alphadeal,
@@ -1850,7 +1891,7 @@ function convertMessagesToAnthropic(
         content: string | unknown;
         [key: string]: unknown;
     }>,
-): unknown[] {
+): AnthropicMessage[] {
     const result: AnthropicMessage[] = [];
 
     for (const msg of messages) {
@@ -3220,6 +3261,224 @@ function resolveRoutingMode(
     return result("passthrough");
 }
 
+interface OpusGateResult {
+    complexity: Complexity;
+    decision: "allowed" | "blocked" | "not_applicable";
+    reason: string;
+}
+
+export function applyOpusGate(
+    complexity: Complexity,
+    assessment: ComplexityAssessment,
+    config: RelayPlaneProxyConfigFile,
+): OpusGateResult {
+    if (complexity !== "complex") {
+        return {
+            complexity,
+            decision: "not_applicable",
+            reason: "complexity_not_complex",
+        };
+    }
+
+    const gate = config.routing?.complexity?.opusGate;
+    if (gate?.enabled === false) {
+        return { complexity, decision: "allowed", reason: "gate_disabled" };
+    }
+
+    const minScore = gate?.minScore ?? 7;
+    const maxTokensInBypass = gate?.maxTokensInBypass ?? 300;
+    const blockIntents = new Set<IntentHint>(
+        gate?.blockIntents ?? ["git_ops", "housekeeping", "small_refactor"],
+    );
+    const requiredSignals = new Set<IntentHint>(
+        gate?.requireSignals ?? [
+            "architecture",
+            "multi_step",
+            "large_context",
+            "cross_file_refactor",
+        ],
+    );
+
+    const hintSet = new Set(assessment.intentHints);
+    const blockedIntent = Array.from(blockIntents).find((h) => hintSet.has(h));
+    if (blockedIntent) {
+        return {
+            complexity: "moderate",
+            decision: "blocked",
+            reason: `blocked_intent:${blockedIntent}`,
+        };
+    }
+
+    const strongSignal = Array.from(requiredSignals).some((h) => hintSet.has(h));
+    if (!strongSignal && assessment.currentTokens <= maxTokensInBypass) {
+        return {
+            complexity: "moderate",
+            decision: "blocked",
+            reason: "no_strong_signal_low_tokens",
+        };
+    }
+
+    if (assessment.score < minScore) {
+        return {
+            complexity: "moderate",
+            decision: "blocked",
+            reason: `score_below_min:${assessment.score}<${minScore}`,
+        };
+    }
+
+    return { complexity, decision: "allowed", reason: "gate_passed" };
+}
+
+export function buildRoutingMetadata(
+    assessment: ComplexityAssessment,
+    gate: OpusGateResult,
+): RoutingMetadata {
+    return {
+        routingReason: `score=${assessment.score};signals=${assessment.signals.join("|") || "none"}`,
+        opusGateDecision: `${gate.decision}:${gate.reason}`,
+        intentHints: assessment.intentHints,
+    };
+}
+
+export function assessComplexityForRouting(
+    messages: Array<{ content?: unknown; role?: string }>,
+    bodyTools: unknown,
+    system: string,
+    config: RelayPlaneProxyConfigFile,
+): { complexity: Complexity; routingMeta: RoutingMetadata } {
+    const assessment = classifyComplexityWithDetails(messages, bodyTools, system);
+    const gate = applyOpusGate(assessment.complexity, assessment, config);
+    return {
+        complexity: gate.complexity,
+        routingMeta: buildRoutingMetadata(assessment, gate),
+    };
+}
+
+export function summarizeRoutingInsights(history: RequestHistoryEntry[]): {
+    opusGateBlocked: number;
+    intentHintCounts: Record<string, number>;
+} {
+    const opusGateBlocked = history.filter((r) =>
+        (r.opusGateDecision ?? "").startsWith("blocked:"),
+    ).length;
+    const intentHintCounts: Record<string, number> = {};
+    for (const r of history) {
+        for (const hint of r.intentHints ?? []) {
+            intentHintCounts[hint] = (intentHintCounts[hint] ?? 0) + 1;
+        }
+    }
+    return { opusGateBlocked, intentHintCounts };
+}
+
+export function toTelemetryRun(
+    r: RequestHistoryEntry,
+): Record<string, unknown> {
+    const baseline = isAutoRouted(r.originalModel)
+        ? "claude-opus-4-6"
+        : r.originalModel;
+    const origCost = estimateCost(baseline, r.tokensIn, r.tokensOut);
+    const perRunSavings = Math.max(0, origCost - r.costUsd);
+    return {
+        id: r.id,
+        workflow_name: r.mode,
+        mode: r.mode,
+        status: r.success ? "success" : "error",
+        success: r.success,
+        started_at: r.timestamp,
+        timestamp: r.timestamp,
+        model: r.targetModel,
+        provider: r.provider,
+        routed_to: `${r.provider}/${r.targetModel}`,
+        original_model: r.originalModel,
+        routingSource: isAutoRouted(r.originalModel) ? "auto" : "direct",
+        taskType: r.taskType || "general",
+        complexity: r.complexity || "simple",
+        costUsd: r.costUsd,
+        latencyMs: r.latencyMs,
+        tokensIn: r.tokensIn,
+        tokensOut: r.tokensOut,
+        savings: Math.round(perRunSavings * 10000) / 10000,
+        escalated: r.escalated,
+        routingReason: r.routingReason,
+        opusGateDecision: r.opusGateDecision,
+        intentHints: r.intentHints ?? [],
+    };
+}
+
+export function buildTelemetryStatsPayload(
+    recent: RequestHistoryEntry[],
+): Record<string, unknown> {
+    const modelMap = new Map<
+        string,
+        {
+            count: number;
+            cost: number;
+            autoCount: number;
+            directCount: number;
+        }
+    >();
+    for (const r of recent) {
+        const key = r.targetModel;
+        const cur = modelMap.get(key) || {
+            count: 0,
+            cost: 0,
+            autoCount: 0,
+            directCount: 0,
+        };
+        cur.count++;
+        cur.cost += r.costUsd;
+        if (isAutoRouted(r.originalModel)) {
+            cur.autoCount++;
+        } else {
+            cur.directCount++;
+        }
+        modelMap.set(key, cur);
+    }
+
+    const dailyMap = new Map<string, { requests: number; cost: number }>();
+    for (const r of recent) {
+        const date = r.timestamp.slice(0, 10);
+        const cur = dailyMap.get(date) || { requests: 0, cost: 0 };
+        cur.requests++;
+        cur.cost += r.costUsd;
+        dailyMap.set(date, cur);
+    }
+
+    const totalCost = recent.reduce((s, r) => s + r.costUsd, 0);
+    const totalLatency = recent.reduce((s, r) => s + r.latencyMs, 0);
+    const routingInsights = summarizeRoutingInsights(recent);
+
+    return {
+        summary: {
+            totalCostUsd: totalCost,
+            totalEvents: recent.length,
+            avgLatencyMs: recent.length
+                ? Math.round(totalLatency / recent.length)
+                : 0,
+            successRate: recent.length
+                ? recent.filter((r) => r.success).length / recent.length
+                : 0,
+        },
+        routingInsights: {
+            opusGateBlocked: routingInsights.opusGateBlocked,
+            intentHintCounts: routingInsights.intentHintCounts,
+        },
+        byModel: Array.from(modelMap.entries()).map(([model, v]) => ({
+            model,
+            count: v.count,
+            costUsd: v.cost,
+            autoCount: v.autoCount,
+            directCount: v.directCount,
+            savings: 0,
+        })),
+        dailyCosts: Array.from(dailyMap.entries()).map(([date, v]) => ({
+            date,
+            costUsd: v.cost,
+            requests: v.requests,
+        })),
+    };
+}
+
 function extractResponseText(responseData: Record<string, unknown>): string {
     const openAiChoices = responseData["choices"] as
         | Array<Record<string, unknown>>
@@ -3896,84 +4155,7 @@ export async function startProxy(
                 const recent = requestHistory.filter(
                     (r) => new Date(r.timestamp).getTime() >= cutoff,
                 );
-
-                // Model breakdown with auto vs direct split
-                const modelMap = new Map<
-                    string,
-                    {
-                        count: number;
-                        cost: number;
-                        autoCount: number;
-                        directCount: number;
-                    }
-                >();
-                for (const r of recent) {
-                    const key = r.targetModel;
-                    const cur = modelMap.get(key) || {
-                        count: 0,
-                        cost: 0,
-                        autoCount: 0,
-                        directCount: 0,
-                    };
-                    cur.count++;
-                    cur.cost += r.costUsd;
-                    if (isAutoRouted(r.originalModel)) {
-                        cur.autoCount++;
-                    } else {
-                        cur.directCount++;
-                    }
-                    modelMap.set(key, cur);
-                }
-
-                // Daily stats
-                const dailyMap = new Map<
-                    string,
-                    { requests: number; cost: number }
-                >();
-                for (const r of recent) {
-                    const date = r.timestamp.slice(0, 10);
-                    const cur = dailyMap.get(date) || { requests: 0, cost: 0 };
-                    cur.requests++;
-                    cur.cost += r.costUsd;
-                    dailyMap.set(date, cur);
-                }
-
-                const totalCost = recent.reduce((s, r) => s + r.costUsd, 0);
-                const totalLatency = recent.reduce(
-                    (s, r) => s + r.latencyMs,
-                    0,
-                );
-
-                const result = {
-                    summary: {
-                        totalCostUsd: totalCost,
-                        totalEvents: recent.length,
-                        avgLatencyMs: recent.length
-                            ? Math.round(totalLatency / recent.length)
-                            : 0,
-                        successRate: recent.length
-                            ? recent.filter((r) => r.success).length /
-                              recent.length
-                            : 0,
-                    },
-                    byModel: Array.from(modelMap.entries()).map(
-                        ([model, v]) => ({
-                            model,
-                            count: v.count,
-                            costUsd: v.cost,
-                            autoCount: v.autoCount,
-                            directCount: v.directCount,
-                            savings: 0,
-                        }),
-                    ),
-                    dailyCosts: Array.from(dailyMap.entries()).map(
-                        ([date, v]) => ({
-                            date,
-                            costUsd: v.cost,
-                            requests: v.requests,
-                        }),
-                    ),
-                };
+                const result = buildTelemetryStatsPayload(recent);
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify(result));
                 return;
@@ -3983,41 +4165,9 @@ export async function startProxy(
                 const limit = parseInt(params.get("limit") || "50", 10);
                 const offset = parseInt(params.get("offset") || "0", 10);
                 const sorted = [...requestHistory].reverse();
-                const runs = sorted.slice(offset, offset + limit).map((r) => {
-                    const baseline = isAutoRouted(r.originalModel)
-                        ? "claude-opus-4-6"
-                        : r.originalModel;
-                    const origCost = estimateCost(
-                        baseline,
-                        r.tokensIn,
-                        r.tokensOut,
-                    );
-                    const perRunSavings = Math.max(0, origCost - r.costUsd);
-                    return {
-                        id: r.id,
-                        workflow_name: r.mode,
-                        mode: r.mode,
-                        status: r.success ? "success" : "error",
-                        success: r.success,
-                        started_at: r.timestamp,
-                        timestamp: r.timestamp,
-                        model: r.targetModel,
-                        provider: r.provider,
-                        routed_to: `${r.provider}/${r.targetModel}`,
-                        original_model: r.originalModel,
-                        routingSource: isAutoRouted(r.originalModel)
-                            ? "auto"
-                            : "direct",
-                        taskType: r.taskType || "general",
-                        complexity: r.complexity || "simple",
-                        costUsd: r.costUsd,
-                        latencyMs: r.latencyMs,
-                        tokensIn: r.tokensIn,
-                        tokensOut: r.tokensOut,
-                        savings: Math.round(perRunSavings * 10000) / 10000,
-                        escalated: r.escalated,
-                    };
-                });
+                const runs = sorted
+                    .slice(offset, offset + limit)
+                    .map((r) => toTelemetryRun(r));
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(
                     JSON.stringify({
@@ -4421,6 +4571,7 @@ export async function startProxy(
             let taskType: TaskType = "general";
             let confidence = 0;
             let complexity: Complexity = "simple";
+            let routingMeta: RoutingMetadata | undefined;
 
             // Always classify — needed for taskType display, telemetry, and routing decisions
             // even in passthrough mode we want accurate task type data
@@ -4438,14 +4589,24 @@ export async function startProxy(
                                 .map((b) => b.text ?? "")
                                 .join(" ")
                           : "";
-                complexity = classifyComplexity(
+                const routingAssessment = assessComplexityForRouting(
                     messages,
                     requestBody["tools"],
                     systemStr,
+                    proxyConfig,
                 );
+                complexity = routingAssessment.complexity;
+                routingMeta = routingAssessment.routingMeta;
                 log(
                     `Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`,
                 );
+                if (
+                    (routingMeta.opusGateDecision ?? "").startsWith("blocked:")
+                ) {
+                    log(
+                        `[opus gate] downgraded complex → moderate (${routingMeta.opusGateDecision})`,
+                    );
+                }
             }
 
             const cascadeConfig = getCascadeConfig(proxyConfig);
@@ -4859,6 +5020,7 @@ export async function startProxy(
                                         undefined,
                                         taskType,
                                         complexity,
+                                        routingMeta,
                                     );
                                     return;
                                 } else {
@@ -4964,6 +5126,7 @@ export async function startProxy(
                                         undefined,
                                         taskType,
                                         complexity,
+                                        routingMeta,
                                     );
                                     return;
                                 } else {
@@ -4998,6 +5161,7 @@ export async function startProxy(
                             undefined,
                             taskType,
                             complexity,
+                            routingMeta,
                         );
                         res.writeHead(providerResponse.status, {
                             "Content-Type": "application/json",
@@ -5126,6 +5290,7 @@ export async function startProxy(
                     useCascade && cascadeConfig ? undefined : false,
                     taskType,
                     complexity,
+                    routingMeta,
                 );
 
                 // Always extract and persist token counts — this is what the telemetry endpoints read
@@ -5181,6 +5346,7 @@ export async function startProxy(
                     undefined,
                     taskType,
                     complexity,
+                    routingMeta,
                 );
                 if (err instanceof ProviderResponseError) {
                     res.writeHead(err.status, {
@@ -5366,6 +5532,7 @@ export async function startProxy(
         let taskType: TaskType = "general";
         let confidence = 0;
         let complexity: Complexity = "simple";
+        let routingMeta: RoutingMetadata | undefined;
 
         // Always classify — taskType is needed for display, routing decisions, and telemetry
         if (request.messages && request.messages.length > 0) {
@@ -5379,14 +5546,22 @@ export async function startProxy(
                 typeof systemMsg?.content === "string"
                     ? systemMsg.content
                     : "";
-            complexity = classifyComplexity(
+            const routingAssessment = assessComplexityForRouting(
                 request.messages,
                 request.tools,
                 systemStr,
+                proxyConfig,
             );
+            complexity = routingAssessment.complexity;
+            routingMeta = routingAssessment.routingMeta;
             log(
                 `Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`,
             );
+            if ((routingMeta.opusGateDecision ?? "").startsWith("blocked:")) {
+                log(
+                    `[opus gate] downgraded complex → moderate (${routingMeta.opusGateDecision})`,
+                );
+            }
         }
 
         const cascadeConfig = getCascadeConfig(proxyConfig);
@@ -5609,6 +5784,7 @@ export async function startProxy(
                 cooldownManager,
                 cooldownsEnabled,
                 complexity,
+                routingMeta,
             );
         } else {
             if (useCascade && cascadeConfig) {
@@ -5687,6 +5863,7 @@ export async function startProxy(
                         cascadeResult.escalations > 0,
                         taskType,
                         complexity,
+                        routingMeta,
                     );
                     const cascadeUsage = (responseData as any)?.usage;
                     const cascadeTokensIn =
@@ -5756,6 +5933,7 @@ export async function startProxy(
                         undefined,
                         taskType,
                         complexity,
+                        routingMeta,
                     );
                     if (err instanceof ProviderResponseError) {
                         res.writeHead(err.status, {
@@ -5792,6 +5970,7 @@ export async function startProxy(
                     cooldownManager,
                     cooldownsEnabled,
                     complexity,
+                    routingMeta,
                 );
             }
         }
@@ -5957,6 +6136,7 @@ async function handleStreamingRequest(
     cooldownManager: CooldownManager,
     cooldownsEnabled: boolean,
     complexity: Complexity = "simple",
+    routingMeta?: RoutingMetadata,
 ): Promise<void> {
     let providerResponse: Response;
 
@@ -6021,6 +6201,7 @@ async function handleStreamingRequest(
                 undefined,
                 taskType,
                 complexity,
+                routingMeta,
             );
             res.writeHead(providerResponse.status, {
                 "Content-Type": "application/json",
@@ -6044,6 +6225,7 @@ async function handleStreamingRequest(
             undefined,
             taskType,
             complexity,
+            routingMeta,
         );
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
@@ -6173,6 +6355,7 @@ async function handleStreamingRequest(
         undefined,
         taskType,
         complexity,
+        routingMeta,
     );
     // Update token/cost info on the history entry
     const streamCost = estimateCost(
@@ -6234,6 +6417,7 @@ async function handleNonStreamingRequest(
     cooldownManager: CooldownManager,
     cooldownsEnabled: boolean,
     complexity: Complexity = "simple",
+    routingMeta?: RoutingMetadata,
 ): Promise<void> {
     let responseData: Record<string, unknown>;
 
@@ -6264,6 +6448,7 @@ async function handleNonStreamingRequest(
                 undefined,
                 taskType,
                 complexity,
+                routingMeta,
             );
             res.writeHead(result.status, {
                 "Content-Type": "application/json",
@@ -6287,6 +6472,7 @@ async function handleNonStreamingRequest(
             undefined,
             taskType,
             complexity,
+            routingMeta,
         );
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
@@ -6310,6 +6496,7 @@ async function handleNonStreamingRequest(
         undefined,
         taskType,
         complexity,
+        routingMeta,
     );
     // Update token/cost info
     const usage = (responseData as any)?.usage;
