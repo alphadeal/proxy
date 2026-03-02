@@ -1144,6 +1144,75 @@ function hasToolReferenceBlocks(
     return false;
 }
 
+/**
+ * Anthropic requires each `tool_result` block to reference a `tool_use` id from
+ * the immediately previous assistant message. Drop orphan tool_result blocks so
+ * a stale/truncated history does not hard-fail the whole request.
+ */
+export function sanitizeAnthropicToolResultMessages(
+    messages: Array<{ role?: string; content?: unknown }>,
+): {
+    messages: Array<{ role?: string; content?: unknown }>;
+    droppedToolResults: number;
+    droppedMessages: number;
+} {
+    const sanitized: Array<{ role?: string; content?: unknown }> = [];
+    let droppedToolResults = 0;
+    let droppedMessages = 0;
+
+    for (const msg of messages) {
+        const role = msg?.role;
+        const content = msg?.content;
+
+        if (role !== "user" || !Array.isArray(content)) {
+            sanitized.push(msg);
+            continue;
+        }
+
+        const prev = sanitized.length > 0 ? sanitized[sanitized.length - 1] : undefined;
+        const validToolUseIds = new Set<string>();
+        if (prev?.role === "assistant" && Array.isArray(prev.content)) {
+            for (const block of prev.content as Array<Record<string, unknown>>) {
+                if (
+                    block?.type === "tool_use" &&
+                    typeof block.id === "string" &&
+                    block.id
+                ) {
+                    validToolUseIds.add(block.id);
+                }
+            }
+        }
+
+        const filtered: unknown[] = [];
+        for (const block of content as Array<Record<string, unknown>>) {
+            if (block?.type !== "tool_result") {
+                filtered.push(block);
+                continue;
+            }
+
+            const toolUseId = block.tool_use_id;
+            const valid =
+                typeof toolUseId === "string" &&
+                toolUseId &&
+                validToolUseIds.has(toolUseId);
+            if (valid) {
+                filtered.push(block);
+            } else {
+                droppedToolResults += 1;
+            }
+        }
+
+        if (filtered.length === 0) {
+            droppedMessages += 1;
+            continue;
+        }
+
+        sanitized.push({ ...msg, content: filtered });
+    }
+
+    return { messages: sanitized, droppedToolResults, droppedMessages };
+}
+
 function stripThinkingIfUnsupported(
     body: Record<string, unknown>,
     model: string,
@@ -1776,19 +1845,35 @@ function convertMessagesToAnthropic(
 
         // Tool result message → Anthropic user message with tool_result content
         if (m.role === "tool") {
-            result.push({
-                role: "user",
-                content: [
-                    {
-                        type: "tool_result",
-                        tool_use_id: m.tool_call_id,
-                        content:
-                            typeof m.content === "string"
-                                ? m.content
-                                : JSON.stringify(m.content),
-                    },
-                ],
-            });
+            const lastMsg = result.length > 0 ? result[result.length - 1] as any : null;
+
+            // If the last message we created was a user message with tool_results,
+            // merge this tool result into the existing user message.
+            if (lastMsg?.role === "user" && Array.isArray(lastMsg.content) && lastMsg.content.some((c: any) => c.type === "tool_result")) {
+                lastMsg.content.push({
+                    type: "tool_result",
+                    tool_use_id: m.tool_call_id,
+                    content:
+                        typeof m.content === "string"
+                            ? m.content
+                            : JSON.stringify(m.content),
+                });
+            } else {
+                // Otherwise, create a new user message for this tool result.
+                result.push({
+                    role: "user",
+                    content: [
+                        {
+                            type: "tool_result",
+                            tool_use_id: m.tool_call_id,
+                            content:
+                                typeof m.content === "string"
+                                    ? m.content
+                                    : JSON.stringify(m.content),
+                        },
+                    ],
+                });
+            }
             continue;
         }
 
@@ -4290,12 +4375,23 @@ export async function startProxy(
             }
 
             const isStreaming = requestBody["stream"] === true;
-            const messages = Array.isArray(requestBody["messages"])
+            const rawMessages = Array.isArray(requestBody["messages"])
                 ? (requestBody["messages"] as Array<{
                       role?: string;
                       content?: unknown;
                   }>)
                 : [];
+            const sanitizedMessages = sanitizeAnthropicToolResultMessages(rawMessages);
+            const messages = sanitizedMessages.messages;
+            if (
+                sanitizedMessages.droppedToolResults > 0 ||
+                sanitizedMessages.droppedMessages > 0
+            ) {
+                log(
+                    `[tool_result sanitize] Dropped ${sanitizedMessages.droppedToolResults} orphan tool_result block(s) across ${sanitizedMessages.droppedMessages} message(s)`,
+                );
+                requestBody["messages"] = messages;
+            }
 
             let promptText = "";
             let taskType: TaskType = "general";

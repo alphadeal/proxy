@@ -5,6 +5,7 @@ import {
   resolveModelAlias,
   getAvailableModelNames,
   MODEL_MAPPING,
+  sanitizeAnthropicToolResultMessages,
 } from '../src/standalone-proxy.js';
 
 describe('RELAYPLANE_ALIASES', () => {
@@ -97,5 +98,58 @@ describe('MODEL_MAPPING', () => {
 
   it('should have updated opus pointing to claude-opus-4', () => {
     expect(MODEL_MAPPING['opus'].model).toContain('claude-opus-4');
+  });
+});
+
+describe('sanitizeAnthropicToolResultMessages', () => {
+  it('keeps valid tool_result blocks paired with previous assistant tool_use', () => {
+    const input = [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_valid', name: 'Read', input: {} }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_valid', content: 'ok' }],
+      },
+    ];
+
+    const out = sanitizeAnthropicToolResultMessages(input);
+    expect(out.droppedToolResults).toBe(0);
+    expect(out.droppedMessages).toBe(0);
+    expect(out.messages).toEqual(input);
+  });
+
+  it('drops orphan tool_result blocks and removes now-empty user message', () => {
+    const out = sanitizeAnthropicToolResultMessages([
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_orphan', content: 'orphan' }],
+      },
+    ]);
+
+    expect(out.droppedToolResults).toBe(1);
+    expect(out.droppedMessages).toBe(1);
+    expect(out.messages).toEqual([]);
+  });
+
+  it('keeps text while removing invalid tool_result blocks in mixed user content', () => {
+    const out = sanitizeAnthropicToolResultMessages([
+      { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'continuing without tools' },
+          { type: 'tool_result', tool_use_id: 'toolu_missing', content: 'bad' },
+        ],
+      },
+    ]);
+
+    expect(out.droppedToolResults).toBe(1);
+    expect(out.droppedMessages).toBe(0);
+    expect(out.messages).toEqual([
+      { role: 'assistant', content: [{ type: 'text', text: 'hello' }] },
+      { role: 'user', content: [{ type: 'text', text: 'continuing without tools' }] },
+    ]);
   });
 });
