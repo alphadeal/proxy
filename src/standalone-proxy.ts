@@ -1899,7 +1899,7 @@ function convertMessagesToAnthropic(
 
         // Assistant message with tool_calls → Anthropic assistant with tool_use content
         if (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0) {
-            const content: unknown[] = [];
+            const content: (AnthropicContentBlock | AnthropicToolResultBlock)[] = [];
 
             // Add text content if present
             if (m.content && typeof m.content === "string") {
@@ -1923,7 +1923,11 @@ function convertMessagesToAnthropic(
         // Regular user/assistant message
         result.push({
             role: m.role === "assistant" ? "assistant" : "user",
-            content: m.content,
+            content: typeof m.content === "string"
+                ? m.content
+                : Array.isArray(m.content)
+                    ? JSON.stringify(m.content)
+                    : "",
         });
     }
 
