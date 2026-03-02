@@ -594,21 +594,9 @@ const requestHistory: RequestHistoryEntry[] = [];
 const MAX_HISTORY = 10000;
 const HISTORY_RETENTION_DAYS = 7;
 
-/** Model names that indicate proxy-routed (auto) requests vs direct user requests */
-const AUTO_ROUTING_MODELS = new Set([
-    "relayplane:auto",
-    "relayplane:cost",
-    "relayplane:fast",
-    "relayplane:quality",
-    "rp:auto",
-    "rp:balanced",
-    "rp:best",
-    "rp:fast",
-    "rp:cheap",
-]);
-
-function isAutoRouted(originalModel: string): boolean {
-    return AUTO_ROUTING_MODELS.has(originalModel);
+/** Returns true if this history entry was proxy-routed (not a direct passthrough) */
+function isAutoRouted(entry: RequestHistoryEntry): boolean {
+    return entry.mode !== "passthrough";
 }
 let requestIdCounter = 0;
 
@@ -3917,7 +3905,7 @@ export async function startProxy(
                     };
                     cur.count++;
                     cur.cost += r.costUsd;
-                    if (isAutoRouted(r.originalModel)) {
+                    if (isAutoRouted(r)) {
                         cur.autoCount++;
                     } else {
                         cur.directCount++;
@@ -3984,7 +3972,7 @@ export async function startProxy(
                 const offset = parseInt(params.get("offset") || "0", 10);
                 const sorted = [...requestHistory].reverse();
                 const runs = sorted.slice(offset, offset + limit).map((r) => {
-                    const baseline = isAutoRouted(r.originalModel)
+                    const baseline = isAutoRouted(r)
                         ? "claude-opus-4-6"
                         : r.originalModel;
                     const origCost = estimateCost(
@@ -4005,7 +3993,7 @@ export async function startProxy(
                         provider: r.provider,
                         routed_to: `${r.provider}/${r.targetModel}`,
                         original_model: r.originalModel,
-                        routingSource: isAutoRouted(r.originalModel)
+                        routingSource: isAutoRouted(r)
                             ? "auto"
                             : "direct",
                         taskType: r.taskType || "general",
@@ -4049,7 +4037,7 @@ export async function startProxy(
                 >();
 
                 for (const r of requestHistory) {
-                    const baselineModel = isAutoRouted(r.originalModel)
+                    const baselineModel = isAutoRouted(r)
                         ? BASELINE_MODEL
                         : r.originalModel;
                     const origCost = estimateCost(
@@ -4108,7 +4096,7 @@ export async function startProxy(
                     };
                     bucket.requests++;
                     bucket.actualCost += r.costUsd;
-                    const baseM = isAutoRouted(r.originalModel)
+                    const baseM = isAutoRouted(r)
                         ? BASELINE_MODEL
                         : r.originalModel;
                     bucket.originalCost += estimateCost(
