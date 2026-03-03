@@ -1,8 +1,14 @@
 import { describe, it, expect } from "vitest";
 import {
+    applyThinkingSanitizationForModel,
     assessComplexityForRouting,
     applyOpusGate,
     applySimpleEffortStrip,
+    hasEffortControls,
+    isEffortUnsupportedError,
+    isLowerTierModel,
+    normalizeAnthropicBetaHeader,
+    normalizeEffortForProvider,
     summarizeRoutingInsights,
     toTelemetryRun,
 } from "../src/standalone-proxy.js";
@@ -306,5 +312,166 @@ describe("standalone routing helpers", () => {
             "simple",
         );
         expect(stripped.effort).toBe("low");
+    });
+
+    it("detects unsupported effort errors from provider payloads", () => {
+        const unsupported = isEffortUnsupportedError(400, {
+            error: {
+                type: "invalid_request_error",
+                message: "This model does not support the effort parameter.",
+            },
+        });
+        const unrelated = isEffortUnsupportedError(400, {
+            error: {
+                type: "invalid_request_error",
+                message: "Unknown tool name.",
+            },
+        });
+
+        expect(unsupported).toBe(true);
+        expect(unrelated).toBe(false);
+    });
+
+    it("classifies lower-tier model names across providers", () => {
+        expect(isLowerTierModel("claude-haiku-4-5-20251001")).toBe(true);
+        expect(isLowerTierModel("gpt-5-nano")).toBe(true);
+        expect(isLowerTierModel("gemini-2.0-flash")).toBe(true);
+        expect(isLowerTierModel("claude-sonnet-4-6")).toBe(false);
+    });
+
+    it("detects effort controls across top-level and nested shapes", () => {
+        expect(hasEffortControls({ effort: "low" })).toBe(true);
+        expect(hasEffortControls({ reasoning_effort: "medium" })).toBe(true);
+        expect(hasEffortControls({ reasoning: { effort: "high" } })).toBe(
+            true,
+        );
+        expect(hasEffortControls({ output_config: { effort: "high" } })).toBe(
+            true,
+        );
+        expect(hasEffortControls({ thinking: { budget_tokens: 1024 } })).toBe(
+            false,
+        );
+    });
+
+    it("normalizes anthropic requests by removing unsupported effort controls", () => {
+        const normalized = normalizeEffortForProvider(
+            {
+                model: "claude-haiku-4-5-20251001",
+                messages: [{ role: "user", content: "hi" }],
+                effort: "low",
+                reasoning_effort: "medium",
+                reasoning: { effort: "high", max_tokens: 2000 },
+                output_config: { effort: "medium", keep: true },
+                thinking: { type: "enabled", budget_tokens: 1200 },
+            },
+            "anthropic" as never,
+            "claude-haiku-4-5-20251001",
+        );
+
+        expect(normalized.effort).toBeUndefined();
+        expect(normalized.reasoning_effort).toBeUndefined();
+        expect((normalized.reasoning as Record<string, unknown>).effort).toBe(
+            undefined,
+        );
+        expect(
+            (normalized.reasoning as Record<string, unknown>).max_tokens,
+        ).toBe(2000);
+        expect(
+            (normalized.output_config as Record<string, unknown>).effort,
+        ).toBeUndefined();
+        expect(
+            (normalized.output_config as Record<string, unknown>).keep,
+        ).toBe(true);
+        expect(
+            (normalized.thinking as Record<string, unknown>).budget_tokens,
+        ).toBe(1200);
+    });
+
+    it("maps generic effort to reasoning_effort for openai", () => {
+        const normalized = normalizeEffortForProvider(
+            {
+                model: "gpt-5.2",
+                messages: [{ role: "user", content: "hi" }],
+                effort: "low",
+            },
+            "openai" as never,
+            "gpt-5.2",
+        );
+        expect(normalized.effort).toBeUndefined();
+        expect(normalized.reasoning_effort).toBe("low");
+    });
+
+    it("maps generic effort to reasoning.effort for openrouter", () => {
+        const normalized = normalizeEffortForProvider(
+            {
+                model: "openai/gpt-5-mini",
+                messages: [{ role: "user", content: "hi" }],
+                effort: "medium",
+            },
+            "openrouter" as never,
+            "openai/gpt-5-mini",
+        );
+        expect(normalized.effort).toBeUndefined();
+        expect((normalized.reasoning as Record<string, unknown>).effort).toBe(
+            "medium",
+        );
+    });
+
+    it("strips effort controls for deepseek models", () => {
+        const normalized = normalizeEffortForProvider(
+            {
+                model: "deepseek-reasoner",
+                messages: [{ role: "user", content: "hi" }],
+                effort: "high",
+                reasoning_effort: "high",
+                reasoning: { effort: "high" },
+            },
+            "deepseek" as never,
+            "deepseek-reasoner",
+        );
+        expect(hasEffortControls(normalized)).toBe(false);
+    });
+
+    it("strips thinking betas for simple/low-tier anthropic routes", () => {
+        const beta = normalizeAnthropicBetaHeader(
+            "prompt-caching-2024-07-31,clear_thinking_20251015,extended-thinking-2025-09-12,effort-2025-11-24",
+            "claude-haiku-4-5-20251001",
+            "simple",
+        );
+        expect(beta).toBe("prompt-caching-2024-07-31");
+    });
+
+    it("returns undefined when all anthropic beta tokens are stripped", () => {
+        const beta = normalizeAnthropicBetaHeader(
+            "clear_thinking_20251015,extended-thinking-2025-09-12",
+            "claude-haiku-4-5-20251001",
+            "simple",
+        );
+        expect(beta).toBeUndefined();
+    });
+
+    it("strips thinking controls when betas is a string", () => {
+        const sanitized = applyThinkingSanitizationForModel(
+            {
+                model: "claude-haiku-4-5-20251001",
+                thinking: { type: "enabled", budget_tokens: 1200 },
+                betas: "clear_thinking_20251015,prompt-caching-2024-07-31",
+            },
+            "claude-haiku-4-5-20251001",
+            "simple",
+        );
+        expect(sanitized.thinking).toBeUndefined();
+        expect(sanitized.betas).toBe("prompt-caching-2024-07-31");
+    });
+
+    it("keeps thinking betas for non-simple higher-tier anthropic routes", () => {
+        const beta = normalizeAnthropicBetaHeader(
+            "prompt-caching-2024-07-31,clear_thinking_20251015",
+            "claude-sonnet-4-6",
+            "moderate",
+        );
+        expect(beta).toBe(
+            "prompt-caching-2024-07-31,clear_thinking_20251015",
+        );
     });
 });

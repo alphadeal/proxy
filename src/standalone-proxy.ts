@@ -1157,6 +1157,18 @@ const EFFORT_STRIP_SIMPLE_MODELS = [
     "claude-3-haiku-20240307",
 ];
 
+const LOWER_TIER_MODEL_HINTS = [
+    "haiku",
+    "nano",
+    "mini",
+    "flash-lite",
+    "flash",
+    "small",
+    "lite",
+    "instant",
+    "fast",
+];
+
 /**
  * Models that do not support `tool_reference` content blocks.
  * These are Sonnet 4+ / Opus 4+ only features as of the claude-haiku-4-5 era.
@@ -1288,19 +1300,44 @@ export function sanitizeAnthropicToolResultMessages(
 function stripThinkingIfUnsupported<T extends Record<string, unknown>>(
     body: T,
     model: string,
+    complexity?: Complexity,
 ): T {
     const modelLower = model.toLowerCase();
     const unsupported = THINKING_UNSUPPORTED_MODELS.some((m) =>
         modelLower.includes(m),
     );
-    if (!unsupported) return body;
+    // Cost/latency policy:
+    // For simple requests on lower-tier models, thinking controls often add
+    // overhead without meaningful quality gain. We strip them proactively to
+    // preserve low-cost routing and prevent avoidable provider contract errors.
+    const simpleLowTier = complexity === "simple" && isLowerTierModel(model);
+    if (!unsupported && !simpleLowTier) return body;
     const stripped: Record<string, unknown> = { ...body };
     delete stripped["thinking"];
     if (Array.isArray(stripped["betas"])) {
         stripped["betas"] = (stripped["betas"] as string[]).filter(
-            (b) => !b.includes("thinking"),
+            (b) =>
+                !b.includes("thinking") &&
+                !b.includes("clear_thinking") &&
+                !b.includes("reasoning"),
         );
         if ((stripped["betas"] as string[]).length === 0) {
+            delete stripped["betas"];
+        }
+    } else if (typeof stripped["betas"] === "string") {
+        const filtered = (stripped["betas"] as string)
+            .split(",")
+            .map((b) => b.trim())
+            .filter(
+                (b) =>
+                    b &&
+                    !b.includes("thinking") &&
+                    !b.includes("clear_thinking") &&
+                    !b.includes("reasoning"),
+            );
+        if (filtered.length > 0) {
+            stripped["betas"] = filtered.join(",");
+        } else {
             delete stripped["betas"];
         }
     }
@@ -1339,6 +1376,224 @@ export function applySimpleEffortStrip<T extends Record<string, unknown>>(
     return stripEffortIfSimple(body, model, complexity);
 }
 
+function stripEffortParameter<T extends Record<string, unknown>>(body: T): T {
+    return normalizeEffortForProvider(body, "anthropic", "unknown");
+}
+
+function getObjectField(
+    body: Record<string, unknown>,
+    key: string,
+): Record<string, unknown> | undefined {
+    const value = body[key];
+    return value && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : undefined;
+}
+
+function getEffortString(body: Record<string, unknown>, key: string): string | null {
+    return typeof body[key] === "string" ? (body[key] as string) : null;
+}
+
+function inferEffortLevel(body: Record<string, unknown>): string | null {
+    const top = getEffortString(body, "effort");
+    if (top) return top;
+    const reasoningEffort = getEffortString(body, "reasoning_effort");
+    if (reasoningEffort) return reasoningEffort;
+    const reasoning = getObjectField(body, "reasoning");
+    if (reasoning && typeof reasoning["effort"] === "string") {
+        return reasoning["effort"] as string;
+    }
+    const outputConfig = getObjectField(body, "output_config");
+    if (outputConfig && typeof outputConfig["effort"] === "string") {
+        return outputConfig["effort"] as string;
+    }
+    return null;
+}
+
+function stripAllEffortControls<T extends Record<string, unknown>>(body: T): T {
+    const stripped: Record<string, unknown> = { ...body };
+    delete stripped["effort"];
+    delete stripped["reasoning_effort"];
+
+    const reasoning = getObjectField(stripped, "reasoning");
+    if (reasoning && Object.prototype.hasOwnProperty.call(reasoning, "effort")) {
+        const nextReasoning = { ...reasoning };
+        delete nextReasoning["effort"];
+        stripped["reasoning"] = nextReasoning;
+    }
+
+    const outputConfig = getObjectField(stripped, "output_config");
+    if (
+        outputConfig &&
+        Object.prototype.hasOwnProperty.call(outputConfig, "effort")
+    ) {
+        const nextOutputConfig = { ...outputConfig };
+        delete nextOutputConfig["effort"];
+        stripped["output_config"] = nextOutputConfig;
+    }
+
+    return stripped as T;
+}
+
+function supportsReasoningEffortOnXai(model: string): boolean {
+    return model.toLowerCase().includes("grok-3-mini");
+}
+
+function supportsReasoningEffortOnGroq(model: string): boolean {
+    const lower = model.toLowerCase();
+    return lower.includes("qwen") || lower.includes("gpt-oss");
+}
+
+export function hasEffortControls(body: Record<string, unknown>): boolean {
+    if (Object.prototype.hasOwnProperty.call(body, "effort")) return true;
+    if (Object.prototype.hasOwnProperty.call(body, "reasoning_effort"))
+        return true;
+    const reasoning = getObjectField(body, "reasoning");
+    if (reasoning && Object.prototype.hasOwnProperty.call(reasoning, "effort"))
+        return true;
+    const outputConfig = getObjectField(body, "output_config");
+    return (
+        !!outputConfig &&
+        Object.prototype.hasOwnProperty.call(outputConfig, "effort")
+    );
+}
+
+export function normalizeEffortForProvider<T extends Record<string, unknown>>(
+    request: T,
+    provider: Provider,
+    model: string,
+): T {
+    const level = inferEffortLevel(request);
+    let normalized = stripAllEffortControls(request) as Record<string, unknown>;
+
+    if (!level) return normalized as T;
+
+    if (provider === "openai") {
+        normalized["reasoning_effort"] = level;
+        return normalized as T;
+    }
+
+    if (provider === "xai") {
+        if (supportsReasoningEffortOnXai(model)) {
+            normalized["reasoning_effort"] = level;
+        }
+        return normalized as T;
+    }
+
+    if (provider === "groq") {
+        if (supportsReasoningEffortOnGroq(model)) {
+            normalized["reasoning_effort"] = level;
+        }
+        return normalized as T;
+    }
+
+    if (provider === "openrouter") {
+        const reasoning = getObjectField(normalized, "reasoning") ?? {};
+        normalized["reasoning"] = { ...reasoning, effort: level };
+        return normalized as T;
+    }
+
+    // Anthropic, Google, DeepSeek, and all other providers: drop effort controls.
+    return normalized as T;
+}
+
+export function isEffortUnsupportedError(
+    status: number,
+    payload: Record<string, unknown>,
+): boolean {
+    if (status < 400 || status >= 500) return false;
+    const errorObj = payload["error"] as Record<string, unknown> | undefined;
+    const message =
+        typeof errorObj?.["message"] === "string"
+            ? errorObj["message"].toLowerCase()
+            : "";
+    const type =
+        typeof errorObj?.["type"] === "string"
+            ? errorObj["type"].toLowerCase()
+            : "";
+    return (
+        message.includes("effort parameter") ||
+        message.includes("unsupported parameter") ||
+        (message.includes("effort") && type === "invalid_request_error")
+    );
+}
+
+export function isLowerTierModel(model: string): boolean {
+    const lower = model.toLowerCase();
+    return LOWER_TIER_MODEL_HINTS.some((hint) => lower.includes(hint));
+}
+
+function isThinkingBeta(token: string): boolean {
+    const lower = token.toLowerCase();
+    return (
+        lower.includes("thinking") ||
+        lower.includes("clear_thinking") ||
+        lower.includes("reasoning") ||
+        lower.includes("effort")
+    );
+}
+
+export function normalizeAnthropicBetaHeader(
+    betaHeader: string | undefined,
+    model: string,
+    complexity: Complexity = "simple",
+): string | undefined {
+    if (!betaHeader || !betaHeader.trim()) return undefined;
+    const tokens = betaHeader
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
+    if (tokens.length === 0) return undefined;
+
+    // Anthropic thinking-related beta strategies (e.g. clear_thinking_*) can
+    // force a thinking contract that lower-tier/simple requests do not need.
+    // Effort betas can also imply higher-reasoning strategies, so we strip them
+    // as part of the same guard. Non-reasoning betas (e.g. oauth/prompt-caching)
+    // are preserved.
+    const shouldStripThinkingBetas =
+        isLowerTierModel(model) || complexity === "simple";
+    if (!shouldStripThinkingBetas) return tokens.join(",");
+
+    const filtered = tokens.filter((t) => !isThinkingBeta(t));
+    return filtered.length > 0 ? filtered.join(",") : undefined;
+}
+
+function sanitizeAnthropicAttempt(
+    body: Record<string, unknown>,
+    ctx: RequestContext,
+    model: string,
+    complexity: Complexity = "simple",
+): { body: Record<string, unknown>; ctx: RequestContext } {
+    let sanitizedBody = stripThinkingIfUnsupported(body, model, complexity);
+    sanitizedBody = normalizeEffortForProvider(
+        sanitizedBody,
+        "anthropic",
+        model,
+    );
+
+    if (complexity === "simple" && isLowerTierModel(model)) {
+        delete sanitizedBody["thinking_strategy"];
+        delete sanitizedBody["clear_thinking_strategy"];
+        const reasoning = getObjectField(sanitizedBody, "reasoning");
+        if (
+            reasoning &&
+            typeof reasoning["strategy"] === "string" &&
+            (reasoning["strategy"] as string).includes("clear_thinking")
+        ) {
+            const nextReasoning = { ...reasoning };
+            delete nextReasoning["strategy"];
+            sanitizedBody["reasoning"] = nextReasoning;
+        }
+    }
+
+    const betaBefore = ctx.betaHeaders;
+    const betaAfter = normalizeAnthropicBetaHeader(betaBefore, model, complexity);
+    const sanitizedCtx =
+        betaBefore !== betaAfter ? { ...ctx, betaHeaders: betaAfter } : ctx;
+
+    return { body: sanitizedBody, ctx: sanitizedCtx };
+}
+
 export function shouldEscalate(
     responseText: string,
     trigger: CascadeConfig["escalateOn"],
@@ -1347,6 +1602,12 @@ export function shouldEscalate(
     const patterns =
         trigger === "refusal" ? REFUSAL_PATTERNS : UNCERTAINTY_PATTERNS;
     return patterns.some((p) => p.test(responseText));
+}
+
+export function applyThinkingSanitizationForModel<
+    T extends Record<string, unknown>,
+>(body: T, model: string, complexity: Complexity = "simple"): T {
+    return stripThinkingIfUnsupported(body, model, complexity);
 }
 
 /**
@@ -1391,6 +1652,7 @@ function buildAnthropicHeadersWithAuth(
     ctx: RequestContext,
     apiKey?: string,
     isMaxToken?: boolean,
+    betaHeadersOverride?: string | null,
 ): Record<string, string> {
     const headers: Record<string, string> = {
         "Content-Type": "application/json",
@@ -1412,8 +1674,10 @@ function buildAnthropicHeadersWithAuth(
     }
 
     // Pass through beta headers
-    if (ctx.betaHeaders) {
-        headers["anthropic-beta"] = ctx.betaHeaders;
+    const effectiveBetaHeaders =
+        betaHeadersOverride !== undefined ? betaHeadersOverride : ctx.betaHeaders;
+    if (effectiveBetaHeaders) {
+        headers["anthropic-beta"] = effectiveBetaHeaders;
     }
 
     return headers;
@@ -1514,13 +1778,34 @@ async function forwardNativeAnthropicRequest(
     ctx: RequestContext,
     envApiKey?: string,
     isMaxToken?: boolean,
+    complexity: Complexity = "simple",
 ): Promise<Response> {
-    const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken);
+    const model =
+        typeof body["model"] === "string" ? (body["model"] as string) : "";
+    const sanitized = sanitizeAnthropicAttempt(body, ctx, model, complexity);
+    if (complexity === "simple" && isLowerTierModel(model)) {
+        const bodyChanged = JSON.stringify(sanitized.body) !== JSON.stringify(body);
+        const betaChanged = sanitized.ctx.betaHeaders !== ctx.betaHeaders;
+        if (bodyChanged || betaChanged) {
+            defaultLogger.info(
+                `[thinking sanitize] model=${model} simple=${complexity} bodyChanged=${bodyChanged} betaChanged=${betaChanged} betaOut=${sanitized.ctx.betaHeaders ?? "<none>"}`,
+            );
+        }
+    }
+    const sanitizedBetaHeaders = sanitized.ctx.betaHeaders;
+    const betaHeadersOverride =
+        ctx.betaHeaders !== undefined ? (sanitizedBetaHeaders ?? null) : undefined;
+    const headers = buildAnthropicHeadersWithAuth(
+        sanitized.ctx,
+        envApiKey,
+        isMaxToken,
+        betaHeadersOverride,
+    );
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers,
-        body: JSON.stringify(body),
+        body: JSON.stringify(sanitized.body),
     });
 
     return response;
@@ -4947,6 +5232,12 @@ export async function startProxy(
                             attemptBody = stripThinkingIfUnsupported(
                                 attemptBody,
                                 resolved.model,
+                                complexity,
+                            );
+                            attemptBody = normalizeEffortForProvider(
+                                attemptBody,
+                                "anthropic",
+                                resolved.model,
                             );
                             // Hybrid auth: use MAX token for Opus models, API key for others
                             const modelAuth = getAuthForModel(
@@ -4963,6 +5254,7 @@ export async function startProxy(
                                     ctx,
                                     modelAuth.apiKey,
                                     modelAuth.isMax,
+                                    complexity,
                                 );
                             const responseData =
                                 (await providerResponse.json()) as Record<
@@ -5060,22 +5352,118 @@ export async function startProxy(
                         nativeBody = stripThinkingIfUnsupported(
                             nativeBody,
                             finalModel,
+                            complexity,
+                        );
+                        nativeBody = normalizeEffortForProvider(
+                            nativeBody,
+                            "anthropic",
+                            finalModel,
                         );
                         providerResponse = await forwardNativeAnthropicRequest(
                             nativeBody,
                             ctx,
                             modelAuth.apiKey,
                             modelAuth.isMax,
+                            complexity,
                         );
                     }
                     if (!providerResponse.ok) {
-                        const errorPayload =
+                        let errorPayload =
                             (await providerResponse.json()) as Record<
                                 string,
                                 unknown
                             >;
+                        let providerStatus = providerResponse.status;
+
+                        if (
+                            targetProvider === "anthropic" &&
+                            hasEffortControls(requestBody) &&
+                            isLowerTierModel(finalModel) &&
+                            isEffortUnsupportedError(
+                                providerStatus,
+                                errorPayload,
+                            )
+                        ) {
+                            const retryNativeBody = stripThinkingIfUnsupported(
+                                stripEffortParameter({
+                                    ...requestBody,
+                                    model: finalModel,
+                                }),
+                                finalModel,
+                                complexity,
+                            );
+                            log(
+                                `[effort retry] anthropic/${finalModel} rejected effort. Retrying same model without effort before escalation.`,
+                            );
+                            const retryResponse =
+                                await forwardNativeAnthropicRequest(
+                                    retryNativeBody,
+                                    ctx,
+                                    modelAuth.apiKey,
+                                    modelAuth.isMax,
+                                    complexity,
+                                );
+                            if (retryResponse.ok) {
+                                const durationMs = Date.now() - startTime;
+                                if (isStreaming) {
+                                    res.writeHead(retryResponse.status, {
+                                        "Content-Type": "text/event-stream",
+                                        "Cache-Control": "no-cache",
+                                        Connection: "keep-alive",
+                                    });
+                                    const reader = retryResponse.body?.getReader();
+                                    if (reader) {
+                                        const decoder = new TextDecoder();
+                                        while (true) {
+                                            const { done, value } =
+                                                await reader.read();
+                                            if (done) break;
+                                            res.write(
+                                                decoder.decode(value, {
+                                                    stream: true,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                    res.end();
+                                } else {
+                                    const retryData =
+                                        (await retryResponse.json()) as Record<
+                                            string,
+                                            unknown
+                                        >;
+                                    res.writeHead(retryResponse.status, {
+                                        "Content-Type": "application/json",
+                                    });
+                                    res.end(JSON.stringify(retryData));
+                                }
+                                logRequest(
+                                    originalModel ?? "unknown",
+                                    finalModel,
+                                    targetProvider,
+                                    durationMs,
+                                    true,
+                                    routingMode,
+                                    undefined,
+                                    taskType,
+                                    complexity,
+                                    routingMeta,
+                                );
+                                return;
+                            }
+                            providerResponse = retryResponse;
+                            providerStatus = retryResponse.status;
+                            errorPayload =
+                                (await retryResponse
+                                    .json()
+                                    .catch(() => ({}))) as Record<
+                                    string,
+                                    unknown
+                                >;
+                        }
+
                         log(
-                            `Anthropic error [${providerResponse.status}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`,
+                            `Anthropic error [${providerStatus}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`,
                         );
 
                         // TODO: The long-context fallback below and the Sonnet fallback
@@ -5091,7 +5479,7 @@ export async function startProxy(
                             | Record<string, unknown>
                             | undefined;
                         const isLongContextError =
-                            providerResponse.status === 429 &&
+                            providerStatus === 429 &&
                             errorObj?.type === "rate_limit_error" &&
                             typeof errorObj?.message === "string" &&
                             (errorObj.message as string).includes(
@@ -5127,6 +5515,12 @@ export async function startProxy(
                                 fallbackBody = stripThinkingIfUnsupported(
                                     fallbackBody,
                                     fallbackResolved.model,
+                                    complexity,
+                                );
+                                fallbackBody = normalizeEffortForProvider(
+                                    fallbackBody,
+                                    "anthropic",
+                                    fallbackResolved.model,
                                 );
                                 const fallbackResponse =
                                     await forwardNativeAnthropicRequest(
@@ -5134,6 +5528,7 @@ export async function startProxy(
                                         ctx,
                                         fallbackAuth.apiKey,
                                         fallbackAuth.isMax,
+                                        complexity,
                                     );
                                 if (fallbackResponse.ok) {
                                     targetModel = fallbackResolved.model;
@@ -5216,11 +5611,11 @@ export async function startProxy(
                                     toProvider: candidate.provider,
                                     toModel: candidate.model,
                                     mode: routingMode,
-                                    reason: `HTTP ${providerResponse.status}`,
+                                    reason: `HTTP ${providerStatus}`,
                                     outcome: "rerouted",
                                 });
                                 log(
-                                    `[FALLBACK] ${previousProvider}/${previousModel} failed [${providerResponse.status}] -> ${candidate.provider}/${candidate.model}`,
+                                    `[FALLBACK] ${previousProvider}/${previousModel} failed [${providerStatus}] -> ${candidate.provider}/${candidate.model}`,
                                 );
 
                                 let retryResponse: Response | undefined;
@@ -5269,6 +5664,12 @@ export async function startProxy(
                                     retryBody = stripThinkingIfUnsupported(
                                         retryBody,
                                         candidate.model,
+                                        complexity,
+                                    );
+                                    retryBody = normalizeEffortForProvider(
+                                        retryBody,
+                                        "anthropic",
+                                        candidate.model,
                                     );
                                     retryResponse =
                                         await forwardNativeAnthropicRequest(
@@ -5276,6 +5677,7 @@ export async function startProxy(
                                             ctx,
                                             candidateAuth.apiKey,
                                             candidateAuth.isMax,
+                                            complexity,
                                         );
                                 } else {
                                     previousProvider = candidate.provider;
@@ -6270,11 +6672,16 @@ async function executeNonStreamingProviderRequest(
 }> {
     let providerResponse: Response;
     let responseData: Record<string, unknown>;
+    const normalizedRequest = normalizeEffortForProvider(
+        request as Record<string, unknown>,
+        targetProvider,
+        targetModel,
+    ) as ChatRequest;
 
     switch (targetProvider) {
         case "anthropic": {
             providerResponse = await forwardToAnthropic(
-                request,
+                normalizedRequest,
                 targetModel,
                 ctx,
                 apiKey,
@@ -6293,7 +6700,7 @@ async function executeNonStreamingProviderRequest(
         }
         case "google": {
             providerResponse = await forwardToGemini(
-                request,
+                normalizedRequest,
                 targetModel,
                 apiKey!,
             );
@@ -6310,7 +6717,7 @@ async function executeNonStreamingProviderRequest(
         }
         case "xai": {
             providerResponse = await forwardToXAI(
-                request,
+                normalizedRequest,
                 targetModel,
                 apiKey!,
             );
@@ -6331,7 +6738,7 @@ async function executeNonStreamingProviderRequest(
         case "deepseek":
         case "groq": {
             providerResponse = await forwardToOpenAICompatible(
-                request,
+                normalizedRequest,
                 targetModel,
                 apiKey!,
             );
@@ -6350,7 +6757,7 @@ async function executeNonStreamingProviderRequest(
         }
         default: {
             providerResponse = await forwardToOpenAI(
-                request,
+                normalizedRequest,
                 targetModel,
                 apiKey!,
             );
@@ -6394,6 +6801,52 @@ async function handleStreamingRequest(
     routingMeta?: RoutingMetadata,
 ): Promise<void> {
     let providerResponse: Response | undefined;
+    const executeStreamingAttempt = async (
+        attempt: FallbackTarget,
+        attemptRequest: ChatRequest,
+        apiKey: string | undefined,
+    ): Promise<Response> => {
+        const normalizedAttempt = normalizeEffortForProvider(
+            attemptRequest as Record<string, unknown>,
+            attempt.provider,
+            attempt.model,
+        ) as ChatRequest;
+        switch (attempt.provider) {
+            case "anthropic":
+                return forwardToAnthropicStream(
+                    normalizedAttempt,
+                    attempt.model,
+                    ctx,
+                    apiKey,
+                );
+            case "google":
+                return forwardToGeminiStream(
+                    normalizedAttempt,
+                    attempt.model,
+                    apiKey!,
+                );
+            case "xai":
+                return forwardToXAIStream(
+                    normalizedAttempt,
+                    attempt.model,
+                    apiKey!,
+                );
+            case "openrouter":
+            case "deepseek":
+            case "groq":
+                return forwardToOpenAICompatibleStream(
+                    normalizedAttempt,
+                    attempt.model,
+                    apiKey!,
+                );
+            default:
+                return forwardToOpenAIStream(
+                    normalizedAttempt,
+                    attempt.model,
+                    apiKey!,
+                );
+        }
+    };
     const attempts: FallbackTarget[] = [
         { provider: targetProvider, model: targetModel },
         ...fallbackTargets,
@@ -6464,52 +6917,70 @@ async function handleStreamingRequest(
         }
 
         try {
-            switch (attempt.provider) {
-                case "anthropic":
-                    providerResponse = await forwardToAnthropicStream(
-                        request,
-                        attempt.model,
-                        ctx,
-                        apiKeyResult.apiKey,
-                    );
-                    break;
-                case "google":
-                    providerResponse = await forwardToGeminiStream(
-                        request,
-                        attempt.model,
-                        apiKeyResult.apiKey!,
-                    );
-                    break;
-                case "xai":
-                    providerResponse = await forwardToXAIStream(
-                        request,
-                        attempt.model,
-                        apiKeyResult.apiKey!,
-                    );
-                    break;
-                case "openrouter":
-                case "deepseek":
-                case "groq":
-                    providerResponse = await forwardToOpenAICompatibleStream(
-                        request,
-                        attempt.model,
-                        apiKeyResult.apiKey!,
-                    );
-                    break;
-                default:
-                    providerResponse = await forwardToOpenAIStream(
-                        request,
-                        attempt.model,
-                        apiKeyResult.apiKey!,
-                    );
-            }
+            let requestForAttempt = request;
+            providerResponse = await executeStreamingAttempt(
+                attempt,
+                requestForAttempt,
+                apiKeyResult.apiKey,
+            );
 
             if (!providerResponse.ok) {
-                const errorData = (await providerResponse.json()) as Record<
+                let errorData = (await providerResponse.json()) as Record<
                     string,
                     unknown
                 >;
-                lastFailureStatus = providerResponse.status;
+                let errorStatus = providerResponse.status;
+
+                if (
+                    hasEffortControls(
+                        requestForAttempt as Record<string, unknown>,
+                    ) &&
+                    isLowerTierModel(attempt.model) &&
+                    isEffortUnsupportedError(errorStatus, errorData)
+                ) {
+                    const retryRequest = normalizeEffortForProvider(
+                        requestForAttempt as Record<string, unknown>,
+                        attempt.provider,
+                        attempt.model,
+                    ) as ChatRequest;
+                    if (retryRequest !== requestForAttempt) {
+                        log(
+                            `[effort retry] ${attempt.provider}/${attempt.model} rejected effort. Retrying same model without effort before escalation.`,
+                        );
+                        requestForAttempt = retryRequest;
+                        const retryResponse = await executeStreamingAttempt(
+                            attempt,
+                            requestForAttempt,
+                            apiKeyResult.apiKey,
+                        );
+                        if (retryResponse.ok) {
+                            providerResponse = retryResponse;
+                            if (i > 0) {
+                                recordFallbackEvent({
+                                    timestamp: new Date().toISOString(),
+                                    fromProvider: attempts[i - 1]!.provider,
+                                    fromModel: attempts[i - 1]!.model,
+                                    toProvider: attempt.provider,
+                                    toModel: attempt.model,
+                                    mode: routingMode,
+                                    reason: "fallback recovered request",
+                                    outcome: "recovered",
+                                });
+                            }
+                            targetProvider = attempt.provider;
+                            targetModel = attempt.model;
+                            break;
+                        }
+                        providerResponse = retryResponse;
+                        errorData = (await retryResponse.json()) as Record<
+                            string,
+                            unknown
+                        >;
+                        errorStatus = retryResponse.status;
+                    }
+                }
+
+                lastFailureStatus = errorStatus;
                 lastFailureData = errorData;
                 if (cooldownsEnabled) {
                     cooldownManager.recordFailure(
@@ -6526,11 +6997,11 @@ async function handleStreamingRequest(
                         toProvider: next.provider,
                         toModel: next.model,
                         mode: routingMode,
-                        reason: `HTTP ${providerResponse.status}`,
+                        reason: `HTTP ${errorStatus}`,
                         outcome: "rerouted",
                     });
                     log(
-                        `[FALLBACK] ${attempt.provider}/${attempt.model} failed [${providerResponse.status}] -> ${next.provider}/${next.model}`,
+                        `[FALLBACK] ${attempt.provider}/${attempt.model} failed [${errorStatus}] -> ${next.provider}/${next.model}`,
                     );
                     continue;
                 }
@@ -6875,13 +7346,41 @@ async function handleNonStreamingRequest(
         }
 
         try {
-            const result = await executeNonStreamingProviderRequest(
-                request,
+            let requestForAttempt = request;
+            let result = await executeNonStreamingProviderRequest(
+                requestForAttempt,
                 attempt.provider,
                 attempt.model,
                 apiKeyResult.apiKey,
                 ctx,
             );
+
+            if (
+                !result.ok &&
+                hasEffortControls(requestForAttempt as Record<string, unknown>) &&
+                isLowerTierModel(attempt.model) &&
+                isEffortUnsupportedError(result.status, result.responseData)
+            ) {
+                const retryRequest = normalizeEffortForProvider(
+                    requestForAttempt as Record<string, unknown>,
+                    attempt.provider,
+                    attempt.model,
+                ) as ChatRequest;
+                if (retryRequest !== requestForAttempt) {
+                    log(
+                        `[effort retry] ${attempt.provider}/${attempt.model} rejected effort. Retrying same model without effort before escalation.`,
+                    );
+                    requestForAttempt = retryRequest;
+                    result = await executeNonStreamingProviderRequest(
+                        requestForAttempt,
+                        attempt.provider,
+                        attempt.model,
+                        apiKeyResult.apiKey,
+                        ctx,
+                    );
+                }
+            }
+
             if (!result.ok) {
                 responseData = result.responseData;
                 lastFailureStatus = result.status;
