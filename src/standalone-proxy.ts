@@ -605,6 +605,22 @@ export interface RequestHistoryEntry {
     intentHints?: string[];
 }
 
+interface FallbackTarget {
+    provider: Provider;
+    model: string;
+}
+
+interface FallbackEvent {
+    timestamp: string;
+    fromProvider: Provider;
+    fromModel: string;
+    toProvider: Provider;
+    toModel: string;
+    mode: string;
+    reason: string;
+    outcome: "rerouted" | "recovered" | "exhausted";
+}
+
 export interface RoutingMetadata {
     routingReason?: string;
     opusGateDecision?: string;
@@ -631,6 +647,15 @@ function isAutoRouted(originalModel: string): boolean {
     return AUTO_ROUTING_MODELS.has(originalModel);
 }
 let requestIdCounter = 0;
+const fallbackEvents: FallbackEvent[] = [];
+const MAX_FALLBACK_EVENTS = 200;
+
+function recordFallbackEvent(event: FallbackEvent): void {
+    fallbackEvents.push(event);
+    if (fallbackEvents.length > MAX_FALLBACK_EVENTS) {
+        fallbackEvents.shift();
+    }
+}
 
 // --- Persistent history (JSONL) ---
 const HISTORY_DIR = path.join(os.homedir(), ".relayplane");
@@ -3674,6 +3699,45 @@ function getQualityModel(config: RelayPlaneProxyConfigFile): string {
     );
 }
 
+function getFallbackTargetsFromConfig(
+    config: RelayPlaneProxyConfigFile,
+    currentModel: string,
+): FallbackTarget[] {
+    const orderedNames: string[] = [];
+    const addModel = (name: unknown) => {
+        if (typeof name === "string" && name.trim()) {
+            orderedNames.push(name.trim());
+        }
+    };
+
+    for (const modelName of config.routing?.cascade?.models ?? []) {
+        addModel(modelName);
+    }
+    addModel(config.routing?.complexity?.simple);
+    addModel(config.routing?.complexity?.moderate);
+    addModel(config.routing?.complexity?.complex);
+
+    const resolved: FallbackTarget[] = [];
+    const seen = new Set<string>();
+    for (const modelName of orderedNames) {
+        const resolvedModel = resolveConfigModel(modelName);
+        if (!resolvedModel) continue;
+        const key = `${resolvedModel.provider}/${resolvedModel.model}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        resolved.push({
+            provider: resolvedModel.provider,
+            model: resolvedModel.model,
+        });
+    }
+
+    const currentIndex = resolved.findIndex(
+        (target) => target.model === currentModel,
+    );
+    if (currentIndex < 0) return [];
+    return resolved.slice(currentIndex + 1);
+}
+
 async function cascadeRequest(
     config: CascadeConfig,
     makeRequest: (model: string) => Promise<{
@@ -3843,6 +3907,19 @@ async function load(){
       return '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+esc(r.model)+'</td><td class="col-rt"><span class="badge rt-'+src+'" title="'+srcTip+'">'+src+'</span></td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+esc((r.taskType||'general').replace(/_/g,' '))+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+esc(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+esc(r.status)+'</span></td></tr>';
     }).join('')||'<tr><td colspan=10 style="color:#64748b">No runs yet</td></tr>';
     const alerts=[];
+    const fallbackSummary = provH.fallbacks || {};
+    const fallbackRecent = Array.isArray(fallbackSummary.recent) ? fallbackSummary.recent : [];
+    if ((fallbackSummary.exhaustedLastHour || 0) > 0) {
+      alerts.push('<div class="alert alert-high"><span class="alert-icon">!!</span><div><div><b>'+(fallbackSummary.exhaustedLastHour||0)+'</b> fallback chain(s) exhausted in the last hour</div><div class="alert-detail">Requests failed even after rerouting to stronger models.</div></div></div>');
+    } else if ((fallbackSummary.totalLastHour || 0) > 0) {
+      alerts.push('<div class="alert alert-info"><span class="alert-icon">i</span><div><div>Fallback rerouting active: <b>'+(fallbackSummary.totalLastHour||0)+'</b> events in the last hour</div><div class="alert-detail"><b>'+(fallbackSummary.recoveredLastHour||0)+'</b> recovered after upgrading to stronger models.</div></div></div>');
+    }
+    fallbackRecent.slice(0,3).forEach(f=>{
+      const sev=f.outcome==='exhausted'?'high':(f.outcome==='recovered'?'info':'medium');
+      const outcome=f.outcome==='recovered'?'Recovered':'Rerouted';
+      const detail=''+esc(f.fromProvider)+'/'+esc(f.fromModel)+' → '+esc(f.toProvider)+'/'+esc(f.toModel)+' · '+esc(f.reason||'request failed');
+      alerts.push('<div class="alert alert-'+sev+'"><span class="alert-icon">'+(sev==='high'?'!!':sev==='medium'?'!':'i')+'</span><div><div>'+outcome+' request by upgrading model</div><div class="alert-detail">'+detail+'</div></div></div>');
+    });
     (ovr.overrides||[]).forEach(o=>{
       const icon=o.severity==='high'?'!!':o.severity==='medium'?'!':'i';
       const pct=sav.total>0?Math.round(o.savingsLost/sav.total*100):0;
@@ -4385,8 +4462,28 @@ export async function startProxy(
                         lastChecked: new Date().toISOString(),
                     });
                 }
+                const recentFallbacks = fallbackEvents.filter(
+                    (event) =>
+                        new Date(event.timestamp).getTime() > recentWindow,
+                );
+                const recoveredCount = recentFallbacks.filter(
+                    (event) => event.outcome === "recovered",
+                ).length;
+                const exhaustedCount = recentFallbacks.filter(
+                    (event) => event.outcome === "exhausted",
+                ).length;
                 res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ providers }));
+                res.end(
+                    JSON.stringify({
+                        providers,
+                        fallbacks: {
+                            totalLastHour: recentFallbacks.length,
+                            recoveredLastHour: recoveredCount,
+                            exhaustedLastHour: exhaustedCount,
+                            recent: recentFallbacks.slice(-8).reverse(),
+                        },
+                    }),
+                );
                 return;
             }
 
@@ -5038,59 +5135,105 @@ export async function startProxy(
                             }
                         }
 
-                        // Sonnet fallback: when a non-passthrough routing decision
-                        // fails with a rate-limit or overload error, retry once
-                        // with claude-sonnet-4-6 before surfacing the error.
-                        const SONNET_FALLBACK_MODEL = "claude-sonnet-4-6";
-                        const isFallbackTriggerStatus = [
-                            429, 500, 503, 529,
-                        ].includes(providerResponse.status);
-                        const isAlreadySonnet =
-                            finalModel === SONNET_FALLBACK_MODEL;
-                        const isNonPassthrough = routingMode !== "passthrough";
-
-                        if (
-                            isFallbackTriggerStatus &&
-                            isNonPassthrough &&
-                            !isAlreadySonnet &&
-                            !isLongContextError
-                        ) {
-                            log(
-                                `[ALERT] Sonnet fallback: model ${finalModel} failed [${providerResponse.status}]. Retrying with ${SONNET_FALLBACK_MODEL}`,
-                            );
-                            const sonnetResolved = resolveExplicitModel(
-                                SONNET_FALLBACK_MODEL,
-                            );
-                            if (sonnetResolved?.provider === "anthropic") {
-                                const sonnetAuth = getAuthForModel(
-                                    sonnetResolved.model,
-                                    proxyConfig.auth,
-                                    useAnthropicEnvKey,
+                        const fallbackTargets = getFallbackTargetsFromConfig(
+                            proxyConfig,
+                            finalModel,
+                        );
+                        if (!isLongContextError && fallbackTargets.length > 0) {
+                            let previousProvider = targetProvider;
+                            let previousModel = finalModel;
+                            let recovered = false;
+                            for (let i = 0; i < fallbackTargets.length; i++) {
+                                const candidate = fallbackTargets[i]!;
+                                recordFallbackEvent({
+                                    timestamp: new Date().toISOString(),
+                                    fromProvider: previousProvider,
+                                    fromModel: previousModel,
+                                    toProvider: candidate.provider,
+                                    toModel: candidate.model,
+                                    mode: routingMode,
+                                    reason: `HTTP ${providerResponse.status}`,
+                                    outcome: "rerouted",
+                                });
+                                log(
+                                    `[FALLBACK] ${previousProvider}/${previousModel} failed [${providerResponse.status}] -> ${candidate.provider}/${candidate.model}`,
                                 );
-                                const sonnetResponse =
-                                    await forwardNativeAnthropicRequest(
-                                        stripThinkingIfUnsupported(
-                                            {
-                                                ...requestBody,
-                                                model: sonnetResolved.model,
-                                            },
-                                            sonnetResolved.model,
-                                        ),
-                                        ctx,
-                                        sonnetAuth.apiKey,
-                                        sonnetAuth.isMax,
+
+                                let retryResponse: Response | undefined;
+                                if (candidate.provider === "openai") {
+                                    const openaiApiKey =
+                                        process.env["OPENAI_API_KEY"];
+                                    if (!openaiApiKey) {
+                                        previousProvider = candidate.provider;
+                                        previousModel = candidate.model;
+                                        continue;
+                                    }
+                                    const openaiReq = convertNativeAnthropicToOpenAI(
+                                        {
+                                            ...requestBody,
+                                            model: candidate.model,
+                                        },
                                     );
-                                if (sonnetResponse.ok) {
-                                    targetModel = sonnetResolved.model;
+                                    openaiReq.stream = isStreaming;
+                                    retryResponse = isStreaming
+                                        ? await forwardToOpenAIStream(
+                                              openaiReq,
+                                              candidate.model,
+                                              openaiApiKey,
+                                          )
+                                        : await forwardToOpenAI(
+                                              openaiReq,
+                                              candidate.model,
+                                              openaiApiKey,
+                                          );
+                                } else if (candidate.provider === "anthropic") {
+                                    const candidateAuth = getAuthForModel(
+                                        candidate.model,
+                                        proxyConfig.auth,
+                                        useAnthropicEnvKey,
+                                    );
+                                    retryResponse =
+                                        await forwardNativeAnthropicRequest(
+                                            stripThinkingIfUnsupported(
+                                                {
+                                                    ...requestBody,
+                                                    model: candidate.model,
+                                                },
+                                                candidate.model,
+                                            ),
+                                            ctx,
+                                            candidateAuth.apiKey,
+                                            candidateAuth.isMax,
+                                        );
+                                } else {
+                                    previousProvider = candidate.provider;
+                                    previousModel = candidate.model;
+                                    continue;
+                                }
+
+                                if (retryResponse.ok) {
+                                    recovered = true;
+                                    targetProvider = candidate.provider;
+                                    targetModel = candidate.model;
+                                    recordFallbackEvent({
+                                        timestamp: new Date().toISOString(),
+                                        fromProvider: previousProvider,
+                                        fromModel: previousModel,
+                                        toProvider: candidate.provider,
+                                        toModel: candidate.model,
+                                        mode: routingMode,
+                                        reason: "fallback recovered request",
+                                        outcome: "recovered",
+                                    });
                                     const durationMs = Date.now() - startTime;
                                     if (isStreaming) {
-                                        res.writeHead(sonnetResponse.status, {
+                                        res.writeHead(retryResponse.status, {
                                             "Content-Type": "text/event-stream",
                                             "Cache-Control": "no-cache",
                                             Connection: "keep-alive",
                                         });
                                         const reader =
-                                            sonnetResponse.body?.getReader();
+                                            retryResponse.body?.getReader();
                                         if (reader) {
                                             const decoder = new TextDecoder();
                                             while (true) {
@@ -5105,16 +5248,31 @@ export async function startProxy(
                                             }
                                         }
                                         res.end();
-                                    } else {
-                                        const sonnetData =
-                                            (await sonnetResponse.json()) as Record<
+                                    } else if (candidate.provider === "openai") {
+                                        const openaiData =
+                                            (await retryResponse.json()) as Record<
                                                 string,
                                                 unknown
                                             >;
-                                        res.writeHead(sonnetResponse.status, {
+                                        const nativeData =
+                                            convertOpenAIResponseToAnthropic(
+                                                openaiData,
+                                                candidate.model,
+                                            );
+                                        res.writeHead(retryResponse.status, {
                                             "Content-Type": "application/json",
                                         });
-                                        res.end(JSON.stringify(sonnetData));
+                                        res.end(JSON.stringify(nativeData));
+                                    } else {
+                                        const nativeData =
+                                            (await retryResponse.json()) as Record<
+                                                string,
+                                                unknown
+                                            >;
+                                        res.writeHead(retryResponse.status, {
+                                            "Content-Type": "application/json",
+                                        });
+                                        res.end(JSON.stringify(nativeData));
                                     }
                                     logRequest(
                                         originalModel ?? "unknown",
@@ -5123,24 +5281,40 @@ export async function startProxy(
                                         durationMs,
                                         true,
                                         "passthrough",
-                                        undefined,
+                                        true,
                                         taskType,
                                         complexity,
                                         routingMeta,
                                     );
                                     return;
-                                } else {
-                                    const sonnetErrPayload =
-                                        (await sonnetResponse
-                                            .json()
-                                            .catch(() => ({}))) as Record<
-                                            string,
-                                            unknown
-                                        >;
-                                    log(
-                                        `[ALERT] Sonnet fallback also failed [${sonnetResponse.status}]: ${JSON.stringify(sonnetErrPayload)}`,
-                                    );
                                 }
+
+                                const retryErrPayload = (await retryResponse
+                                    .json()
+                                    .catch(() => ({}))) as Record<
+                                    string,
+                                    unknown
+                                >;
+                                log(
+                                    `[FALLBACK] ${candidate.provider}/${candidate.model} failed [${retryResponse.status}]: ${JSON.stringify(retryErrPayload)}`,
+                                );
+                                previousProvider = candidate.provider;
+                                previousModel = candidate.model;
+                                if (i === fallbackTargets.length - 1) {
+                                    recordFallbackEvent({
+                                        timestamp: new Date().toISOString(),
+                                        fromProvider: candidate.provider,
+                                        fromModel: candidate.model,
+                                        toProvider: candidate.provider,
+                                        toModel: candidate.model,
+                                        mode: routingMode,
+                                        reason: `HTTP ${retryResponse.status}`,
+                                        outcome: "exhausted",
+                                    });
+                                }
+                            }
+                            if (recovered) {
+                                return;
                             }
                         }
 
@@ -5763,6 +5937,9 @@ export async function startProxy(
         }
 
         const startTime = Date.now();
+        const fallbackTargets = !useCascade
+            ? getFallbackTargetsFromConfig(proxyConfig, targetModel)
+            : [];
 
         // Handle streaming vs non-streaming
         if (isStreaming) {
@@ -5783,6 +5960,8 @@ export async function startProxy(
                 log,
                 cooldownManager,
                 cooldownsEnabled,
+                fallbackTargets,
+                useAnthropicEnvKey,
                 complexity,
                 routingMeta,
             );
@@ -5969,6 +6148,8 @@ export async function startProxy(
                     log,
                     cooldownManager,
                     cooldownsEnabled,
+                    fallbackTargets,
+                    useAnthropicEnvKey,
                     complexity,
                     routingMeta,
                 );
@@ -6123,7 +6304,7 @@ async function handleStreamingRequest(
     request: ChatRequest,
     targetProvider: Provider,
     targetModel: string,
-    apiKey: string | undefined,
+    _apiKey: string | undefined,
     ctx: RequestContext,
     relay: RelayPlane,
     promptText: string,
@@ -6135,100 +6316,228 @@ async function handleStreamingRequest(
     log: (msg: string) => void,
     cooldownManager: CooldownManager,
     cooldownsEnabled: boolean,
+    fallbackTargets: FallbackTarget[],
+    anthropicEnvKey: string | undefined,
     complexity: Complexity = "simple",
     routingMeta?: RoutingMetadata,
 ): Promise<void> {
-    let providerResponse: Response;
+    let providerResponse: Response | undefined;
+    const attempts: FallbackTarget[] = [
+        { provider: targetProvider, model: targetModel },
+        ...fallbackTargets,
+    ];
+    let lastFailureStatus = 500;
+    let lastFailureData: Record<string, unknown> = {
+        error: "Fallback chain exhausted",
+    };
+    let activeProvider = targetProvider;
+    let activeModel = targetModel;
 
-    try {
-        switch (targetProvider) {
-            case "anthropic":
-                // Use auth passthrough for Anthropic
-                providerResponse = await forwardToAnthropicStream(
-                    request,
-                    targetModel,
-                    ctx,
-                    apiKey,
+    for (let i = 0; i < attempts.length; i++) {
+        const attempt = attempts[i]!;
+        const isLast = i === attempts.length - 1;
+        activeProvider = attempt.provider;
+        activeModel = attempt.model;
+        if (cooldownsEnabled && !cooldownManager.isAvailable(attempt.provider)) {
+            lastFailureStatus = 503;
+            lastFailureData = {
+                error: `Provider ${attempt.provider} is temporarily cooled down`,
+            };
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: "provider cooldown",
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} unavailable (cooldown) -> ${next.provider}/${next.model}`,
                 );
-                break;
-            case "google":
-                providerResponse = await forwardToGeminiStream(
-                    request,
-                    targetModel,
-                    apiKey!,
-                );
-                break;
-            case "xai":
-                providerResponse = await forwardToXAIStream(
-                    request,
-                    targetModel,
-                    apiKey!,
-                );
-                break;
-            case "openrouter":
-            case "deepseek":
-            case "groq":
-                providerResponse = await forwardToOpenAICompatibleStream(
-                    request,
-                    targetModel,
-                    apiKey!,
-                );
-                break;
-            default:
-                providerResponse = await forwardToOpenAIStream(
-                    request,
-                    targetModel,
-                    apiKey!,
-                );
-        }
-
-        if (!providerResponse.ok) {
-            const errorData = await providerResponse.json();
-            if (cooldownsEnabled) {
-                cooldownManager.recordFailure(
-                    targetProvider,
-                    JSON.stringify(errorData),
-                );
+                continue;
             }
-            const durationMs = Date.now() - startTime;
-            logRequest(
-                request.model ?? "unknown",
-                targetModel,
-                targetProvider,
-                durationMs,
-                false,
-                routingMode,
-                undefined,
-                taskType,
-                complexity,
-                routingMeta,
-            );
-            res.writeHead(providerResponse.status, {
-                "Content-Type": "application/json",
-            });
-            res.end(JSON.stringify(errorData));
-            return;
+            break;
         }
-    } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        if (cooldownsEnabled) {
-            cooldownManager.recordFailure(targetProvider, errorMsg);
+
+        const apiKeyResult = resolveProviderApiKey(
+            attempt.provider,
+            ctx,
+            anthropicEnvKey,
+        );
+        if (apiKeyResult.error) {
+            lastFailureStatus = apiKeyResult.error.status;
+            lastFailureData = apiKeyResult.error.payload;
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: "provider authentication/configuration error",
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} auth/config failed -> ${next.provider}/${next.model}`,
+                );
+                continue;
+            }
+            break;
         }
+
+        try {
+            switch (attempt.provider) {
+                case "anthropic":
+                    providerResponse = await forwardToAnthropicStream(
+                        request,
+                        attempt.model,
+                        ctx,
+                        apiKeyResult.apiKey,
+                    );
+                    break;
+                case "google":
+                    providerResponse = await forwardToGeminiStream(
+                        request,
+                        attempt.model,
+                        apiKeyResult.apiKey!,
+                    );
+                    break;
+                case "xai":
+                    providerResponse = await forwardToXAIStream(
+                        request,
+                        attempt.model,
+                        apiKeyResult.apiKey!,
+                    );
+                    break;
+                case "openrouter":
+                case "deepseek":
+                case "groq":
+                    providerResponse = await forwardToOpenAICompatibleStream(
+                        request,
+                        attempt.model,
+                        apiKeyResult.apiKey!,
+                    );
+                    break;
+                default:
+                    providerResponse = await forwardToOpenAIStream(
+                        request,
+                        attempt.model,
+                        apiKeyResult.apiKey!,
+                    );
+            }
+
+            if (!providerResponse.ok) {
+                const errorData = (await providerResponse.json()) as Record<
+                    string,
+                    unknown
+                >;
+                lastFailureStatus = providerResponse.status;
+                lastFailureData = errorData;
+                if (cooldownsEnabled) {
+                    cooldownManager.recordFailure(
+                        attempt.provider,
+                        JSON.stringify(errorData),
+                    );
+                }
+                if (!isLast) {
+                    const next = attempts[i + 1]!;
+                    recordFallbackEvent({
+                        timestamp: new Date().toISOString(),
+                        fromProvider: attempt.provider,
+                        fromModel: attempt.model,
+                        toProvider: next.provider,
+                        toModel: next.model,
+                        mode: routingMode,
+                        reason: `HTTP ${providerResponse.status}`,
+                        outcome: "rerouted",
+                    });
+                    log(
+                        `[FALLBACK] ${attempt.provider}/${attempt.model} failed [${providerResponse.status}] -> ${next.provider}/${next.model}`,
+                    );
+                    continue;
+                }
+            } else {
+                if (i > 0) {
+                    recordFallbackEvent({
+                        timestamp: new Date().toISOString(),
+                        fromProvider: attempts[i - 1]!.provider,
+                        fromModel: attempts[i - 1]!.model,
+                        toProvider: attempt.provider,
+                        toModel: attempt.model,
+                        mode: routingMode,
+                        reason: "fallback recovered request",
+                        outcome: "recovered",
+                    });
+                }
+                targetProvider = attempt.provider;
+                targetModel = attempt.model;
+                break;
+            }
+        } catch (err) {
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            lastFailureStatus = 500;
+            lastFailureData = { error: `Provider error: ${errorMsg}` };
+            if (cooldownsEnabled) {
+                cooldownManager.recordFailure(attempt.provider, errorMsg);
+            }
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: errorMsg,
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} threw error -> ${next.provider}/${next.model}: ${errorMsg}`,
+                );
+                continue;
+            }
+        }
+        break;
+    }
+
+    if (!providerResponse || !providerResponse.ok) {
+        recordFallbackEvent({
+            timestamp: new Date().toISOString(),
+            fromProvider: activeProvider,
+            fromModel: activeModel,
+            toProvider: activeProvider,
+            toModel: activeModel,
+            mode: routingMode,
+            reason:
+                typeof lastFailureData["error"] === "string"
+                    ? (lastFailureData["error"] as string)
+                    : `HTTP ${lastFailureStatus}`,
+            outcome: "exhausted",
+        });
         const durationMs = Date.now() - startTime;
         logRequest(
             request.model ?? "unknown",
-            targetModel,
-            targetProvider,
+            activeModel,
+            activeProvider,
             durationMs,
             false,
             routingMode,
-            undefined,
+            fallbackTargets.length > 0,
             taskType,
             complexity,
             routingMeta,
         );
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
+        res.writeHead(lastFailureStatus, {
+            "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify(lastFailureData));
         return;
     }
 
@@ -6404,7 +6713,7 @@ async function handleNonStreamingRequest(
     request: ChatRequest,
     targetProvider: Provider,
     targetModel: string,
-    apiKey: string | undefined,
+    _apiKey: string | undefined,
     ctx: RequestContext,
     relay: RelayPlane,
     promptText: string,
@@ -6416,66 +6725,196 @@ async function handleNonStreamingRequest(
     log: (msg: string) => void,
     cooldownManager: CooldownManager,
     cooldownsEnabled: boolean,
+    fallbackTargets: FallbackTarget[],
+    anthropicEnvKey: string | undefined,
     complexity: Complexity = "simple",
     routingMeta?: RoutingMetadata,
 ): Promise<void> {
-    let responseData: Record<string, unknown>;
+    let responseData: Record<string, unknown> | undefined;
+    const attempts: FallbackTarget[] = [
+        { provider: targetProvider, model: targetModel },
+        ...fallbackTargets,
+    ];
+    let lastFailureStatus = 500;
+    let lastFailureData: Record<string, unknown> = {
+        error: "Fallback chain exhausted",
+    };
+    let activeProvider = targetProvider;
+    let activeModel = targetModel;
+    let succeeded = false;
 
-    try {
-        const result = await executeNonStreamingProviderRequest(
-            request,
-            targetProvider,
-            targetModel,
-            apiKey,
-            ctx,
-        );
-        responseData = result.responseData;
-        if (!result.ok) {
-            if (cooldownsEnabled) {
-                cooldownManager.recordFailure(
-                    targetProvider,
-                    JSON.stringify(responseData),
+    for (let i = 0; i < attempts.length; i++) {
+        const attempt = attempts[i]!;
+        const isLast = i === attempts.length - 1;
+        activeProvider = attempt.provider;
+        activeModel = attempt.model;
+
+        if (cooldownsEnabled && !cooldownManager.isAvailable(attempt.provider)) {
+            lastFailureStatus = 503;
+            lastFailureData = {
+                error: `Provider ${attempt.provider} is temporarily cooled down`,
+            };
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: "provider cooldown",
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} unavailable (cooldown) -> ${next.provider}/${next.model}`,
                 );
+                continue;
             }
-            const durationMs = Date.now() - startTime;
-            logRequest(
-                request.model ?? "unknown",
-                targetModel,
-                targetProvider,
-                durationMs,
-                false,
-                routingMode,
-                undefined,
-                taskType,
-                complexity,
-                routingMeta,
+            break;
+        }
+
+        const apiKeyResult = resolveProviderApiKey(
+            attempt.provider,
+            ctx,
+            anthropicEnvKey,
+        );
+        if (apiKeyResult.error) {
+            lastFailureStatus = apiKeyResult.error.status;
+            lastFailureData = apiKeyResult.error.payload;
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: "provider authentication/configuration error",
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} auth/config failed -> ${next.provider}/${next.model}`,
+                );
+                continue;
+            }
+            break;
+        }
+
+        try {
+            const result = await executeNonStreamingProviderRequest(
+                request,
+                attempt.provider,
+                attempt.model,
+                apiKeyResult.apiKey,
+                ctx,
             );
-            res.writeHead(result.status, {
-                "Content-Type": "application/json",
-            });
-            res.end(JSON.stringify(responseData));
-            return;
+            if (!result.ok) {
+                responseData = result.responseData;
+                lastFailureStatus = result.status;
+                lastFailureData = result.responseData;
+                if (cooldownsEnabled) {
+                    cooldownManager.recordFailure(
+                        attempt.provider,
+                        JSON.stringify(result.responseData),
+                    );
+                }
+                if (!isLast) {
+                    const next = attempts[i + 1]!;
+                    recordFallbackEvent({
+                        timestamp: new Date().toISOString(),
+                        fromProvider: attempt.provider,
+                        fromModel: attempt.model,
+                        toProvider: next.provider,
+                        toModel: next.model,
+                        mode: routingMode,
+                        reason: `HTTP ${result.status}`,
+                        outcome: "rerouted",
+                    });
+                    log(
+                        `[FALLBACK] ${attempt.provider}/${attempt.model} failed [${result.status}] -> ${next.provider}/${next.model}`,
+                    );
+                    continue;
+                }
+            } else {
+                responseData = result.responseData;
+                targetProvider = attempt.provider;
+                targetModel = attempt.model;
+                if (i > 0) {
+                    recordFallbackEvent({
+                        timestamp: new Date().toISOString(),
+                        fromProvider: attempts[i - 1]!.provider,
+                        fromModel: attempts[i - 1]!.model,
+                        toProvider: attempt.provider,
+                        toModel: attempt.model,
+                        mode: routingMode,
+                        reason: "fallback recovered request",
+                        outcome: "recovered",
+                    });
+                }
+                succeeded = true;
+                break;
+            }
+        } catch (err) {
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            lastFailureStatus = 500;
+            lastFailureData = { error: `Provider error: ${errorMsg}` };
+            if (cooldownsEnabled) {
+                cooldownManager.recordFailure(attempt.provider, errorMsg);
+            }
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: errorMsg,
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} threw error -> ${next.provider}/${next.model}: ${errorMsg}`,
+                );
+                continue;
+            }
         }
-    } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        if (cooldownsEnabled) {
-            cooldownManager.recordFailure(targetProvider, errorMsg);
-        }
+        break;
+    }
+
+    if (!succeeded || !responseData) {
+        recordFallbackEvent({
+            timestamp: new Date().toISOString(),
+            fromProvider: activeProvider,
+            fromModel: activeModel,
+            toProvider: activeProvider,
+            toModel: activeModel,
+            mode: routingMode,
+            reason:
+                typeof lastFailureData["error"] === "string"
+                    ? (lastFailureData["error"] as string)
+                    : `HTTP ${lastFailureStatus}`,
+            outcome: "exhausted",
+        });
         const durationMs = Date.now() - startTime;
         logRequest(
             request.model ?? "unknown",
-            targetModel,
-            targetProvider,
+            activeModel,
+            activeProvider,
             durationMs,
             false,
             routingMode,
-            undefined,
+            fallbackTargets.length > 0,
             taskType,
             complexity,
             routingMeta,
         );
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
+        res.writeHead(lastFailureStatus, {
+            "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify(lastFailureData));
         return;
     }
 
