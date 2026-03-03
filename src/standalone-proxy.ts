@@ -3719,15 +3719,16 @@ function createRow(e){
     +'<td><span class="badge rt-'+src+'">'+src+'</span></td>'
     +'<td><span class="badge '+ttCls(e.taskType)+'">'+esc((e.taskType||'general').replace(/_/g,' '))+'</span></td>'
     +'<td><span class="badge '+cxCls(e.complexity)+'">'+esc(e.complexity||'simple')+'</span></td>'
-    +'<td class="mono">'+(e.tokensIn||0)+'</td>'
-    +'<td class="mono">'+(e.tokensOut||0)+'</td>'
-    +'<td class="mono">$'+fmt(e.costUsd,4)+'</td>'
-    +'<td class="mono">'+e.latencyMs+'ms</td>'
+    +'<td class="mono">'+esc(String(e.tokensIn||0))+'</td>'
+    +'<td class="mono">'+esc(String(e.tokensOut||0))+'</td>'
+    +'<td class="mono">$'+esc(fmt(e.costUsd,4))+'</td>'
+    +'<td class="mono">'+esc(String(e.latencyMs))+'ms</td>'
     +'<td><span class="badge '+(e.success?'ok':'err')+'">'+(e.success?'ok':'err')+'</span></td>';
   return tr;
 }
 var tbody=document.getElementById('logRows');
 var rows=new Map();
+var MAX_ROWS=2000;
 var countEl=document.getElementById('count');
 var loadMoreEl=document.getElementById('loadMore');
 var total=0;
@@ -3736,10 +3737,20 @@ var nextOffset=100;
 var loading=false;
 var exhausted=false;
 function updateCount(){countEl.textContent=total+' entries'}
+function trimRows(){
+  while(rows.size>MAX_ROWS){
+    var last=tbody.lastElementChild;
+    if(!last)break;
+    var id=last.dataset.id;
+    last.remove();
+    if(id)rows.delete(id);
+    total--;
+  }
+}
 function addRow(entry,prepend){
   if(rows.has(entry.id))return false;
   var tr=createRow(entry);
-  if(prepend){tr.className='new';tbody.prepend(tr)}else{tbody.appendChild(tr)}
+  if(prepend){tr.className='new';tbody.prepend(tr);trimRows()}else{if(rows.size>=MAX_ROWS)return false;tbody.appendChild(tr)}
   rows.set(entry.id,tr);
   total++;
   updateCount();
@@ -4460,19 +4471,24 @@ export async function startProxy(
 
             logSubscribers.add(res);
 
-            const keepAlive = setInterval(() => {
-                if (res.writableEnded) {
-                    clearInterval(keepAlive);
-                    logSubscribers.delete(res);
-                    return;
-                }
-                res.write(": ping\n\n");
-            }, 15000);
-
-            req.on("close", () => {
+            const cleanup = () => {
                 clearInterval(keepAlive);
                 logSubscribers.delete(res);
-            });
+            };
+
+            const keepAlive = setInterval(() => {
+                if (res.writableEnded) {
+                    cleanup();
+                    return;
+                }
+                try {
+                    res.write(": ping\n\n");
+                } catch {
+                    cleanup();
+                }
+            }, 15000);
+
+            req.on("close", cleanup);
 
             return;
         }
