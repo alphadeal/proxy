@@ -1548,6 +1548,24 @@ export function isLowerTierModel(model: string): boolean {
     return LOWER_TIER_MODEL_HINTS.some((hint) => lower.includes(hint));
 }
 
+/**
+ * Sanitize beta headers for the OpenAI-compatible Anthropic forwarding path.
+ *
+ * `buildAnthropicBody` (the OpenAI-compat converter) never includes a `thinking`
+ * block. Forwarding `clear_thinking_20251015` (or any thinking beta) without a
+ * corresponding `thinking` block causes Anthropic to return 400:
+ *   "clear_thinking_20251015 strategy requires `thinking` to be enabled or adaptive"
+ *
+ * This function always strips thinking betas regardless of model tier, because
+ * the OpenAI-compat path never supports thinking contracts.
+ */
+export function sanitizeBetaHeadersForAnthropicCompat(
+    betaHeaders: string | undefined,
+    model: string,
+): string | undefined {
+    return normalizeAnthropicBetaHeader(betaHeaders, model);
+}
+
 function isThinkingBeta(token: string): boolean {
     const lower = token.toLowerCase();
     return (
@@ -1807,7 +1825,11 @@ async function forwardToAnthropic(
     envApiKey?: string,
 ): Promise<Response> {
     const anthropicBody = buildAnthropicBody(request, targetModel, false);
-    const headers = buildAnthropicHeaders(ctx, envApiKey);
+    const sanitizedCtx = {
+        ...ctx,
+        betaHeaders: sanitizeBetaHeadersForAnthropicCompat(ctx.betaHeaders, targetModel),
+    };
+    const headers = buildAnthropicHeaders(sanitizedCtx, envApiKey);
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -1828,7 +1850,11 @@ async function forwardToAnthropicStream(
     envApiKey?: string,
 ): Promise<Response> {
     const anthropicBody = buildAnthropicBody(request, targetModel, true);
-    const headers = buildAnthropicHeaders(ctx, envApiKey);
+    const sanitizedCtx = {
+        ...ctx,
+        betaHeaders: sanitizeBetaHeadersForAnthropicCompat(ctx.betaHeaders, targetModel),
+    };
+    const headers = buildAnthropicHeaders(sanitizedCtx, envApiKey);
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
