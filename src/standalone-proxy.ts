@@ -1151,6 +1151,12 @@ const THINKING_UNSUPPORTED_MODELS = [
     "claude-3-haiku-20240307",
 ];
 
+const EFFORT_STRIP_SIMPLE_MODELS = [
+    "claude-haiku-4-5-20251001",
+    "claude-3-5-haiku-20241022",
+    "claude-3-haiku-20240307",
+];
+
 /**
  * Models that do not support `tool_reference` content blocks.
  * These are Sonnet 4+ / Opus 4+ only features as of the claude-haiku-4-5 era.
@@ -1279,16 +1285,16 @@ export function sanitizeAnthropicToolResultMessages(
     return { messages: sanitized, droppedToolResults, droppedMessages };
 }
 
-function stripThinkingIfUnsupported(
-    body: Record<string, unknown>,
+function stripThinkingIfUnsupported<T extends Record<string, unknown>>(
+    body: T,
     model: string,
-): Record<string, unknown> {
+): T {
     const modelLower = model.toLowerCase();
     const unsupported = THINKING_UNSUPPORTED_MODELS.some((m) =>
         modelLower.includes(m),
     );
     if (!unsupported) return body;
-    const stripped = { ...body };
+    const stripped: Record<string, unknown> = { ...body };
     delete stripped["thinking"];
     if (Array.isArray(stripped["betas"])) {
         stripped["betas"] = (stripped["betas"] as string[]).filter(
@@ -1298,7 +1304,39 @@ function stripThinkingIfUnsupported(
             delete stripped["betas"];
         }
     }
-    return stripped;
+    return stripped as T;
+}
+
+function stripEffortIfSimple<T extends Record<string, unknown>>(
+    body: T,
+    model: string,
+    complexity: Complexity,
+    log?: (msg: string) => void,
+): T {
+    if (complexity !== "simple") return body;
+    const modelLower = model.toLowerCase();
+    const shouldStripEffort = EFFORT_STRIP_SIMPLE_MODELS.some((m) =>
+        modelLower.includes(m),
+    );
+    if (!shouldStripEffort) return body;
+    if (!Object.prototype.hasOwnProperty.call(body, "effort")) return body;
+
+    const stripped: Record<string, unknown> = { ...body };
+    delete stripped["effort"];
+    if (log) {
+        log(
+            `[effort strip] Removed effort parameter for simple complexity on ${model} to keep low-cost routing`,
+        );
+    }
+    return stripped as T;
+}
+
+export function applySimpleEffortStrip<T extends Record<string, unknown>>(
+    body: T,
+    model: string,
+    complexity: Complexity,
+): T {
+    return stripEffortIfSimple(body, model, complexity);
 }
 
 export function shouldEscalate(
@@ -4896,8 +4934,18 @@ export async function startProxy(
                             ) {
                                 throw new CooldownError(resolved.provider);
                             }
-                            const attemptBody = stripThinkingIfUnsupported(
-                                { ...requestBody, model: resolved.model },
+                            let attemptBody = {
+                                ...requestBody,
+                                model: resolved.model,
+                            };
+                            attemptBody = stripEffortIfSimple(
+                                attemptBody,
+                                resolved.model,
+                                complexity,
+                                log,
+                            );
+                            attemptBody = stripThinkingIfUnsupported(
+                                attemptBody,
                                 resolved.model,
                             );
                             // Hybrid auth: use MAX token for Opus models, API key for others
@@ -5002,11 +5050,19 @@ export async function startProxy(
                             );
                         }
                     } else {
+                        let nativeBody = { ...requestBody, model: finalModel };
+                        nativeBody = stripEffortIfSimple(
+                            nativeBody,
+                            finalModel,
+                            complexity,
+                            log,
+                        );
+                        nativeBody = stripThinkingIfUnsupported(
+                            nativeBody,
+                            finalModel,
+                        );
                         providerResponse = await forwardNativeAnthropicRequest(
-                            stripThinkingIfUnsupported(
-                                { ...requestBody, model: finalModel },
-                                finalModel,
-                            ),
+                            nativeBody,
                             ctx,
                             modelAuth.apiKey,
                             modelAuth.isMax,
@@ -5058,15 +5114,23 @@ export async function startProxy(
                                     proxyConfig.auth,
                                     useAnthropicEnvKey,
                                 );
+                                let fallbackBody = {
+                                    ...requestBody,
+                                    model: fallbackResolved.model,
+                                };
+                                fallbackBody = stripEffortIfSimple(
+                                    fallbackBody,
+                                    fallbackResolved.model,
+                                    complexity,
+                                    log,
+                                );
+                                fallbackBody = stripThinkingIfUnsupported(
+                                    fallbackBody,
+                                    fallbackResolved.model,
+                                );
                                 const fallbackResponse =
                                     await forwardNativeAnthropicRequest(
-                                        stripThinkingIfUnsupported(
-                                            {
-                                                ...requestBody,
-                                                model: fallbackResolved.model,
-                                            },
-                                            fallbackResolved.model,
-                                        ),
+                                        fallbackBody,
                                         ctx,
                                         fallbackAuth.apiKey,
                                         fallbackAuth.isMax,
@@ -5192,15 +5256,23 @@ export async function startProxy(
                                         proxyConfig.auth,
                                         useAnthropicEnvKey,
                                     );
+                                    let retryBody = {
+                                        ...requestBody,
+                                        model: candidate.model,
+                                    };
+                                    retryBody = stripEffortIfSimple(
+                                        retryBody,
+                                        candidate.model,
+                                        complexity,
+                                        log,
+                                    );
+                                    retryBody = stripThinkingIfUnsupported(
+                                        retryBody,
+                                        candidate.model,
+                                    );
                                     retryResponse =
                                         await forwardNativeAnthropicRequest(
-                                            stripThinkingIfUnsupported(
-                                                {
-                                                    ...requestBody,
-                                                    model: candidate.model,
-                                                },
-                                                candidate.model,
-                                            ),
+                                            retryBody,
                                             ctx,
                                             candidateAuth.apiKey,
                                             candidateAuth.isMax,

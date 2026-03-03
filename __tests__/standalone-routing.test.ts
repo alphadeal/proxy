@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
     assessComplexityForRouting,
     applyOpusGate,
+    applySimpleEffortStrip,
     summarizeRoutingInsights,
     toTelemetryRun,
 } from "../src/standalone-proxy.js";
@@ -263,5 +264,47 @@ describe("standalone routing helpers", () => {
         expect(summary.intentHintCounts["git_ops"]).toBe(1);
         expect(summary.intentHintCounts["small_refactor"]).toBe(1);
         expect(summary.intentHintCounts["architecture"]).toBe(1);
+    });
+
+    it("strips effort for simple haiku requests", () => {
+        const input = {
+            model: "claude-haiku-4-5-20251001",
+            effort: "low",
+            messages: [{ role: "user", content: "hi" }],
+        };
+        const stripped = applySimpleEffortStrip(
+            input,
+            "claude-haiku-4-5-20251001",
+            "simple",
+        );
+        expect(stripped.effort).toBeUndefined();
+    });
+
+    it("keeps effort for non-simple complexity", () => {
+        const input = {
+            model: "claude-haiku-4-5-20251001",
+            effort: "low",
+            messages: [{ role: "user", content: "hi" }],
+        };
+        const stripped = applySimpleEffortStrip(
+            input,
+            "claude-haiku-4-5-20251001",
+            "moderate",
+        );
+        expect(stripped.effort).toBe("low");
+    });
+
+    it("keeps effort for simple non-haiku models", () => {
+        const input = {
+            model: "claude-sonnet-4-6",
+            effort: "low",
+            messages: [{ role: "user", content: "hi" }],
+        };
+        const stripped = applySimpleEffortStrip(
+            input,
+            "claude-sonnet-4-6",
+            "simple",
+        );
+        expect(stripped.effort).toBe("low");
     });
 });
