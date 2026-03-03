@@ -594,23 +594,32 @@ const requestHistory: RequestHistoryEntry[] = [];
 const MAX_HISTORY = 10000;
 const HISTORY_RETENTION_DAYS = 7;
 
-/** Model names that indicate proxy-routed (auto) requests vs direct user requests */
-const AUTO_ROUTING_MODELS = new Set([
-    "relayplane:auto",
-    "relayplane:cost",
-    "relayplane:fast",
-    "relayplane:quality",
-    "rp:auto",
-    "rp:balanced",
-    "rp:best",
-    "rp:fast",
-    "rp:cheap",
-]);
-
-function isAutoRouted(originalModel: string): boolean {
-    return AUTO_ROUTING_MODELS.has(originalModel);
+/** Returns true if this history entry was proxy-routed (not a direct passthrough) */
+function isAutoRouted(entry: RequestHistoryEntry): boolean {
+    return entry.mode !== "passthrough";
 }
 let requestIdCounter = 0;
+
+// --- Live log subscribers (SSE) ---
+const logSubscribers = new Set<http.ServerResponse>();
+
+function notifyLogSubscribers(
+    entry: RequestHistoryEntry,
+    eventType: string,
+): void {
+    const payload = `event: ${eventType}\ndata: ${JSON.stringify(entry)}\n\n`;
+    for (const sub of logSubscribers) {
+        try {
+            if (!sub.writableEnded) {
+                sub.write(payload);
+            } else {
+                logSubscribers.delete(sub);
+            }
+        } catch {
+            logSubscribers.delete(sub);
+        }
+    }
+}
 
 // --- Persistent history (JSONL) ---
 const HISTORY_DIR = path.join(os.homedir(), ".relayplane");
@@ -806,6 +815,7 @@ function logRequest(
         requestHistory.shift();
     }
     bufferHistoryEntry(entry);
+    notifyLogSubscribers(entry, "log");
 }
 
 /** Update the most recent history entry with token/cost info */
@@ -819,6 +829,7 @@ function updateLastHistoryEntry(
         last.tokensIn = tokensIn;
         last.tokensOut = tokensOut;
         last.costUsd = costUsd;
+        notifyLogSubscribers(last, "update");
     }
 }
 
@@ -3525,7 +3536,7 @@ td{padding:8px 12px;border-bottom:1px solid #111318}
 .chart-tab{padding:4px 10px;border-radius:4px;cursor:pointer;border:1px solid #1e293b;background:transparent;color:#94a3b8}
 .chart-tab.active{background:#1e293b;color:#e2e8f0}
 </style></head><body>
-<div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><span id="ver"></span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
+<div class="header"><div><h1>⚡ RelayPlane Dashboard</h1></div><div class="meta"><a href="/logs" style="font-size:.85rem">Logs &rarr;</a> · <span id="ver"></span> · up <span id="uptime"></span> · refreshes every 5s</div></div>
 <div class="cards">
   <div class="card"><div class="label">Total Requests</div><div class="value" id="totalReq">—</div></div>
   <div class="card"><div class="label">Total Cost</div><div class="value" id="totalCost">—</div></div>
@@ -3663,6 +3674,121 @@ function renderChart(sav){
   $('chart').innerHTML=svg;
 }
 load();setInterval(load,5000);
+</script></body></html>`;
+}
+
+function getLogsHTML(): string {
+    return `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>RelayPlane Logs</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0b0d;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:20px;max-width:1400px;margin:0 auto}
+a{color:#34d399}h1{font-size:1.5rem;font-weight:600}
+.header{display:flex;justify-content:space-between;align-items:center;padding:16px 0;border-bottom:1px solid #1e293b;margin-bottom:24px}
+.header .meta{font-size:.8rem;color:#64748b;display:flex;align-items:center;gap:12px}
+table{width:100%;border-collapse:collapse;font-size:.8rem}
+th{text-align:left;color:#64748b;font-weight:500;padding:6px 10px;border-bottom:1px solid #1e293b;font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;position:sticky;top:0;background:#0a0b0d;z-index:1}
+td{padding:6px 10px;border-bottom:1px solid #111318;white-space:nowrap}
+tr.new{animation:fadeIn .3s ease-out}
+@keyframes fadeIn{from{background:#1e293b}to{background:transparent}}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}.dot.up{background:#34d399}.dot.down{background:#ef4444}
+.badge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:.7rem;font-weight:500}
+.badge.ok{background:#052e1633;color:#34d399}.badge.err{background:#2d0a0a;color:#ef4444}
+.badge.tt-code{background:#1e3a5f;color:#60a5fa}.badge.tt-analysis{background:#3b1f6e;color:#a78bfa}.badge.tt-summarization{background:#1a3a2a;color:#6ee7b7}.badge.tt-qa{background:#3a2f1e;color:#fbbf24}.badge.tt-general{background:#1e293b;color:#94a3b8}
+.badge.cx-simple{background:#052e1633;color:#34d399}.badge.cx-moderate{background:#2d2a0a;color:#fbbf24}.badge.cx-complex{background:#2d0a0a;color:#ef4444}
+.badge.rt-auto{background:#052e1633;color:#34d399}.badge.rt-direct{background:#1e293b;color:#94a3b8}
+.mono{font-family:'SF Mono',SFMono-Regular,Consolas,monospace;font-size:.75rem;color:#94a3b8}
+</style></head><body>
+<div class="header"><div><h1>RelayPlane Logs</h1></div><div class="meta"><a href="/">&larr; Dashboard</a><span><span id="connDot" class="dot down"></span><span id="connLabel">connecting</span></span><span id="count">0 entries</span></div></div>
+<table><thead><tr><th>Time</th><th>Original</th><th>Target</th><th>Provider</th><th>Route</th><th>Task</th><th>Complexity</th><th>In</th><th>Out</th><th>Cost</th><th>Latency</th><th>Status</th></tr></thead><tbody id="logRows"></tbody></table>
+<div id="sentinel" style="height:1px"></div>
+<div id="loadMore" style="text-align:center;padding:16px;color:#64748b;font-size:.8rem;display:none"></div>
+<script>
+var esc=(function(){var d=document.createElement('div');return function(s){d.textContent=s;return d.innerHTML}}());
+function ttCls(t){var m={code_generation:'tt-code',code_review:'tt-code',analysis:'tt-analysis',summarization:'tt-summarization',question_answering:'tt-qa'};return m[t]||'tt-general'}
+function cxCls(c){var m={simple:'cx-simple',moderate:'cx-moderate',complex:'cx-complex'};return m[c]||'cx-simple'}
+function fmt(n,d){return Number(n||0).toFixed(d)}
+function fmtTime(s){try{var d=new Date(s);return d.toLocaleTimeString()}catch(e){return s}}
+function normalizeRun(r){return{id:r.id,originalModel:r.original_model||r.originalModel,targetModel:r.model||r.targetModel,provider:r.provider,latencyMs:r.latencyMs,success:r.success!==undefined?r.success:r.status==='success',mode:r.mode,escalated:r.escalated,timestamp:r.timestamp||r.started_at,tokensIn:r.tokensIn,tokensOut:r.tokensOut,costUsd:r.costUsd,taskType:r.taskType,complexity:r.complexity}}
+function createRow(e){
+  var tr=document.createElement('tr');
+  tr.dataset.id=e.id;
+  var src=e.mode!=='passthrough'?'auto':'direct';
+  tr.innerHTML='<td class="mono">'+fmtTime(e.timestamp)+'</td>'
+    +'<td class="mono">'+esc(e.originalModel)+'</td>'
+    +'<td class="mono">'+esc(e.targetModel)+'</td>'
+    +'<td>'+esc(e.provider)+'</td>'
+    +'<td><span class="badge rt-'+src+'">'+src+'</span></td>'
+    +'<td><span class="badge '+ttCls(e.taskType)+'">'+esc((e.taskType||'general').replace(/_/g,' '))+'</span></td>'
+    +'<td><span class="badge '+cxCls(e.complexity)+'">'+esc(e.complexity||'simple')+'</span></td>'
+    +'<td class="mono">'+esc(String(e.tokensIn||0))+'</td>'
+    +'<td class="mono">'+esc(String(e.tokensOut||0))+'</td>'
+    +'<td class="mono">$'+esc(fmt(e.costUsd,4))+'</td>'
+    +'<td class="mono">'+esc(String(e.latencyMs))+'ms</td>'
+    +'<td><span class="badge '+(e.success?'ok':'err')+'">'+(e.success?'ok':'err')+'</span></td>';
+  return tr;
+}
+var tbody=document.getElementById('logRows');
+var rows=new Map();
+var MAX_ROWS=2000;
+var countEl=document.getElementById('count');
+var loadMoreEl=document.getElementById('loadMore');
+var total=0;
+var sseNewCount=0;
+var nextOffset=100;
+var loading=false;
+var exhausted=false;
+function updateCount(){countEl.textContent=total+' entries'}
+function trimRows(){
+  while(rows.size>MAX_ROWS){
+    var last=tbody.lastElementChild;
+    if(!last)break;
+    var id=last.dataset.id;
+    last.remove();
+    if(id)rows.delete(id);
+    total--;
+  }
+}
+function addRow(entry,prepend){
+  if(rows.has(entry.id))return false;
+  var tr=createRow(entry);
+  if(prepend){tr.className='new';tbody.prepend(tr);trimRows()}else{if(rows.size>=MAX_ROWS)return false;tbody.appendChild(tr)}
+  rows.set(entry.id,tr);
+  total++;
+  updateCount();
+  return true;
+}
+function loadOlder(){
+  if(loading||exhausted)return;
+  loading=true;
+  loadMoreEl.style.display='block';
+  loadMoreEl.textContent='Loading older entries...';
+  var offset=nextOffset+sseNewCount;
+  fetch('/v1/telemetry/runs?offset='+offset+'&limit=50').then(function(r){return r.json()}).then(function(data){
+    var runs=data.runs||[];
+    var added=0;
+    for(var i=0;i<runs.length;i++){
+      var entry=normalizeRun(runs[i]);
+      if(addRow(entry,false))added++;
+    }
+    nextOffset+=runs.length;
+    if(runs.length<50){exhausted=true;loadMoreEl.textContent='All entries loaded';setTimeout(function(){loadMoreEl.style.display='none'},2000)}
+    else{loadMoreEl.style.display='none'}
+    loading=false;
+  }).catch(function(){loading=false;loadMoreEl.textContent='Failed to load';setTimeout(function(){loadMoreEl.style.display='none'},2000)});
+}
+var evtSource=new EventSource('/v1/logs/stream');
+evtSource.addEventListener('log',function(e){
+  var entry=JSON.parse(e.data);
+  if(addRow(entry,true))sseNewCount++;
+});
+evtSource.addEventListener('update',function(e){
+  var entry=JSON.parse(e.data);
+  var existing=rows.get(entry.id);
+  if(existing){var tr=createRow(entry);existing.replaceWith(tr);rows.set(entry.id,tr)}
+});
+evtSource.onopen=function(){document.getElementById('connDot').className='dot up';document.getElementById('connLabel').textContent='live'};
+evtSource.onerror=function(){document.getElementById('connDot').className='dot down';document.getElementById('connLabel').textContent='disconnected'};
+var observer=new IntersectionObserver(function(entries){if(entries[0].isIntersecting)loadOlder()},{rootMargin:'200px'});
+observer.observe(document.getElementById('sentinel'));
 </script></body></html>`;
 }
 
@@ -3917,7 +4043,7 @@ export async function startProxy(
                     };
                     cur.count++;
                     cur.cost += r.costUsd;
-                    if (isAutoRouted(r.originalModel)) {
+                    if (isAutoRouted(r)) {
                         cur.autoCount++;
                     } else {
                         cur.directCount++;
@@ -3984,7 +4110,7 @@ export async function startProxy(
                 const offset = parseInt(params.get("offset") || "0", 10);
                 const sorted = [...requestHistory].reverse();
                 const runs = sorted.slice(offset, offset + limit).map((r) => {
-                    const baseline = isAutoRouted(r.originalModel)
+                    const baseline = isAutoRouted(r)
                         ? "claude-opus-4-6"
                         : r.originalModel;
                     const origCost = estimateCost(
@@ -4005,7 +4131,7 @@ export async function startProxy(
                         provider: r.provider,
                         routed_to: `${r.provider}/${r.targetModel}`,
                         original_model: r.originalModel,
-                        routingSource: isAutoRouted(r.originalModel)
+                        routingSource: isAutoRouted(r)
                             ? "auto"
                             : "direct",
                         taskType: r.taskType || "general",
@@ -4049,7 +4175,7 @@ export async function startProxy(
                 >();
 
                 for (const r of requestHistory) {
-                    const baselineModel = isAutoRouted(r.originalModel)
+                    const baselineModel = isAutoRouted(r)
                         ? BASELINE_MODEL
                         : r.originalModel;
                     const origCost = estimateCost(
@@ -4108,7 +4234,7 @@ export async function startProxy(
                     };
                     bucket.requests++;
                     bucket.actualCost += r.costUsd;
-                    const baseM = isAutoRouted(r.originalModel)
+                    const baseM = isAutoRouted(r)
                         ? BASELINE_MODEL
                         : r.originalModel;
                     bucket.originalCost += estimateCost(
@@ -4319,6 +4445,51 @@ export async function startProxy(
         ) {
             res.writeHead(200, { "Content-Type": "text/html" });
             res.end(getDashboardHTML());
+            return;
+        }
+
+        // === Logs Page ===
+        if (req.method === "GET" && pathname === "/logs") {
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end(getLogsHTML());
+            return;
+        }
+
+        // === Live Logs SSE Stream ===
+        if (req.method === "GET" && pathname === "/v1/logs/stream") {
+            res.writeHead(200, {
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                Connection: "keep-alive",
+            });
+
+            // Backfill recent entries
+            const backfill = requestHistory.slice(-100);
+            for (const entry of backfill) {
+                res.write(`event: log\ndata: ${JSON.stringify(entry)}\n\n`);
+            }
+
+            logSubscribers.add(res);
+
+            const cleanup = () => {
+                clearInterval(keepAlive);
+                logSubscribers.delete(res);
+            };
+
+            const keepAlive = setInterval(() => {
+                if (res.writableEnded) {
+                    cleanup();
+                    return;
+                }
+                try {
+                    res.write(": ping\n\n");
+                } catch {
+                    cleanup();
+                }
+            }, 15000);
+
+            req.on("close", cleanup);
+
             return;
         }
 
