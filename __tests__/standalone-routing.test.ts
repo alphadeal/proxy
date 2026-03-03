@@ -10,6 +10,7 @@ import {
     isLowerTierModel,
     normalizeAnthropicBetaHeader,
     normalizeEffortForProvider,
+    sanitizeBetaHeadersForAnthropicCompat,
     summarizeRoutingInsights,
     toTelemetryRun,
 } from "../src/standalone-proxy.js";
@@ -507,5 +508,47 @@ describe("standalone routing helpers", () => {
         expect(beta).toBe(
             "prompt-caching-2024-07-31,clear_thinking_20251015",
         );
+    });
+
+    describe("sanitizeBetaHeadersForAnthropicCompat", () => {
+        // Regression: the OpenAI-compat path (forwardToAnthropicStream /
+        // forwardToAnthropic) uses buildAnthropicBody which never includes a
+        // thinking block. Forwarding clear_thinking_20251015 without a thinking
+        // block causes Anthropic to return:
+        //   400 "clear_thinking_20251015 strategy requires `thinking` to be enabled or adaptive"
+        // These functions must always strip thinking betas before forwarding.
+
+        it("strips clear_thinking beta for a non-lower-tier model", () => {
+            expect(
+                sanitizeBetaHeadersForAnthropicCompat(
+                    "clear_thinking_20251015",
+                    "claude-sonnet-4-6",
+                ),
+            ).toBeUndefined();
+        });
+
+        it("strips clear_thinking beta for Opus", () => {
+            expect(
+                sanitizeBetaHeadersForAnthropicCompat(
+                    "clear_thinking_20251015",
+                    "claude-opus-4-6",
+                ),
+            ).toBeUndefined();
+        });
+
+        it("preserves non-thinking betas while stripping clear_thinking", () => {
+            expect(
+                sanitizeBetaHeadersForAnthropicCompat(
+                    "clear_thinking_20251015,prompt-caching-2024-07-31",
+                    "claude-opus-4-6",
+                ),
+            ).toBe("prompt-caching-2024-07-31");
+        });
+
+        it("returns undefined for undefined input", () => {
+            expect(
+                sanitizeBetaHeadersForAnthropicCompat(undefined, "claude-sonnet-4-6"),
+            ).toBeUndefined();
+        });
     });
 });
