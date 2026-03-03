@@ -1563,7 +1563,7 @@ export function sanitizeBetaHeadersForAnthropicCompat(
     betaHeaders: string | undefined,
     model: string,
 ): string | undefined {
-    return normalizeAnthropicBetaHeader(betaHeaders, model);
+    return normalizeAnthropicBetaHeader(betaHeaders, model, "simple");
 }
 
 function isThinkingBeta(token: string): boolean {
