@@ -1316,10 +1316,14 @@ function stripThinkingIfUnsupported<T extends Record<string, unknown>>(
     delete stripped["thinking"];
     if (Array.isArray(stripped["betas"])) {
         stripped["betas"] = (stripped["betas"] as string[]).filter(
-            (b) =>
-                !b.includes("thinking") &&
-                !b.includes("clear_thinking") &&
-                !b.includes("reasoning"),
+            (b) => {
+                const lower = b.toLowerCase();
+                return (
+                    !lower.includes("thinking") &&
+                    !lower.includes("clear_thinking") &&
+                    !lower.includes("reasoning")
+                );
+            },
         );
         if ((stripped["betas"] as string[]).length === 0) {
             delete stripped["betas"];
@@ -1329,11 +1333,15 @@ function stripThinkingIfUnsupported<T extends Record<string, unknown>>(
             .split(",")
             .map((b) => b.trim())
             .filter(
-                (b) =>
-                    b &&
-                    !b.includes("thinking") &&
-                    !b.includes("clear_thinking") &&
-                    !b.includes("reasoning"),
+                (b) => {
+                    if (!b) return false;
+                    const lower = b.toLowerCase();
+                    return (
+                        !lower.includes("thinking") &&
+                        !lower.includes("clear_thinking") &&
+                        !lower.includes("reasoning")
+                    );
+                },
             );
         if (filtered.length > 0) {
             stripped["betas"] = filtered.join(",");
@@ -1518,6 +1526,29 @@ export function isEffortUnsupportedError(
     );
 }
 
+export function isThinkingContractError(
+    status: number,
+    payload: Record<string, unknown>,
+): boolean {
+    if (status < 400 || status >= 500) return false;
+    const errorObj = payload["error"] as Record<string, unknown> | undefined;
+    const message =
+        typeof errorObj?.["message"] === "string"
+            ? errorObj["message"].toLowerCase()
+            : "";
+    const type =
+        typeof errorObj?.["type"] === "string"
+            ? errorObj["type"].toLowerCase()
+            : "";
+    if (type !== "invalid_request_error") return false;
+    return (
+        message.includes("clear_thinking") ||
+        message.includes("strategy requires `thinking`") ||
+        message.includes("requires `thinking` to be enabled or adaptive") ||
+        (message.includes("thinking") && message.includes("adaptive"))
+    );
+}
+
 export function isLowerTierModel(model: string): boolean {
     const lower = model.toLowerCase();
     return LOWER_TIER_MODEL_HINTS.some((hint) => lower.includes(hint));
@@ -1556,6 +1587,51 @@ export function normalizeAnthropicBetaHeader(
 
     const filtered = tokens.filter((t) => !isThinkingBeta(t));
     return filtered.length > 0 ? filtered.join(",") : undefined;
+}
+
+function stripThinkingContractFields<T extends Record<string, unknown>>(
+    body: T,
+): T {
+    const stripped: Record<string, unknown> = { ...body };
+    delete stripped["thinking"];
+    delete stripped["thinking_strategy"];
+    delete stripped["clear_thinking_strategy"];
+    delete stripped["reasoning_strategy"];
+
+    if (Array.isArray(stripped["betas"])) {
+        stripped["betas"] = (stripped["betas"] as string[]).filter(
+            (token) => !isThinkingBeta(token),
+        );
+        if ((stripped["betas"] as string[]).length === 0) {
+            delete stripped["betas"];
+        }
+    } else if (typeof stripped["betas"] === "string") {
+        const filtered = (stripped["betas"] as string)
+            .split(",")
+            .map((token) => token.trim())
+            .filter((token) => token && !isThinkingBeta(token));
+        if (filtered.length > 0) {
+            stripped["betas"] = filtered.join(",");
+        } else {
+            delete stripped["betas"];
+        }
+    }
+
+    const reasoning = getObjectField(stripped, "reasoning");
+    if (reasoning) {
+        const nextReasoning = { ...reasoning };
+        const strategy = nextReasoning["strategy"];
+        if (typeof strategy === "string" && isThinkingBeta(strategy)) {
+            delete nextReasoning["strategy"];
+        }
+        if (Object.keys(nextReasoning).length > 0) {
+            stripped["reasoning"] = nextReasoning;
+        } else {
+            delete stripped["reasoning"];
+        }
+    }
+
+    return stripped as T;
 }
 
 function sanitizeAnthropicAttempt(
@@ -5461,6 +5537,92 @@ export async function startProxy(
                                     unknown
                                 >;
                         }
+                        if (
+                            targetProvider === "anthropic" &&
+                            complexity === "simple" &&
+                            isLowerTierModel(finalModel) &&
+                            isThinkingContractError(
+                                providerStatus,
+                                errorPayload,
+                            )
+                        ) {
+                            const retryNativeBody = stripThinkingContractFields({
+                                ...requestBody,
+                                model: finalModel,
+                            });
+                            const retryCtx: RequestContext = {
+                                ...ctx,
+                                betaHeaders: undefined,
+                            };
+                            log(
+                                `[thinking retry] anthropic/${finalModel} rejected thinking contract. Retrying same model with thinking controls stripped before escalation.`,
+                            );
+                            const retryResponse =
+                                await forwardNativeAnthropicRequest(
+                                    retryNativeBody,
+                                    retryCtx,
+                                    modelAuth.apiKey,
+                                    modelAuth.isMax,
+                                    complexity,
+                                );
+                            if (retryResponse.ok) {
+                                const durationMs = Date.now() - startTime;
+                                if (isStreaming) {
+                                    res.writeHead(retryResponse.status, {
+                                        "Content-Type": "text/event-stream",
+                                        "Cache-Control": "no-cache",
+                                        Connection: "keep-alive",
+                                    });
+                                    const reader = retryResponse.body?.getReader();
+                                    if (reader) {
+                                        const decoder = new TextDecoder();
+                                        while (true) {
+                                            const { done, value } =
+                                                await reader.read();
+                                            if (done) break;
+                                            res.write(
+                                                decoder.decode(value, {
+                                                    stream: true,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                    res.end();
+                                } else {
+                                    const retryData =
+                                        (await retryResponse.json()) as Record<
+                                            string,
+                                            unknown
+                                        >;
+                                    res.writeHead(retryResponse.status, {
+                                        "Content-Type": "application/json",
+                                    });
+                                    res.end(JSON.stringify(retryData));
+                                }
+                                logRequest(
+                                    originalModel ?? "unknown",
+                                    finalModel,
+                                    targetProvider,
+                                    durationMs,
+                                    true,
+                                    routingMode,
+                                    undefined,
+                                    taskType,
+                                    complexity,
+                                    routingMeta,
+                                );
+                                return;
+                            }
+                            providerResponse = retryResponse;
+                            providerStatus = retryResponse.status;
+                            errorPayload =
+                                (await retryResponse
+                                    .json()
+                                    .catch(() => ({}))) as Record<
+                                    string,
+                                    unknown
+                                >;
+                        }
 
                         log(
                             `Anthropic error [${providerStatus}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`,
@@ -6805,6 +6967,7 @@ async function handleStreamingRequest(
         attempt: FallbackTarget,
         attemptRequest: ChatRequest,
         apiKey: string | undefined,
+        attemptCtx?: RequestContext,
     ): Promise<Response> => {
         const normalizedAttempt = normalizeEffortForProvider(
             attemptRequest as Record<string, unknown>,
@@ -6816,7 +6979,7 @@ async function handleStreamingRequest(
                 return forwardToAnthropicStream(
                     normalizedAttempt,
                     attempt.model,
-                    ctx,
+                    attemptCtx ?? ctx,
                     apiKey,
                 );
             case "google":
@@ -6922,6 +7085,7 @@ async function handleStreamingRequest(
                 attempt,
                 requestForAttempt,
                 apiKeyResult.apiKey,
+                ctx,
             );
 
             if (!providerResponse.ok) {
@@ -6952,6 +7116,7 @@ async function handleStreamingRequest(
                             attempt,
                             requestForAttempt,
                             apiKeyResult.apiKey,
+                            ctx,
                         );
                         if (retryResponse.ok) {
                             providerResponse = retryResponse;
@@ -6978,6 +7143,49 @@ async function handleStreamingRequest(
                         >;
                         errorStatus = retryResponse.status;
                     }
+                }
+                if (
+                    !providerResponse.ok &&
+                    attempt.provider === "anthropic" &&
+                    complexity === "simple" &&
+                    isLowerTierModel(attempt.model) &&
+                    isThinkingContractError(errorStatus, errorData)
+                ) {
+                    log(
+                        `[thinking retry] ${attempt.provider}/${attempt.model} rejected thinking contract. Retrying same model with thinking controls stripped before escalation.`,
+                    );
+                    requestForAttempt = stripThinkingContractFields(
+                        requestForAttempt as Record<string, unknown>,
+                    ) as ChatRequest;
+                    const retryResponse = await executeStreamingAttempt(
+                        attempt,
+                        requestForAttempt,
+                        apiKeyResult.apiKey,
+                        { ...ctx, betaHeaders: undefined },
+                    );
+                    if (retryResponse.ok) {
+                        providerResponse = retryResponse;
+                        if (i > 0) {
+                            recordFallbackEvent({
+                                timestamp: new Date().toISOString(),
+                                fromProvider: attempts[i - 1]!.provider,
+                                fromModel: attempts[i - 1]!.model,
+                                toProvider: attempt.provider,
+                                toModel: attempt.model,
+                                mode: routingMode,
+                                reason: "fallback recovered request",
+                                outcome: "recovered",
+                            });
+                        }
+                        targetProvider = attempt.provider;
+                        targetModel = attempt.model;
+                        break;
+                    }
+                    providerResponse = retryResponse;
+                    errorData = (await retryResponse
+                        .json()
+                        .catch(() => ({}))) as Record<string, unknown>;
+                    errorStatus = retryResponse.status;
                 }
 
                 lastFailureStatus = errorStatus;
@@ -7379,6 +7587,27 @@ async function handleNonStreamingRequest(
                         ctx,
                     );
                 }
+            }
+            if (
+                !result.ok &&
+                attempt.provider === "anthropic" &&
+                complexity === "simple" &&
+                isLowerTierModel(attempt.model) &&
+                isThinkingContractError(result.status, result.responseData)
+            ) {
+                log(
+                    `[thinking retry] ${attempt.provider}/${attempt.model} rejected thinking contract. Retrying same model with thinking controls stripped before escalation.`,
+                );
+                requestForAttempt = stripThinkingContractFields(
+                    requestForAttempt as Record<string, unknown>,
+                ) as ChatRequest;
+                result = await executeNonStreamingProviderRequest(
+                    requestForAttempt,
+                    attempt.provider,
+                    attempt.model,
+                    apiKeyResult.apiKey,
+                    { ...ctx, betaHeaders: undefined },
+                );
             }
 
             if (!result.ok) {

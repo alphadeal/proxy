@@ -6,6 +6,7 @@ import {
     applySimpleEffortStrip,
     hasEffortControls,
     isEffortUnsupportedError,
+    isThinkingContractError,
     isLowerTierModel,
     normalizeAnthropicBetaHeader,
     normalizeEffortForProvider,
@@ -332,6 +333,25 @@ describe("standalone routing helpers", () => {
         expect(unrelated).toBe(false);
     });
 
+    it("detects thinking-contract errors from provider payloads", () => {
+        const unsupported = isThinkingContractError(400, {
+            error: {
+                type: "invalid_request_error",
+                message:
+                    "`clear_thinking_20251015` strategy requires `thinking` to be enabled or adaptive",
+            },
+        });
+        const unrelated = isThinkingContractError(400, {
+            error: {
+                type: "invalid_request_error",
+                message: "Unknown tool name.",
+            },
+        });
+
+        expect(unsupported).toBe(true);
+        expect(unrelated).toBe(false);
+    });
+
     it("classifies lower-tier model names across providers", () => {
         expect(isLowerTierModel("claude-haiku-4-5-20251001")).toBe(true);
         expect(isLowerTierModel("gpt-5-nano")).toBe(true);
@@ -456,6 +476,20 @@ describe("standalone routing helpers", () => {
                 model: "claude-haiku-4-5-20251001",
                 thinking: { type: "enabled", budget_tokens: 1200 },
                 betas: "clear_thinking_20251015,prompt-caching-2024-07-31",
+            },
+            "claude-haiku-4-5-20251001",
+            "simple",
+        );
+        expect(sanitized.thinking).toBeUndefined();
+        expect(sanitized.betas).toBe("prompt-caching-2024-07-31");
+    });
+
+    it("strips thinking controls case-insensitively when betas is a string", () => {
+        const sanitized = applyThinkingSanitizationForModel(
+            {
+                model: "claude-haiku-4-5-20251001",
+                thinking: { type: "enabled", budget_tokens: 1200 },
+                betas: "Clear_Thinking_20251015,prompt-caching-2024-07-31",
             },
             "claude-haiku-4-5-20251001",
             "simple",
