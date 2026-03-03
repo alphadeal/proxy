@@ -39,11 +39,15 @@ import {
 import { StatsCollector } from "./stats.js";
 import { defaultLogger } from "./logger.js";
 import {
-    classifyComplexity,
+    classifyComplexityWithDetails,
     extractMessageText,
     isContentBlockArray,
 } from "./routing/complexity-classifier.js";
-import type { Complexity } from "./routing/complexity-classifier.js";
+import type {
+    Complexity,
+    ComplexityAssessment,
+    IntentHint,
+} from "./routing/complexity-classifier.js";
 const PROXY_VERSION: string = (() => {
     try {
         const pkgPath = path.join(__dirname, "..", "package.json");
@@ -375,6 +379,13 @@ interface ComplexityConfig {
     simple: string;
     moderate: string;
     complex: string;
+    opusGate?: {
+        enabled?: boolean;
+        minScore?: number;
+        requireSignals?: IntentHint[];
+        maxTokensInBypass?: number;
+        blockIntents?: IntentHint[];
+    };
 }
 
 interface AlphadealConfig {
@@ -574,7 +585,7 @@ const globalStats: RequestStats = {
 };
 
 /** Rolling request history for telemetry endpoints (max 10000 entries) */
-interface RequestHistoryEntry {
+export interface RequestHistoryEntry {
     id: string;
     originalModel: string;
     targetModel: string;
@@ -589,6 +600,31 @@ interface RequestHistoryEntry {
     costUsd: number;
     taskType?: string;
     complexity?: string;
+    routingReason?: string;
+    opusGateDecision?: string;
+    intentHints?: string[];
+}
+
+interface FallbackTarget {
+    provider: Provider;
+    model: string;
+}
+
+interface FallbackEvent {
+    timestamp: string;
+    fromProvider: Provider;
+    fromModel: string;
+    toProvider: Provider;
+    toModel: string;
+    mode: string;
+    reason: string;
+    outcome: "rerouted" | "recovered" | "exhausted";
+}
+
+export interface RoutingMetadata {
+    routingReason?: string;
+    opusGateDecision?: string;
+    intentHints?: IntentHint[];
 }
 const requestHistory: RequestHistoryEntry[] = [];
 const MAX_HISTORY = 10000;
@@ -599,6 +635,15 @@ function isAutoRouted(entry: RequestHistoryEntry): boolean {
     return entry.mode !== "passthrough";
 }
 let requestIdCounter = 0;
+const fallbackEvents: FallbackEvent[] = [];
+const MAX_FALLBACK_EVENTS = 200;
+
+function recordFallbackEvent(event: FallbackEvent): void {
+    fallbackEvents.push(event);
+    if (fallbackEvents.length > MAX_FALLBACK_EVENTS) {
+        fallbackEvents.shift();
+    }
+}
 
 // --- Live log subscribers (SSE) ---
 const logSubscribers = new Set<http.ServerResponse>();
@@ -760,6 +805,7 @@ function logRequest(
     escalated?: boolean,
     taskType?: string,
     complexity?: string,
+    routingMeta?: RoutingMetadata,
 ): void {
     const timestamp = new Date().toISOString();
     const status = success ? "✓" : "✗";
@@ -809,6 +855,9 @@ function logRequest(
         costUsd: 0,
         taskType: taskType || "general",
         complexity: complexity || "simple",
+        routingReason: routingMeta?.routingReason,
+        opusGateDecision: routingMeta?.opusGateDecision,
+        intentHints: routingMeta?.intentHints,
     };
     requestHistory.push(entry);
     if (requestHistory.length > MAX_HISTORY) {
@@ -854,6 +903,18 @@ const DEFAULT_PROXY_CONFIG: RelayPlaneProxyConfigFile = {
             simple: "claude-3-5-haiku-20241022",
             moderate: "claude-sonnet-4-20250514",
             complex: "claude-opus-4-20250514",
+            opusGate: {
+                enabled: true,
+                minScore: 7,
+                requireSignals: [
+                    "architecture",
+                    "multi_step",
+                    "large_context",
+                    "cross_file_refactor",
+                ],
+                maxTokensInBypass: 300,
+                blockIntents: ["git_ops", "housekeeping", "small_refactor"],
+            },
         },
         alphadeal: {
             enabled: true,
@@ -890,6 +951,11 @@ function normalizeProxyConfig(
     const complexity = {
         ...defaultRouting.complexity,
         ...(configRouting.complexity ?? {}),
+        opusGate: {
+            ...(defaultRouting.complexity?.opusGate ?? {}),
+            ...((configRouting.complexity as ComplexityConfig | undefined)
+                ?.opusGate ?? {}),
+        },
     };
     const alphadeal = {
         ...defaultRouting.alphadeal,
@@ -1096,6 +1162,24 @@ const THINKING_UNSUPPORTED_MODELS = [
     "claude-3-haiku-20240307",
 ];
 
+const EFFORT_STRIP_SIMPLE_MODELS = [
+    "claude-haiku-4-5-20251001",
+    "claude-3-5-haiku-20241022",
+    "claude-3-haiku-20240307",
+];
+
+const LOWER_TIER_MODEL_HINTS = [
+    "haiku",
+    "nano",
+    "mini",
+    "flash-lite",
+    "flash",
+    "small",
+    "lite",
+    "instant",
+    "fast",
+];
+
 /**
  * Models that do not support `tool_reference` content blocks.
  * These are Sonnet 4+ / Opus 4+ only features as of the claude-haiku-4-5 era.
@@ -1224,26 +1308,377 @@ export function sanitizeAnthropicToolResultMessages(
     return { messages: sanitized, droppedToolResults, droppedMessages };
 }
 
-function stripThinkingIfUnsupported(
-    body: Record<string, unknown>,
+function stripThinkingIfUnsupported<T extends Record<string, unknown>>(
+    body: T,
     model: string,
-): Record<string, unknown> {
+    complexity?: Complexity,
+): T {
     const modelLower = model.toLowerCase();
     const unsupported = THINKING_UNSUPPORTED_MODELS.some((m) =>
         modelLower.includes(m),
     );
-    if (!unsupported) return body;
-    const stripped = { ...body };
+    // Cost/latency policy:
+    // For simple requests on lower-tier models, thinking controls often add
+    // overhead without meaningful quality gain. We strip them proactively to
+    // preserve low-cost routing and prevent avoidable provider contract errors.
+    const simpleLowTier = complexity === "simple" && isLowerTierModel(model);
+    if (!unsupported && !simpleLowTier) return body;
+    const stripped: Record<string, unknown> = { ...body };
     delete stripped["thinking"];
     if (Array.isArray(stripped["betas"])) {
         stripped["betas"] = (stripped["betas"] as string[]).filter(
-            (b) => !b.includes("thinking"),
+            (b) => {
+                const lower = b.toLowerCase();
+                return (
+                    !lower.includes("thinking") &&
+                    !lower.includes("clear_thinking") &&
+                    !lower.includes("reasoning")
+                );
+            },
         );
         if ((stripped["betas"] as string[]).length === 0) {
             delete stripped["betas"];
         }
+    } else if (typeof stripped["betas"] === "string") {
+        const filtered = (stripped["betas"] as string)
+            .split(",")
+            .map((b) => b.trim())
+            .filter(
+                (b) => {
+                    if (!b) return false;
+                    const lower = b.toLowerCase();
+                    return (
+                        !lower.includes("thinking") &&
+                        !lower.includes("clear_thinking") &&
+                        !lower.includes("reasoning")
+                    );
+                },
+            );
+        if (filtered.length > 0) {
+            stripped["betas"] = filtered.join(",");
+        } else {
+            delete stripped["betas"];
+        }
     }
-    return stripped;
+    return stripped as T;
+}
+
+function stripEffortIfSimple<T extends Record<string, unknown>>(
+    body: T,
+    model: string,
+    complexity: Complexity,
+    log?: (msg: string) => void,
+): T {
+    if (complexity !== "simple") return body;
+    const modelLower = model.toLowerCase();
+    const shouldStripEffort = EFFORT_STRIP_SIMPLE_MODELS.some((m) =>
+        modelLower.includes(m),
+    );
+    if (!shouldStripEffort) return body;
+    if (!Object.prototype.hasOwnProperty.call(body, "effort")) return body;
+
+    const stripped: Record<string, unknown> = { ...body };
+    delete stripped["effort"];
+    if (log) {
+        log(
+            `[effort strip] Removed effort parameter for simple complexity on ${model} to keep low-cost routing`,
+        );
+    }
+    return stripped as T;
+}
+
+export function applySimpleEffortStrip<T extends Record<string, unknown>>(
+    body: T,
+    model: string,
+    complexity: Complexity,
+): T {
+    return stripEffortIfSimple(body, model, complexity);
+}
+
+function stripEffortParameter<T extends Record<string, unknown>>(body: T): T {
+    return normalizeEffortForProvider(body, "anthropic", "unknown");
+}
+
+function getObjectField(
+    body: Record<string, unknown>,
+    key: string,
+): Record<string, unknown> | undefined {
+    const value = body[key];
+    return value && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : undefined;
+}
+
+function getEffortString(body: Record<string, unknown>, key: string): string | null {
+    return typeof body[key] === "string" ? (body[key] as string) : null;
+}
+
+function inferEffortLevel(body: Record<string, unknown>): string | null {
+    const top = getEffortString(body, "effort");
+    if (top) return top;
+    const reasoningEffort = getEffortString(body, "reasoning_effort");
+    if (reasoningEffort) return reasoningEffort;
+    const reasoning = getObjectField(body, "reasoning");
+    if (reasoning && typeof reasoning["effort"] === "string") {
+        return reasoning["effort"] as string;
+    }
+    const outputConfig = getObjectField(body, "output_config");
+    if (outputConfig && typeof outputConfig["effort"] === "string") {
+        return outputConfig["effort"] as string;
+    }
+    return null;
+}
+
+function stripAllEffortControls<T extends Record<string, unknown>>(body: T): T {
+    const stripped: Record<string, unknown> = { ...body };
+    delete stripped["effort"];
+    delete stripped["reasoning_effort"];
+
+    const reasoning = getObjectField(stripped, "reasoning");
+    if (reasoning && Object.prototype.hasOwnProperty.call(reasoning, "effort")) {
+        const nextReasoning = { ...reasoning };
+        delete nextReasoning["effort"];
+        stripped["reasoning"] = nextReasoning;
+    }
+
+    const outputConfig = getObjectField(stripped, "output_config");
+    if (
+        outputConfig &&
+        Object.prototype.hasOwnProperty.call(outputConfig, "effort")
+    ) {
+        const nextOutputConfig = { ...outputConfig };
+        delete nextOutputConfig["effort"];
+        stripped["output_config"] = nextOutputConfig;
+    }
+
+    return stripped as T;
+}
+
+function supportsReasoningEffortOnXai(model: string): boolean {
+    return model.toLowerCase().includes("grok-3-mini");
+}
+
+function supportsReasoningEffortOnGroq(model: string): boolean {
+    const lower = model.toLowerCase();
+    return lower.includes("qwen") || lower.includes("gpt-oss");
+}
+
+export function hasEffortControls(body: Record<string, unknown>): boolean {
+    if (Object.prototype.hasOwnProperty.call(body, "effort")) return true;
+    if (Object.prototype.hasOwnProperty.call(body, "reasoning_effort"))
+        return true;
+    const reasoning = getObjectField(body, "reasoning");
+    if (reasoning && Object.prototype.hasOwnProperty.call(reasoning, "effort"))
+        return true;
+    const outputConfig = getObjectField(body, "output_config");
+    return (
+        !!outputConfig &&
+        Object.prototype.hasOwnProperty.call(outputConfig, "effort")
+    );
+}
+
+export function normalizeEffortForProvider<T extends Record<string, unknown>>(
+    request: T,
+    provider: Provider,
+    model: string,
+): T {
+    const level = inferEffortLevel(request);
+    let normalized = stripAllEffortControls(request) as Record<string, unknown>;
+
+    if (!level) return normalized as T;
+
+    if (provider === "openai") {
+        normalized["reasoning_effort"] = level;
+        return normalized as T;
+    }
+
+    if (provider === "xai") {
+        if (supportsReasoningEffortOnXai(model)) {
+            normalized["reasoning_effort"] = level;
+        }
+        return normalized as T;
+    }
+
+    if (provider === "groq") {
+        if (supportsReasoningEffortOnGroq(model)) {
+            normalized["reasoning_effort"] = level;
+        }
+        return normalized as T;
+    }
+
+    if (provider === "openrouter") {
+        const reasoning = getObjectField(normalized, "reasoning") ?? {};
+        normalized["reasoning"] = { ...reasoning, effort: level };
+        return normalized as T;
+    }
+
+    // Anthropic, Google, DeepSeek, and all other providers: drop effort controls.
+    return normalized as T;
+}
+
+export function isEffortUnsupportedError(
+    status: number,
+    payload: Record<string, unknown>,
+): boolean {
+    if (status < 400 || status >= 500) return false;
+    const errorObj = payload["error"] as Record<string, unknown> | undefined;
+    const message =
+        typeof errorObj?.["message"] === "string"
+            ? errorObj["message"].toLowerCase()
+            : "";
+    const type =
+        typeof errorObj?.["type"] === "string"
+            ? errorObj["type"].toLowerCase()
+            : "";
+    return (
+        message.includes("effort parameter") ||
+        message.includes("unsupported parameter") ||
+        (message.includes("effort") && type === "invalid_request_error")
+    );
+}
+
+export function isThinkingContractError(
+    status: number,
+    payload: Record<string, unknown>,
+): boolean {
+    if (status < 400 || status >= 500) return false;
+    const errorObj = payload["error"] as Record<string, unknown> | undefined;
+    const message =
+        typeof errorObj?.["message"] === "string"
+            ? errorObj["message"].toLowerCase()
+            : "";
+    const type =
+        typeof errorObj?.["type"] === "string"
+            ? errorObj["type"].toLowerCase()
+            : "";
+    if (type !== "invalid_request_error") return false;
+    return (
+        message.includes("clear_thinking") ||
+        message.includes("strategy requires `thinking`") ||
+        message.includes("requires `thinking` to be enabled or adaptive") ||
+        (message.includes("thinking") && message.includes("adaptive"))
+    );
+}
+
+export function isLowerTierModel(model: string): boolean {
+    const lower = model.toLowerCase();
+    return LOWER_TIER_MODEL_HINTS.some((hint) => lower.includes(hint));
+}
+
+function isThinkingBeta(token: string): boolean {
+    const lower = token.toLowerCase();
+    return (
+        lower.includes("thinking") ||
+        lower.includes("clear_thinking") ||
+        lower.includes("reasoning") ||
+        lower.includes("effort")
+    );
+}
+
+export function normalizeAnthropicBetaHeader(
+    betaHeader: string | undefined,
+    model: string,
+    complexity: Complexity = "simple",
+): string | undefined {
+    if (!betaHeader || !betaHeader.trim()) return undefined;
+    const tokens = betaHeader
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean);
+    if (tokens.length === 0) return undefined;
+
+    // Anthropic thinking-related beta strategies (e.g. clear_thinking_*) can
+    // force a thinking contract that lower-tier/simple requests do not need.
+    // Effort betas can also imply higher-reasoning strategies, so we strip them
+    // as part of the same guard. Non-reasoning betas (e.g. oauth/prompt-caching)
+    // are preserved.
+    const shouldStripThinkingBetas =
+        isLowerTierModel(model) || complexity === "simple";
+    if (!shouldStripThinkingBetas) return tokens.join(",");
+
+    const filtered = tokens.filter((t) => !isThinkingBeta(t));
+    return filtered.length > 0 ? filtered.join(",") : undefined;
+}
+
+function stripThinkingContractFields<T extends Record<string, unknown>>(
+    body: T,
+): T {
+    const stripped: Record<string, unknown> = { ...body };
+    delete stripped["thinking"];
+    delete stripped["thinking_strategy"];
+    delete stripped["clear_thinking_strategy"];
+    delete stripped["reasoning_strategy"];
+
+    if (Array.isArray(stripped["betas"])) {
+        stripped["betas"] = (stripped["betas"] as string[]).filter(
+            (token) => !isThinkingBeta(token),
+        );
+        if ((stripped["betas"] as string[]).length === 0) {
+            delete stripped["betas"];
+        }
+    } else if (typeof stripped["betas"] === "string") {
+        const filtered = (stripped["betas"] as string)
+            .split(",")
+            .map((token) => token.trim())
+            .filter((token) => token && !isThinkingBeta(token));
+        if (filtered.length > 0) {
+            stripped["betas"] = filtered.join(",");
+        } else {
+            delete stripped["betas"];
+        }
+    }
+
+    const reasoning = getObjectField(stripped, "reasoning");
+    if (reasoning) {
+        const nextReasoning = { ...reasoning };
+        const strategy = nextReasoning["strategy"];
+        if (typeof strategy === "string" && isThinkingBeta(strategy)) {
+            delete nextReasoning["strategy"];
+        }
+        if (Object.keys(nextReasoning).length > 0) {
+            stripped["reasoning"] = nextReasoning;
+        } else {
+            delete stripped["reasoning"];
+        }
+    }
+
+    return stripped as T;
+}
+
+function sanitizeAnthropicAttempt(
+    body: Record<string, unknown>,
+    ctx: RequestContext,
+    model: string,
+    complexity: Complexity = "simple",
+): { body: Record<string, unknown>; ctx: RequestContext } {
+    let sanitizedBody = stripThinkingIfUnsupported(body, model, complexity);
+    sanitizedBody = normalizeEffortForProvider(
+        sanitizedBody,
+        "anthropic",
+        model,
+    );
+
+    if (complexity === "simple" && isLowerTierModel(model)) {
+        delete sanitizedBody["thinking_strategy"];
+        delete sanitizedBody["clear_thinking_strategy"];
+        const reasoning = getObjectField(sanitizedBody, "reasoning");
+        if (
+            reasoning &&
+            typeof reasoning["strategy"] === "string" &&
+            (reasoning["strategy"] as string).includes("clear_thinking")
+        ) {
+            const nextReasoning = { ...reasoning };
+            delete nextReasoning["strategy"];
+            sanitizedBody["reasoning"] = nextReasoning;
+        }
+    }
+
+    const betaBefore = ctx.betaHeaders;
+    const betaAfter = normalizeAnthropicBetaHeader(betaBefore, model, complexity);
+    const sanitizedCtx =
+        betaBefore !== betaAfter ? { ...ctx, betaHeaders: betaAfter } : ctx;
+
+    return { body: sanitizedBody, ctx: sanitizedCtx };
 }
 
 export function shouldEscalate(
@@ -1254,6 +1689,12 @@ export function shouldEscalate(
     const patterns =
         trigger === "refusal" ? REFUSAL_PATTERNS : UNCERTAINTY_PATTERNS;
     return patterns.some((p) => p.test(responseText));
+}
+
+export function applyThinkingSanitizationForModel<
+    T extends Record<string, unknown>,
+>(body: T, model: string, complexity: Complexity = "simple"): T {
+    return stripThinkingIfUnsupported(body, model, complexity);
 }
 
 /**
@@ -1298,6 +1739,7 @@ function buildAnthropicHeadersWithAuth(
     ctx: RequestContext,
     apiKey?: string,
     isMaxToken?: boolean,
+    betaHeadersOverride?: string | null,
 ): Record<string, string> {
     const headers: Record<string, string> = {
         "Content-Type": "application/json",
@@ -1319,8 +1761,10 @@ function buildAnthropicHeadersWithAuth(
     }
 
     // Pass through beta headers
-    if (ctx.betaHeaders) {
-        headers["anthropic-beta"] = ctx.betaHeaders;
+    const effectiveBetaHeaders =
+        betaHeadersOverride !== undefined ? betaHeadersOverride : ctx.betaHeaders;
+    if (effectiveBetaHeaders) {
+        headers["anthropic-beta"] = effectiveBetaHeaders;
     }
 
     return headers;
@@ -1421,13 +1865,34 @@ async function forwardNativeAnthropicRequest(
     ctx: RequestContext,
     envApiKey?: string,
     isMaxToken?: boolean,
+    complexity: Complexity = "simple",
 ): Promise<Response> {
-    const headers = buildAnthropicHeadersWithAuth(ctx, envApiKey, isMaxToken);
+    const model =
+        typeof body["model"] === "string" ? (body["model"] as string) : "";
+    const sanitized = sanitizeAnthropicAttempt(body, ctx, model, complexity);
+    if (complexity === "simple" && isLowerTierModel(model)) {
+        const bodyChanged = JSON.stringify(sanitized.body) !== JSON.stringify(body);
+        const betaChanged = sanitized.ctx.betaHeaders !== ctx.betaHeaders;
+        if (bodyChanged || betaChanged) {
+            defaultLogger.info(
+                `[thinking sanitize] model=${model} simple=${complexity} bodyChanged=${bodyChanged} betaChanged=${betaChanged} betaOut=${sanitized.ctx.betaHeaders ?? "<none>"}`,
+            );
+        }
+    }
+    const sanitizedBetaHeaders = sanitized.ctx.betaHeaders;
+    const betaHeadersOverride =
+        ctx.betaHeaders !== undefined ? (sanitizedBetaHeaders ?? null) : undefined;
+    const headers = buildAnthropicHeadersWithAuth(
+        sanitized.ctx,
+        envApiKey,
+        isMaxToken,
+        betaHeadersOverride,
+    );
 
     const response = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
         headers,
-        body: JSON.stringify(body),
+        body: JSON.stringify(sanitized.body),
     });
 
     return response;
@@ -1861,7 +2326,7 @@ function convertMessagesToAnthropic(
         content: string | unknown;
         [key: string]: unknown;
     }>,
-): unknown[] {
+): AnthropicMessage[] {
     const result: AnthropicMessage[] = [];
 
     for (const msg of messages) {
@@ -3231,6 +3696,230 @@ function resolveRoutingMode(
     return result("passthrough");
 }
 
+interface OpusGateResult {
+    complexity: Complexity;
+    decision: "allowed" | "blocked" | "not_applicable";
+    reason: string;
+}
+
+export function applyOpusGate(
+    complexity: Complexity,
+    assessment: ComplexityAssessment,
+    config: RelayPlaneProxyConfigFile,
+): OpusGateResult {
+    if (complexity !== "complex") {
+        return {
+            complexity,
+            decision: "not_applicable",
+            reason: "complexity_not_complex",
+        };
+    }
+
+    const gate = config.routing?.complexity?.opusGate;
+    if (gate?.enabled === false) {
+        return { complexity, decision: "allowed", reason: "gate_disabled" };
+    }
+
+    const minScore = gate?.minScore ?? 7;
+    const maxTokensInBypass = gate?.maxTokensInBypass ?? 300;
+    const blockIntents = new Set<IntentHint>(
+        gate?.blockIntents ?? ["git_ops", "housekeeping", "small_refactor"],
+    );
+    const requiredSignals = new Set<IntentHint>(
+        gate?.requireSignals ?? [
+            "architecture",
+            "multi_step",
+            "large_context",
+            "cross_file_refactor",
+        ],
+    );
+
+    const hintSet = new Set(assessment.intentHints);
+    const blockedIntent = Array.from(blockIntents).find((h) => hintSet.has(h));
+    if (blockedIntent) {
+        return {
+            complexity: "moderate",
+            decision: "blocked",
+            reason: `blocked_intent:${blockedIntent}`,
+        };
+    }
+
+    const strongSignal = Array.from(requiredSignals).some((h) => hintSet.has(h));
+    if (!strongSignal && assessment.currentTokens <= maxTokensInBypass) {
+        return {
+            complexity: "moderate",
+            decision: "blocked",
+            reason: "no_strong_signal_low_tokens",
+        };
+    }
+
+    if (assessment.score < minScore) {
+        return {
+            complexity: "moderate",
+            decision: "blocked",
+            reason: `score_below_min:${assessment.score}<${minScore}`,
+        };
+    }
+
+    return { complexity, decision: "allowed", reason: "gate_passed" };
+}
+
+export function buildRoutingMetadata(
+    assessment: ComplexityAssessment,
+    gate: OpusGateResult,
+): RoutingMetadata {
+    return {
+        routingReason: `score=${assessment.score};signals=${assessment.signals.join("|") || "none"}`,
+        opusGateDecision: `${gate.decision}:${gate.reason}`,
+        intentHints: assessment.intentHints,
+    };
+}
+
+export function assessComplexityForRouting(
+    messages: Array<{ content?: unknown; role?: string }>,
+    bodyTools: unknown,
+    system: string,
+    config: RelayPlaneProxyConfigFile,
+): { complexity: Complexity; routingMeta: RoutingMetadata } {
+    const assessment = classifyComplexityWithDetails(messages, bodyTools, system);
+    const gate = applyOpusGate(assessment.complexity, assessment, config);
+    return {
+        complexity: gate.complexity,
+        routingMeta: buildRoutingMetadata(assessment, gate),
+    };
+}
+
+export function summarizeRoutingInsights(history: RequestHistoryEntry[]): {
+    opusGateBlocked: number;
+    intentHintCounts: Record<string, number>;
+} {
+    const opusGateBlocked = history.filter((r) =>
+        (r.opusGateDecision ?? "").startsWith("blocked:"),
+    ).length;
+    const intentHintCounts: Record<string, number> = {};
+    for (const r of history) {
+        for (const hint of r.intentHints ?? []) {
+            intentHintCounts[hint] = (intentHintCounts[hint] ?? 0) + 1;
+        }
+    }
+    return { opusGateBlocked, intentHintCounts };
+}
+
+export function toTelemetryRun(
+    r: RequestHistoryEntry,
+    baselineModel: string = "claude-opus-4-6",
+): Record<string, unknown> {
+    const baseline = isAutoRouted(r)
+        ? baselineModel
+        : r.originalModel;
+    const origCost = estimateCost(baseline, r.tokensIn, r.tokensOut);
+    const perRunSavings = Math.max(0, origCost - r.costUsd);
+    return {
+        id: r.id,
+        workflow_name: r.mode,
+        mode: r.mode,
+        status: r.success ? "success" : "error",
+        success: r.success,
+        started_at: r.timestamp,
+        timestamp: r.timestamp,
+        model: r.targetModel,
+        provider: r.provider,
+        routed_to: `${r.provider}/${r.targetModel}`,
+        original_model: r.originalModel,
+        routingSource: isAutoRouted(r) ? "auto" : "direct",
+        taskType: r.taskType || "general",
+        complexity: r.complexity || "simple",
+        costUsd: r.costUsd,
+        latencyMs: r.latencyMs,
+        tokensIn: r.tokensIn,
+        tokensOut: r.tokensOut,
+        savings: Math.round(perRunSavings * 10000) / 10000,
+        escalated: r.escalated,
+        routingReason: r.routingReason,
+        opusGateDecision: r.opusGateDecision,
+        intentHints: r.intentHints ?? [],
+    };
+}
+
+export function buildTelemetryStatsPayload(
+    recent: RequestHistoryEntry[],
+    baselineModel: string = "claude-opus-4-6",
+): Record<string, unknown> {
+    const modelMap = new Map<
+        string,
+        {
+            count: number;
+            cost: number;
+            autoCount: number;
+            directCount: number;
+            savings: number;
+        }
+    >();
+    for (const r of recent) {
+        const key = r.targetModel;
+        const cur = modelMap.get(key) || {
+            count: 0,
+            cost: 0,
+            autoCount: 0,
+            directCount: 0,
+            savings: 0,
+        };
+        cur.count++;
+        cur.cost += r.costUsd;
+        if (isAutoRouted(r)) {
+            cur.autoCount++;
+            const origCost = estimateCost(baselineModel, r.tokensIn, r.tokensOut);
+            cur.savings += Math.max(0, origCost - r.costUsd);
+        } else {
+            cur.directCount++;
+        }
+        modelMap.set(key, cur);
+    }
+
+    const dailyMap = new Map<string, { requests: number; cost: number }>();
+    for (const r of recent) {
+        const date = r.timestamp.slice(0, 10);
+        const cur = dailyMap.get(date) || { requests: 0, cost: 0 };
+        cur.requests++;
+        cur.cost += r.costUsd;
+        dailyMap.set(date, cur);
+    }
+
+    const totalCost = recent.reduce((s, r) => s + r.costUsd, 0);
+    const totalLatency = recent.reduce((s, r) => s + r.latencyMs, 0);
+    const routingInsights = summarizeRoutingInsights(recent);
+
+    return {
+        summary: {
+            totalCostUsd: totalCost,
+            totalEvents: recent.length,
+            avgLatencyMs: recent.length
+                ? Math.round(totalLatency / recent.length)
+                : 0,
+            successRate: recent.length
+                ? recent.filter((r) => r.success).length / recent.length
+                : 0,
+        },
+        routingInsights: {
+            opusGateBlocked: routingInsights.opusGateBlocked,
+            intentHintCounts: routingInsights.intentHintCounts,
+        },
+        byModel: Array.from(modelMap.entries()).map(([model, v]) => ({
+            model,
+            count: v.count,
+            costUsd: v.cost,
+            autoCount: v.autoCount,
+            directCount: v.directCount,
+            savings: Math.round(v.savings * 10000) / 10000,
+        })),
+        dailyCosts: Array.from(dailyMap.entries()).map(([date, v]) => ({
+            date,
+            costUsd: v.cost,
+            requests: v.requests,
+        })),
+    };
+}
+
 function extractResponseText(responseData: Record<string, unknown>): string {
     const openAiChoices = responseData["choices"] as
         | Array<Record<string, unknown>>
@@ -3426,6 +4115,45 @@ function getQualityModel(config: RelayPlaneProxyConfigFile): string {
     );
 }
 
+function getFallbackTargetsFromConfig(
+    config: RelayPlaneProxyConfigFile,
+    currentModel: string,
+): FallbackTarget[] {
+    const orderedNames: string[] = [];
+    const addModel = (name: unknown) => {
+        if (typeof name === "string" && name.trim()) {
+            orderedNames.push(name.trim());
+        }
+    };
+
+    for (const modelName of config.routing?.cascade?.models ?? []) {
+        addModel(modelName);
+    }
+    addModel(config.routing?.complexity?.simple);
+    addModel(config.routing?.complexity?.moderate);
+    addModel(config.routing?.complexity?.complex);
+
+    const resolved: FallbackTarget[] = [];
+    const seen = new Set<string>();
+    for (const modelName of orderedNames) {
+        const resolvedModel = resolveConfigModel(modelName);
+        if (!resolvedModel) continue;
+        const key = `${resolvedModel.provider}/${resolvedModel.model}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        resolved.push({
+            provider: resolvedModel.provider,
+            model: resolvedModel.model,
+        });
+    }
+
+    const currentIndex = resolved.findIndex(
+        (target) => target.model === currentModel,
+    );
+    if (currentIndex < 0) return [];
+    return resolved.slice(currentIndex + 1);
+}
+
 async function cascadeRequest(
     config: CascadeConfig,
     makeRequest: (model: string) => Promise<{
@@ -3595,6 +4323,19 @@ async function load(){
       return '<tr><td>'+fmtTime(r.started_at)+'</td><td>'+esc(r.model)+'</td><td class="col-rt"><span class="badge rt-'+src+'" title="'+srcTip+'">'+src+'</span></td><td class="col-tt"><span class="badge '+ttCls(r.taskType)+'">'+esc((r.taskType||'general').replace(/_/g,' '))+'</span></td><td class="col-cx"><span class="badge '+cxCls(r.complexity)+'">'+esc(r.complexity||'simple')+'</span></td><td>'+(r.tokensIn||0)+'</td><td>'+(r.tokensOut||0)+'</td><td>$'+fmt(r.costUsd,4)+'</td><td>'+r.latencyMs+'ms</td><td><span class="badge '+(r.status==='success'?'ok':'err')+'">'+esc(r.status)+'</span></td></tr>';
     }).join('')||'<tr><td colspan=10 style="color:#64748b">No runs yet</td></tr>';
     const alerts=[];
+    const fallbackSummary = provH.fallbacks || {};
+    const fallbackRecent = Array.isArray(fallbackSummary.recent) ? fallbackSummary.recent : [];
+    if ((fallbackSummary.exhaustedLastHour || 0) > 0) {
+      alerts.push('<div class="alert alert-high"><span class="alert-icon">!!</span><div><div><b>'+(fallbackSummary.exhaustedLastHour||0)+'</b> fallback chain(s) exhausted in the last hour</div><div class="alert-detail">Requests failed even after rerouting to stronger models.</div></div></div>');
+    } else if ((fallbackSummary.totalLastHour || 0) > 0) {
+      alerts.push('<div class="alert alert-info"><span class="alert-icon">i</span><div><div>Fallback rerouting active: <b>'+(fallbackSummary.totalLastHour||0)+'</b> events in the last hour</div><div class="alert-detail"><b>'+(fallbackSummary.recoveredLastHour||0)+'</b> recovered after upgrading to stronger models.</div></div></div>');
+    }
+    fallbackRecent.slice(0,3).forEach(f=>{
+      const sev=f.outcome==='exhausted'?'high':(f.outcome==='recovered'?'info':'medium');
+      const outcome=f.outcome==='recovered'?'Recovered':'Rerouted';
+      const detail=''+esc(f.fromProvider)+'/'+esc(f.fromModel)+' → '+esc(f.toProvider)+'/'+esc(f.toModel)+' · '+esc(f.reason||'request failed');
+      alerts.push('<div class="alert alert-'+sev+'"><span class="alert-icon">'+(sev==='high'?'!!':sev==='medium'?'!':'i')+'</span><div><div>'+outcome+' request by upgrading model</div><div class="alert-detail">'+detail+'</div></div></div>');
+    });
     (ovr.overrides||[]).forEach(o=>{
       const icon=o.severity==='high'?'!!':o.severity==='medium'?'!':'i';
       const pct=sav.total>0?Math.round(o.savingsLost/sav.total*100):0;
@@ -4016,90 +4757,16 @@ export async function startProxy(
                 : "";
             const params = new URLSearchParams(queryString);
 
+            const BASELINE_MODEL =
+                proxyConfig.telemetry?.baselineModel ?? "claude-opus-4-6";
+
             if (req.method === "GET" && telemetryPath === "stats") {
                 const days = parseInt(params.get("days") || "7", 10);
                 const cutoff = Date.now() - days * 86400000;
                 const recent = requestHistory.filter(
                     (r) => new Date(r.timestamp).getTime() >= cutoff,
                 );
-
-                // Model breakdown with auto vs direct split
-                const modelMap = new Map<
-                    string,
-                    {
-                        count: number;
-                        cost: number;
-                        autoCount: number;
-                        directCount: number;
-                    }
-                >();
-                for (const r of recent) {
-                    const key = r.targetModel;
-                    const cur = modelMap.get(key) || {
-                        count: 0,
-                        cost: 0,
-                        autoCount: 0,
-                        directCount: 0,
-                    };
-                    cur.count++;
-                    cur.cost += r.costUsd;
-                    if (isAutoRouted(r)) {
-                        cur.autoCount++;
-                    } else {
-                        cur.directCount++;
-                    }
-                    modelMap.set(key, cur);
-                }
-
-                // Daily stats
-                const dailyMap = new Map<
-                    string,
-                    { requests: number; cost: number }
-                >();
-                for (const r of recent) {
-                    const date = r.timestamp.slice(0, 10);
-                    const cur = dailyMap.get(date) || { requests: 0, cost: 0 };
-                    cur.requests++;
-                    cur.cost += r.costUsd;
-                    dailyMap.set(date, cur);
-                }
-
-                const totalCost = recent.reduce((s, r) => s + r.costUsd, 0);
-                const totalLatency = recent.reduce(
-                    (s, r) => s + r.latencyMs,
-                    0,
-                );
-
-                const result = {
-                    summary: {
-                        totalCostUsd: totalCost,
-                        totalEvents: recent.length,
-                        avgLatencyMs: recent.length
-                            ? Math.round(totalLatency / recent.length)
-                            : 0,
-                        successRate: recent.length
-                            ? recent.filter((r) => r.success).length /
-                              recent.length
-                            : 0,
-                    },
-                    byModel: Array.from(modelMap.entries()).map(
-                        ([model, v]) => ({
-                            model,
-                            count: v.count,
-                            costUsd: v.cost,
-                            autoCount: v.autoCount,
-                            directCount: v.directCount,
-                            savings: 0,
-                        }),
-                    ),
-                    dailyCosts: Array.from(dailyMap.entries()).map(
-                        ([date, v]) => ({
-                            date,
-                            costUsd: v.cost,
-                            requests: v.requests,
-                        }),
-                    ),
-                };
+                const result = buildTelemetryStatsPayload(recent, BASELINE_MODEL);
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify(result));
                 return;
@@ -4109,41 +4776,9 @@ export async function startProxy(
                 const limit = parseInt(params.get("limit") || "50", 10);
                 const offset = parseInt(params.get("offset") || "0", 10);
                 const sorted = [...requestHistory].reverse();
-                const runs = sorted.slice(offset, offset + limit).map((r) => {
-                    const baseline = isAutoRouted(r)
-                        ? "claude-opus-4-6"
-                        : r.originalModel;
-                    const origCost = estimateCost(
-                        baseline,
-                        r.tokensIn,
-                        r.tokensOut,
-                    );
-                    const perRunSavings = Math.max(0, origCost - r.costUsd);
-                    return {
-                        id: r.id,
-                        workflow_name: r.mode,
-                        mode: r.mode,
-                        status: r.success ? "success" : "error",
-                        success: r.success,
-                        started_at: r.timestamp,
-                        timestamp: r.timestamp,
-                        model: r.targetModel,
-                        provider: r.provider,
-                        routed_to: `${r.provider}/${r.targetModel}`,
-                        original_model: r.originalModel,
-                        routingSource: isAutoRouted(r)
-                            ? "auto"
-                            : "direct",
-                        taskType: r.taskType || "general",
-                        complexity: r.complexity || "simple",
-                        costUsd: r.costUsd,
-                        latencyMs: r.latencyMs,
-                        tokensIn: r.tokensIn,
-                        tokensOut: r.tokensOut,
-                        savings: Math.round(perRunSavings * 10000) / 10000,
-                        escalated: r.escalated,
-                    };
-                });
+                const runs = sorted
+                    .slice(offset, offset + limit)
+                    .map((r) => toTelemetryRun(r, BASELINE_MODEL));
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(
                     JSON.stringify({
@@ -4159,8 +4794,6 @@ export async function startProxy(
                 // For auto-routing aliases, the baseline is the model the user would
                 // have used without smart routing. Configurable via config.json
                 // telemetry.baselineModel; defaults to Opus for a conservative estimate.
-                const BASELINE_MODEL =
-                    proxyConfig.telemetry?.baselineModel ?? "claude-opus-4-6";
 
                 let totalOriginalCost = 0;
                 let totalActualCost = 0;
@@ -4361,8 +4994,28 @@ export async function startProxy(
                         lastChecked: new Date().toISOString(),
                     });
                 }
+                const recentFallbacks = fallbackEvents.filter(
+                    (event) =>
+                        new Date(event.timestamp).getTime() > recentWindow,
+                );
+                const recoveredCount = recentFallbacks.filter(
+                    (event) => event.outcome === "recovered",
+                ).length;
+                const exhaustedCount = recentFallbacks.filter(
+                    (event) => event.outcome === "exhausted",
+                ).length;
                 res.writeHead(200, { "Content-Type": "application/json" });
-                res.end(JSON.stringify({ providers }));
+                res.end(
+                    JSON.stringify({
+                        providers,
+                        fallbacks: {
+                            totalLastHour: recentFallbacks.length,
+                            recoveredLastHour: recoveredCount,
+                            exhaustedLastHour: exhaustedCount,
+                            recent: recentFallbacks.slice(-8).reverse(),
+                        },
+                    }),
+                );
                 return;
             }
 
@@ -4592,6 +5245,7 @@ export async function startProxy(
             let taskType: TaskType = "general";
             let confidence = 0;
             let complexity: Complexity = "simple";
+            let routingMeta: RoutingMetadata | undefined;
 
             // Always classify — needed for taskType display, telemetry, and routing decisions
             // even in passthrough mode we want accurate task type data
@@ -4609,14 +5263,24 @@ export async function startProxy(
                                 .map((b) => b.text ?? "")
                                 .join(" ")
                           : "";
-                complexity = classifyComplexity(
+                const routingAssessment = assessComplexityForRouting(
                     messages,
                     requestBody["tools"],
                     systemStr,
+                    proxyConfig,
                 );
+                complexity = routingAssessment.complexity;
+                routingMeta = routingAssessment.routingMeta;
                 log(
                     `Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`,
                 );
+                if (
+                    (routingMeta.opusGateDecision ?? "").startsWith("blocked:")
+                ) {
+                    log(
+                        `[opus gate] downgraded complex → moderate (${routingMeta.opusGateDecision})`,
+                    );
+                }
             }
 
             const cascadeConfig = getCascadeConfig(proxyConfig);
@@ -4809,8 +5473,24 @@ export async function startProxy(
                             ) {
                                 throw new CooldownError(resolved.provider);
                             }
-                            const attemptBody = stripThinkingIfUnsupported(
-                                { ...requestBody, model: resolved.model },
+                            let attemptBody = {
+                                ...requestBody,
+                                model: resolved.model,
+                            };
+                            attemptBody = stripEffortIfSimple(
+                                attemptBody,
+                                resolved.model,
+                                complexity,
+                                log,
+                            );
+                            attemptBody = stripThinkingIfUnsupported(
+                                attemptBody,
+                                resolved.model,
+                                complexity,
+                            );
+                            attemptBody = normalizeEffortForProvider(
+                                attemptBody,
+                                "anthropic",
                                 resolved.model,
                             );
                             // Hybrid auth: use MAX token for Opus models, API key for others
@@ -4828,6 +5508,7 @@ export async function startProxy(
                                     ctx,
                                     modelAuth.apiKey,
                                     modelAuth.isMax,
+                                    complexity,
                                 );
                             const responseData =
                                 (await providerResponse.json()) as Record<
@@ -4915,24 +5596,214 @@ export async function startProxy(
                             );
                         }
                     } else {
+                        let nativeBody = { ...requestBody, model: finalModel };
+                        nativeBody = stripEffortIfSimple(
+                            nativeBody,
+                            finalModel,
+                            complexity,
+                            log,
+                        );
+                        nativeBody = stripThinkingIfUnsupported(
+                            nativeBody,
+                            finalModel,
+                            complexity,
+                        );
+                        nativeBody = normalizeEffortForProvider(
+                            nativeBody,
+                            "anthropic",
+                            finalModel,
+                        );
                         providerResponse = await forwardNativeAnthropicRequest(
-                            stripThinkingIfUnsupported(
-                                { ...requestBody, model: finalModel },
-                                finalModel,
-                            ),
+                            nativeBody,
                             ctx,
                             modelAuth.apiKey,
                             modelAuth.isMax,
+                            complexity,
                         );
                     }
                     if (!providerResponse.ok) {
-                        const errorPayload =
+                        let errorPayload =
                             (await providerResponse.json()) as Record<
                                 string,
                                 unknown
                             >;
+                        let providerStatus = providerResponse.status;
+
+                        if (
+                            targetProvider === "anthropic" &&
+                            hasEffortControls(requestBody) &&
+                            isLowerTierModel(finalModel) &&
+                            isEffortUnsupportedError(
+                                providerStatus,
+                                errorPayload,
+                            )
+                        ) {
+                            const retryNativeBody = stripThinkingIfUnsupported(
+                                stripEffortParameter({
+                                    ...requestBody,
+                                    model: finalModel,
+                                }),
+                                finalModel,
+                                complexity,
+                            );
+                            log(
+                                `[effort retry] anthropic/${finalModel} rejected effort. Retrying same model without effort before escalation.`,
+                            );
+                            const retryResponse =
+                                await forwardNativeAnthropicRequest(
+                                    retryNativeBody,
+                                    ctx,
+                                    modelAuth.apiKey,
+                                    modelAuth.isMax,
+                                    complexity,
+                                );
+                            if (retryResponse.ok) {
+                                const durationMs = Date.now() - startTime;
+                                if (isStreaming) {
+                                    res.writeHead(retryResponse.status, {
+                                        "Content-Type": "text/event-stream",
+                                        "Cache-Control": "no-cache",
+                                        Connection: "keep-alive",
+                                    });
+                                    const reader = retryResponse.body?.getReader();
+                                    if (reader) {
+                                        const decoder = new TextDecoder();
+                                        while (true) {
+                                            const { done, value } =
+                                                await reader.read();
+                                            if (done) break;
+                                            res.write(
+                                                decoder.decode(value, {
+                                                    stream: true,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                    res.end();
+                                } else {
+                                    const retryData =
+                                        (await retryResponse.json()) as Record<
+                                            string,
+                                            unknown
+                                        >;
+                                    res.writeHead(retryResponse.status, {
+                                        "Content-Type": "application/json",
+                                    });
+                                    res.end(JSON.stringify(retryData));
+                                }
+                                logRequest(
+                                    originalModel ?? "unknown",
+                                    finalModel,
+                                    targetProvider,
+                                    durationMs,
+                                    true,
+                                    routingMode,
+                                    undefined,
+                                    taskType,
+                                    complexity,
+                                    routingMeta,
+                                );
+                                return;
+                            }
+                            providerResponse = retryResponse;
+                            providerStatus = retryResponse.status;
+                            errorPayload =
+                                (await retryResponse
+                                    .json()
+                                    .catch(() => ({}))) as Record<
+                                    string,
+                                    unknown
+                                >;
+                        }
+                        if (
+                            targetProvider === "anthropic" &&
+                            complexity === "simple" &&
+                            isLowerTierModel(finalModel) &&
+                            isThinkingContractError(
+                                providerStatus,
+                                errorPayload,
+                            )
+                        ) {
+                            const retryNativeBody = stripThinkingContractFields({
+                                ...requestBody,
+                                model: finalModel,
+                            });
+                            const retryCtx: RequestContext = {
+                                ...ctx,
+                                betaHeaders: undefined,
+                            };
+                            log(
+                                `[thinking retry] anthropic/${finalModel} rejected thinking contract. Retrying same model with thinking controls stripped before escalation.`,
+                            );
+                            const retryResponse =
+                                await forwardNativeAnthropicRequest(
+                                    retryNativeBody,
+                                    retryCtx,
+                                    modelAuth.apiKey,
+                                    modelAuth.isMax,
+                                    complexity,
+                                );
+                            if (retryResponse.ok) {
+                                const durationMs = Date.now() - startTime;
+                                if (isStreaming) {
+                                    res.writeHead(retryResponse.status, {
+                                        "Content-Type": "text/event-stream",
+                                        "Cache-Control": "no-cache",
+                                        Connection: "keep-alive",
+                                    });
+                                    const reader = retryResponse.body?.getReader();
+                                    if (reader) {
+                                        const decoder = new TextDecoder();
+                                        while (true) {
+                                            const { done, value } =
+                                                await reader.read();
+                                            if (done) break;
+                                            res.write(
+                                                decoder.decode(value, {
+                                                    stream: true,
+                                                }),
+                                            );
+                                        }
+                                    }
+                                    res.end();
+                                } else {
+                                    const retryData =
+                                        (await retryResponse.json()) as Record<
+                                            string,
+                                            unknown
+                                        >;
+                                    res.writeHead(retryResponse.status, {
+                                        "Content-Type": "application/json",
+                                    });
+                                    res.end(JSON.stringify(retryData));
+                                }
+                                logRequest(
+                                    originalModel ?? "unknown",
+                                    finalModel,
+                                    targetProvider,
+                                    durationMs,
+                                    true,
+                                    routingMode,
+                                    undefined,
+                                    taskType,
+                                    complexity,
+                                    routingMeta,
+                                );
+                                return;
+                            }
+                            providerResponse = retryResponse;
+                            providerStatus = retryResponse.status;
+                            errorPayload =
+                                (await retryResponse
+                                    .json()
+                                    .catch(() => ({}))) as Record<
+                                    string,
+                                    unknown
+                                >;
+                        }
+
                         log(
-                            `Anthropic error [${providerResponse.status}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`,
+                            `Anthropic error [${providerStatus}] for model=${targetModel || requestedModel}: ${JSON.stringify(errorPayload)}`,
                         );
 
                         // TODO: The long-context fallback below and the Sonnet fallback
@@ -4948,7 +5819,7 @@ export async function startProxy(
                             | Record<string, unknown>
                             | undefined;
                         const isLongContextError =
-                            providerResponse.status === 429 &&
+                            providerStatus === 429 &&
                             errorObj?.type === "rate_limit_error" &&
                             typeof errorObj?.message === "string" &&
                             (errorObj.message as string).includes(
@@ -4971,18 +5842,33 @@ export async function startProxy(
                                     proxyConfig.auth,
                                     useAnthropicEnvKey,
                                 );
+                                let fallbackBody = {
+                                    ...requestBody,
+                                    model: fallbackResolved.model,
+                                };
+                                fallbackBody = stripEffortIfSimple(
+                                    fallbackBody,
+                                    fallbackResolved.model,
+                                    complexity,
+                                    log,
+                                );
+                                fallbackBody = stripThinkingIfUnsupported(
+                                    fallbackBody,
+                                    fallbackResolved.model,
+                                    complexity,
+                                );
+                                fallbackBody = normalizeEffortForProvider(
+                                    fallbackBody,
+                                    "anthropic",
+                                    fallbackResolved.model,
+                                );
                                 const fallbackResponse =
                                     await forwardNativeAnthropicRequest(
-                                        stripThinkingIfUnsupported(
-                                            {
-                                                ...requestBody,
-                                                model: fallbackResolved.model,
-                                            },
-                                            fallbackResolved.model,
-                                        ),
+                                        fallbackBody,
                                         ctx,
                                         fallbackAuth.apiKey,
                                         fallbackAuth.isMax,
+                                        complexity,
                                     );
                                 if (fallbackResponse.ok) {
                                     targetModel = fallbackResolved.model;
@@ -5030,6 +5916,7 @@ export async function startProxy(
                                         undefined,
                                         taskType,
                                         complexity,
+                                        routingMeta,
                                     );
                                     return;
                                 } else {
@@ -5047,59 +5934,120 @@ export async function startProxy(
                             }
                         }
 
-                        // Sonnet fallback: when a non-passthrough routing decision
-                        // fails with a rate-limit or overload error, retry once
-                        // with claude-sonnet-4-6 before surfacing the error.
-                        const SONNET_FALLBACK_MODEL = "claude-sonnet-4-6";
-                        const isFallbackTriggerStatus = [
-                            429, 500, 503, 529,
-                        ].includes(providerResponse.status);
-                        const isAlreadySonnet =
-                            finalModel === SONNET_FALLBACK_MODEL;
-                        const isNonPassthrough = routingMode !== "passthrough";
-
-                        if (
-                            isFallbackTriggerStatus &&
-                            isNonPassthrough &&
-                            !isAlreadySonnet &&
-                            !isLongContextError
-                        ) {
-                            log(
-                                `[ALERT] Sonnet fallback: model ${finalModel} failed [${providerResponse.status}]. Retrying with ${SONNET_FALLBACK_MODEL}`,
-                            );
-                            const sonnetResolved = resolveExplicitModel(
-                                SONNET_FALLBACK_MODEL,
-                            );
-                            if (sonnetResolved?.provider === "anthropic") {
-                                const sonnetAuth = getAuthForModel(
-                                    sonnetResolved.model,
-                                    proxyConfig.auth,
-                                    useAnthropicEnvKey,
+                        const fallbackTargets = getFallbackTargetsFromConfig(
+                            proxyConfig,
+                            finalModel,
+                        );
+                        if (!isLongContextError && fallbackTargets.length > 0) {
+                            let previousProvider = targetProvider;
+                            let previousModel = finalModel;
+                            let recovered = false;
+                            for (let i = 0; i < fallbackTargets.length; i++) {
+                                const candidate = fallbackTargets[i]!;
+                                recordFallbackEvent({
+                                    timestamp: new Date().toISOString(),
+                                    fromProvider: previousProvider,
+                                    fromModel: previousModel,
+                                    toProvider: candidate.provider,
+                                    toModel: candidate.model,
+                                    mode: routingMode,
+                                    reason: `HTTP ${providerStatus}`,
+                                    outcome: "rerouted",
+                                });
+                                log(
+                                    `[FALLBACK] ${previousProvider}/${previousModel} failed [${providerStatus}] -> ${candidate.provider}/${candidate.model}`,
                                 );
-                                const sonnetResponse =
-                                    await forwardNativeAnthropicRequest(
-                                        stripThinkingIfUnsupported(
-                                            {
-                                                ...requestBody,
-                                                model: sonnetResolved.model,
-                                            },
-                                            sonnetResolved.model,
-                                        ),
-                                        ctx,
-                                        sonnetAuth.apiKey,
-                                        sonnetAuth.isMax,
+
+                                let retryResponse: Response | undefined;
+                                if (candidate.provider === "openai") {
+                                    const openaiApiKey =
+                                        process.env["OPENAI_API_KEY"];
+                                    if (!openaiApiKey) {
+                                        previousProvider = candidate.provider;
+                                        previousModel = candidate.model;
+                                        continue;
+                                    }
+                                    const openaiReq = convertNativeAnthropicToOpenAI(
+                                        {
+                                            ...requestBody,
+                                            model: candidate.model,
+                                        },
                                     );
-                                if (sonnetResponse.ok) {
-                                    targetModel = sonnetResolved.model;
+                                    openaiReq.stream = isStreaming;
+                                    retryResponse = isStreaming
+                                        ? await forwardToOpenAIStream(
+                                              openaiReq,
+                                              candidate.model,
+                                              openaiApiKey,
+                                          )
+                                        : await forwardToOpenAI(
+                                              openaiReq,
+                                              candidate.model,
+                                              openaiApiKey,
+                                          );
+                                } else if (candidate.provider === "anthropic") {
+                                    const candidateAuth = getAuthForModel(
+                                        candidate.model,
+                                        proxyConfig.auth,
+                                        useAnthropicEnvKey,
+                                    );
+                                    let retryBody = {
+                                        ...requestBody,
+                                        model: candidate.model,
+                                    };
+                                    retryBody = stripEffortIfSimple(
+                                        retryBody,
+                                        candidate.model,
+                                        complexity,
+                                        log,
+                                    );
+                                    retryBody = stripThinkingIfUnsupported(
+                                        retryBody,
+                                        candidate.model,
+                                        complexity,
+                                    );
+                                    retryBody = normalizeEffortForProvider(
+                                        retryBody,
+                                        "anthropic",
+                                        candidate.model,
+                                    );
+                                    retryResponse =
+                                        await forwardNativeAnthropicRequest(
+                                            retryBody,
+                                            ctx,
+                                            candidateAuth.apiKey,
+                                            candidateAuth.isMax,
+                                            complexity,
+                                        );
+                                } else {
+                                    previousProvider = candidate.provider;
+                                    previousModel = candidate.model;
+                                    continue;
+                                }
+
+                                if (retryResponse.ok) {
+                                    recovered = true;
+                                    targetProvider = candidate.provider;
+                                    targetModel = candidate.model;
+                                    recordFallbackEvent({
+                                        timestamp: new Date().toISOString(),
+                                        fromProvider: previousProvider,
+                                        fromModel: previousModel,
+                                        toProvider: candidate.provider,
+                                        toModel: candidate.model,
+                                        mode: routingMode,
+                                        reason: "fallback recovered request",
+                                        outcome: "recovered",
+                                    });
                                     const durationMs = Date.now() - startTime;
                                     if (isStreaming) {
-                                        res.writeHead(sonnetResponse.status, {
+                                        res.writeHead(retryResponse.status, {
                                             "Content-Type": "text/event-stream",
                                             "Cache-Control": "no-cache",
                                             Connection: "keep-alive",
                                         });
                                         const reader =
-                                            sonnetResponse.body?.getReader();
+                                            retryResponse.body?.getReader();
                                         if (reader) {
                                             const decoder = new TextDecoder();
                                             while (true) {
@@ -5114,16 +6062,31 @@ export async function startProxy(
                                             }
                                         }
                                         res.end();
-                                    } else {
-                                        const sonnetData =
-                                            (await sonnetResponse.json()) as Record<
+                                    } else if (candidate.provider === "openai") {
+                                        const openaiData =
+                                            (await retryResponse.json()) as Record<
                                                 string,
                                                 unknown
                                             >;
-                                        res.writeHead(sonnetResponse.status, {
+                                        const nativeData =
+                                            convertOpenAIResponseToAnthropic(
+                                                openaiData,
+                                                candidate.model,
+                                            );
+                                        res.writeHead(retryResponse.status, {
                                             "Content-Type": "application/json",
                                         });
-                                        res.end(JSON.stringify(sonnetData));
+                                        res.end(JSON.stringify(nativeData));
+                                    } else {
+                                        const nativeData =
+                                            (await retryResponse.json()) as Record<
+                                                string,
+                                                unknown
+                                            >;
+                                        res.writeHead(retryResponse.status, {
+                                            "Content-Type": "application/json",
+                                        });
+                                        res.end(JSON.stringify(nativeData));
                                     }
                                     logRequest(
                                         originalModel ?? "unknown",
@@ -5132,23 +6095,40 @@ export async function startProxy(
                                         durationMs,
                                         true,
                                         "passthrough",
-                                        undefined,
+                                        true,
                                         taskType,
                                         complexity,
+                                        routingMeta,
                                     );
                                     return;
-                                } else {
-                                    const sonnetErrPayload =
-                                        (await sonnetResponse
-                                            .json()
-                                            .catch(() => ({}))) as Record<
-                                            string,
-                                            unknown
-                                        >;
-                                    log(
-                                        `[ALERT] Sonnet fallback also failed [${sonnetResponse.status}]: ${JSON.stringify(sonnetErrPayload)}`,
-                                    );
                                 }
+
+                                const retryErrPayload = (await retryResponse
+                                    .json()
+                                    .catch(() => ({}))) as Record<
+                                    string,
+                                    unknown
+                                >;
+                                log(
+                                    `[FALLBACK] ${candidate.provider}/${candidate.model} failed [${retryResponse.status}]: ${JSON.stringify(retryErrPayload)}`,
+                                );
+                                previousProvider = candidate.provider;
+                                previousModel = candidate.model;
+                                if (i === fallbackTargets.length - 1) {
+                                    recordFallbackEvent({
+                                        timestamp: new Date().toISOString(),
+                                        fromProvider: candidate.provider,
+                                        fromModel: candidate.model,
+                                        toProvider: candidate.provider,
+                                        toModel: candidate.model,
+                                        mode: routingMode,
+                                        reason: `HTTP ${retryResponse.status}`,
+                                        outcome: "exhausted",
+                                    });
+                                }
+                            }
+                            if (recovered) {
+                                return;
                             }
                         }
 
@@ -5169,6 +6149,7 @@ export async function startProxy(
                             undefined,
                             taskType,
                             complexity,
+                            routingMeta,
                         );
                         res.writeHead(providerResponse.status, {
                             "Content-Type": "application/json",
@@ -5297,6 +6278,7 @@ export async function startProxy(
                     useCascade && cascadeConfig ? undefined : false,
                     taskType,
                     complexity,
+                    routingMeta,
                 );
 
                 // Always extract and persist token counts — this is what the telemetry endpoints read
@@ -5352,6 +6334,7 @@ export async function startProxy(
                     undefined,
                     taskType,
                     complexity,
+                    routingMeta,
                 );
                 if (err instanceof ProviderResponseError) {
                     res.writeHead(err.status, {
@@ -5537,6 +6520,7 @@ export async function startProxy(
         let taskType: TaskType = "general";
         let confidence = 0;
         let complexity: Complexity = "simple";
+        let routingMeta: RoutingMetadata | undefined;
 
         // Always classify — taskType is needed for display, routing decisions, and telemetry
         if (request.messages && request.messages.length > 0) {
@@ -5550,14 +6534,22 @@ export async function startProxy(
                 typeof systemMsg?.content === "string"
                     ? systemMsg.content
                     : "";
-            complexity = classifyComplexity(
+            const routingAssessment = assessComplexityForRouting(
                 request.messages,
                 request.tools,
                 systemStr,
+                proxyConfig,
             );
+            complexity = routingAssessment.complexity;
+            routingMeta = routingAssessment.routingMeta;
             log(
                 `Inferred task: ${taskType} (confidence: ${confidence.toFixed(2)})`,
             );
+            if ((routingMeta.opusGateDecision ?? "").startsWith("blocked:")) {
+                log(
+                    `[opus gate] downgraded complex → moderate (${routingMeta.opusGateDecision})`,
+                );
+            }
         }
 
         const cascadeConfig = getCascadeConfig(proxyConfig);
@@ -5759,6 +6751,9 @@ export async function startProxy(
         }
 
         const startTime = Date.now();
+        const fallbackTargets = !useCascade
+            ? getFallbackTargetsFromConfig(proxyConfig, targetModel)
+            : [];
 
         // Handle streaming vs non-streaming
         if (isStreaming) {
@@ -5779,7 +6774,10 @@ export async function startProxy(
                 log,
                 cooldownManager,
                 cooldownsEnabled,
+                fallbackTargets,
+                useAnthropicEnvKey,
                 complexity,
+                routingMeta,
             );
         } else {
             if (useCascade && cascadeConfig) {
@@ -5858,6 +6856,7 @@ export async function startProxy(
                         cascadeResult.escalations > 0,
                         taskType,
                         complexity,
+                        routingMeta,
                     );
                     const cascadeUsage = (responseData as any)?.usage;
                     const cascadeTokensIn =
@@ -5927,6 +6926,7 @@ export async function startProxy(
                         undefined,
                         taskType,
                         complexity,
+                        routingMeta,
                     );
                     if (err instanceof ProviderResponseError) {
                         res.writeHead(err.status, {
@@ -5962,7 +6962,10 @@ export async function startProxy(
                     log,
                     cooldownManager,
                     cooldownsEnabled,
+                    fallbackTargets,
+                    useAnthropicEnvKey,
                     complexity,
+                    routingMeta,
                 );
             }
         }
@@ -6009,11 +7012,16 @@ async function executeNonStreamingProviderRequest(
 }> {
     let providerResponse: Response;
     let responseData: Record<string, unknown>;
+    const normalizedRequest = normalizeEffortForProvider(
+        request as Record<string, unknown>,
+        targetProvider,
+        targetModel,
+    ) as ChatRequest;
 
     switch (targetProvider) {
         case "anthropic": {
             providerResponse = await forwardToAnthropic(
-                request,
+                normalizedRequest,
                 targetModel,
                 ctx,
                 apiKey,
@@ -6032,7 +7040,7 @@ async function executeNonStreamingProviderRequest(
         }
         case "google": {
             providerResponse = await forwardToGemini(
-                request,
+                normalizedRequest,
                 targetModel,
                 apiKey!,
             );
@@ -6049,7 +7057,7 @@ async function executeNonStreamingProviderRequest(
         }
         case "xai": {
             providerResponse = await forwardToXAI(
-                request,
+                normalizedRequest,
                 targetModel,
                 apiKey!,
             );
@@ -6070,7 +7078,7 @@ async function executeNonStreamingProviderRequest(
         case "deepseek":
         case "groq": {
             providerResponse = await forwardToOpenAICompatible(
-                request,
+                normalizedRequest,
                 targetModel,
                 apiKey!,
             );
@@ -6089,7 +7097,7 @@ async function executeNonStreamingProviderRequest(
         }
         default: {
             providerResponse = await forwardToOpenAI(
-                request,
+                normalizedRequest,
                 targetModel,
                 apiKey!,
             );
@@ -6115,7 +7123,7 @@ async function handleStreamingRequest(
     request: ChatRequest,
     targetProvider: Provider,
     targetModel: string,
-    apiKey: string | undefined,
+    _apiKey: string | undefined,
     ctx: RequestContext,
     relay: RelayPlane,
     promptText: string,
@@ -6127,97 +7135,338 @@ async function handleStreamingRequest(
     log: (msg: string) => void,
     cooldownManager: CooldownManager,
     cooldownsEnabled: boolean,
+    fallbackTargets: FallbackTarget[],
+    anthropicEnvKey: string | undefined,
     complexity: Complexity = "simple",
+    routingMeta?: RoutingMetadata,
 ): Promise<void> {
-    let providerResponse: Response;
-
-    try {
-        switch (targetProvider) {
+    let providerResponse: Response | undefined;
+    const executeStreamingAttempt = async (
+        attempt: FallbackTarget,
+        attemptRequest: ChatRequest,
+        apiKey: string | undefined,
+        attemptCtx?: RequestContext,
+    ): Promise<Response> => {
+        const normalizedAttempt = normalizeEffortForProvider(
+            attemptRequest as Record<string, unknown>,
+            attempt.provider,
+            attempt.model,
+        ) as ChatRequest;
+        switch (attempt.provider) {
             case "anthropic":
-                // Use auth passthrough for Anthropic
-                providerResponse = await forwardToAnthropicStream(
-                    request,
-                    targetModel,
-                    ctx,
+                return forwardToAnthropicStream(
+                    normalizedAttempt,
+                    attempt.model,
+                    attemptCtx ?? ctx,
                     apiKey,
                 );
-                break;
             case "google":
-                providerResponse = await forwardToGeminiStream(
-                    request,
-                    targetModel,
+                return forwardToGeminiStream(
+                    normalizedAttempt,
+                    attempt.model,
                     apiKey!,
                 );
-                break;
             case "xai":
-                providerResponse = await forwardToXAIStream(
-                    request,
-                    targetModel,
+                return forwardToXAIStream(
+                    normalizedAttempt,
+                    attempt.model,
                     apiKey!,
                 );
-                break;
             case "openrouter":
             case "deepseek":
             case "groq":
-                providerResponse = await forwardToOpenAICompatibleStream(
-                    request,
-                    targetModel,
+                return forwardToOpenAICompatibleStream(
+                    normalizedAttempt,
+                    attempt.model,
                     apiKey!,
                 );
-                break;
             default:
-                providerResponse = await forwardToOpenAIStream(
-                    request,
-                    targetModel,
+                return forwardToOpenAIStream(
+                    normalizedAttempt,
+                    attempt.model,
                     apiKey!,
                 );
+        }
+    };
+    const attempts: FallbackTarget[] = [
+        { provider: targetProvider, model: targetModel },
+        ...fallbackTargets,
+    ];
+    let lastFailureStatus = 500;
+    let lastFailureData: Record<string, unknown> = {
+        error: "Fallback chain exhausted",
+    };
+    let activeProvider = targetProvider;
+    let activeModel = targetModel;
+
+    for (let i = 0; i < attempts.length; i++) {
+        const attempt = attempts[i]!;
+        const isLast = i === attempts.length - 1;
+        activeProvider = attempt.provider;
+        activeModel = attempt.model;
+        if (cooldownsEnabled && !cooldownManager.isAvailable(attempt.provider)) {
+            lastFailureStatus = 503;
+            lastFailureData = {
+                error: `Provider ${attempt.provider} is temporarily cooled down`,
+            };
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: "provider cooldown",
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} unavailable (cooldown) -> ${next.provider}/${next.model}`,
+                );
+                continue;
+            }
+            break;
         }
 
-        if (!providerResponse.ok) {
-            const errorData = await providerResponse.json();
-            if (cooldownsEnabled) {
-                cooldownManager.recordFailure(
-                    targetProvider,
-                    JSON.stringify(errorData),
+        const apiKeyResult = resolveProviderApiKey(
+            attempt.provider,
+            ctx,
+            anthropicEnvKey,
+        );
+        if (apiKeyResult.error) {
+            lastFailureStatus = apiKeyResult.error.status;
+            lastFailureData = apiKeyResult.error.payload;
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: "provider authentication/configuration error",
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} auth/config failed -> ${next.provider}/${next.model}`,
                 );
+                continue;
             }
-            const durationMs = Date.now() - startTime;
-            logRequest(
-                request.model ?? "unknown",
-                targetModel,
-                targetProvider,
-                durationMs,
-                false,
-                routingMode,
-                undefined,
-                taskType,
-                complexity,
+            break;
+        }
+
+        try {
+            let requestForAttempt = request;
+            providerResponse = await executeStreamingAttempt(
+                attempt,
+                requestForAttempt,
+                apiKeyResult.apiKey,
+                ctx,
             );
-            res.writeHead(providerResponse.status, {
-                "Content-Type": "application/json",
-            });
-            res.end(JSON.stringify(errorData));
-            return;
+
+            if (!providerResponse.ok) {
+                let errorData = (await providerResponse.json()) as Record<
+                    string,
+                    unknown
+                >;
+                let errorStatus = providerResponse.status;
+
+                if (
+                    hasEffortControls(
+                        requestForAttempt as Record<string, unknown>,
+                    ) &&
+                    isLowerTierModel(attempt.model) &&
+                    isEffortUnsupportedError(errorStatus, errorData)
+                ) {
+                    const retryRequest = normalizeEffortForProvider(
+                        requestForAttempt as Record<string, unknown>,
+                        attempt.provider,
+                        attempt.model,
+                    ) as ChatRequest;
+                    if (retryRequest !== requestForAttempt) {
+                        log(
+                            `[effort retry] ${attempt.provider}/${attempt.model} rejected effort. Retrying same model without effort before escalation.`,
+                        );
+                        requestForAttempt = retryRequest;
+                        const retryResponse = await executeStreamingAttempt(
+                            attempt,
+                            requestForAttempt,
+                            apiKeyResult.apiKey,
+                            ctx,
+                        );
+                        if (retryResponse.ok) {
+                            providerResponse = retryResponse;
+                            if (i > 0) {
+                                recordFallbackEvent({
+                                    timestamp: new Date().toISOString(),
+                                    fromProvider: attempts[i - 1]!.provider,
+                                    fromModel: attempts[i - 1]!.model,
+                                    toProvider: attempt.provider,
+                                    toModel: attempt.model,
+                                    mode: routingMode,
+                                    reason: "fallback recovered request",
+                                    outcome: "recovered",
+                                });
+                            }
+                            targetProvider = attempt.provider;
+                            targetModel = attempt.model;
+                            break;
+                        }
+                        providerResponse = retryResponse;
+                        errorData = (await retryResponse.json()) as Record<
+                            string,
+                            unknown
+                        >;
+                        errorStatus = retryResponse.status;
+                    }
+                }
+                if (
+                    !providerResponse.ok &&
+                    attempt.provider === "anthropic" &&
+                    complexity === "simple" &&
+                    isLowerTierModel(attempt.model) &&
+                    isThinkingContractError(errorStatus, errorData)
+                ) {
+                    log(
+                        `[thinking retry] ${attempt.provider}/${attempt.model} rejected thinking contract. Retrying same model with thinking controls stripped before escalation.`,
+                    );
+                    requestForAttempt = stripThinkingContractFields(
+                        requestForAttempt as Record<string, unknown>,
+                    ) as ChatRequest;
+                    const retryResponse = await executeStreamingAttempt(
+                        attempt,
+                        requestForAttempt,
+                        apiKeyResult.apiKey,
+                        { ...ctx, betaHeaders: undefined },
+                    );
+                    if (retryResponse.ok) {
+                        providerResponse = retryResponse;
+                        if (i > 0) {
+                            recordFallbackEvent({
+                                timestamp: new Date().toISOString(),
+                                fromProvider: attempts[i - 1]!.provider,
+                                fromModel: attempts[i - 1]!.model,
+                                toProvider: attempt.provider,
+                                toModel: attempt.model,
+                                mode: routingMode,
+                                reason: "fallback recovered request",
+                                outcome: "recovered",
+                            });
+                        }
+                        targetProvider = attempt.provider;
+                        targetModel = attempt.model;
+                        break;
+                    }
+                    providerResponse = retryResponse;
+                    errorData = (await retryResponse
+                        .json()
+                        .catch(() => ({}))) as Record<string, unknown>;
+                    errorStatus = retryResponse.status;
+                }
+
+                lastFailureStatus = errorStatus;
+                lastFailureData = errorData;
+                if (cooldownsEnabled) {
+                    cooldownManager.recordFailure(
+                        attempt.provider,
+                        JSON.stringify(errorData),
+                    );
+                }
+                if (!isLast) {
+                    const next = attempts[i + 1]!;
+                    recordFallbackEvent({
+                        timestamp: new Date().toISOString(),
+                        fromProvider: attempt.provider,
+                        fromModel: attempt.model,
+                        toProvider: next.provider,
+                        toModel: next.model,
+                        mode: routingMode,
+                        reason: `HTTP ${errorStatus}`,
+                        outcome: "rerouted",
+                    });
+                    log(
+                        `[FALLBACK] ${attempt.provider}/${attempt.model} failed [${errorStatus}] -> ${next.provider}/${next.model}`,
+                    );
+                    continue;
+                }
+            } else {
+                if (i > 0) {
+                    recordFallbackEvent({
+                        timestamp: new Date().toISOString(),
+                        fromProvider: attempts[i - 1]!.provider,
+                        fromModel: attempts[i - 1]!.model,
+                        toProvider: attempt.provider,
+                        toModel: attempt.model,
+                        mode: routingMode,
+                        reason: "fallback recovered request",
+                        outcome: "recovered",
+                    });
+                }
+                targetProvider = attempt.provider;
+                targetModel = attempt.model;
+                break;
+            }
+        } catch (err) {
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            lastFailureStatus = 500;
+            lastFailureData = { error: `Provider error: ${errorMsg}` };
+            if (cooldownsEnabled) {
+                cooldownManager.recordFailure(attempt.provider, errorMsg);
+            }
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: errorMsg,
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} threw error -> ${next.provider}/${next.model}: ${errorMsg}`,
+                );
+                continue;
+            }
         }
-    } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        if (cooldownsEnabled) {
-            cooldownManager.recordFailure(targetProvider, errorMsg);
-        }
+        break;
+    }
+
+    if (!providerResponse || !providerResponse.ok) {
+        recordFallbackEvent({
+            timestamp: new Date().toISOString(),
+            fromProvider: activeProvider,
+            fromModel: activeModel,
+            toProvider: activeProvider,
+            toModel: activeModel,
+            mode: routingMode,
+            reason:
+                typeof lastFailureData["error"] === "string"
+                    ? (lastFailureData["error"] as string)
+                    : `HTTP ${lastFailureStatus}`,
+            outcome: "exhausted",
+        });
         const durationMs = Date.now() - startTime;
         logRequest(
             request.model ?? "unknown",
-            targetModel,
-            targetProvider,
+            activeModel,
+            activeProvider,
             durationMs,
             false,
             routingMode,
-            undefined,
+            fallbackTargets.length > 0,
             taskType,
             complexity,
+            routingMeta,
         );
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
+        res.writeHead(lastFailureStatus, {
+            "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify(lastFailureData));
         return;
     }
 
@@ -6344,6 +7593,7 @@ async function handleStreamingRequest(
         undefined,
         taskType,
         complexity,
+        routingMeta,
     );
     // Update token/cost info on the history entry
     const streamCost = estimateCost(
@@ -6392,7 +7642,7 @@ async function handleNonStreamingRequest(
     request: ChatRequest,
     targetProvider: Provider,
     targetModel: string,
-    apiKey: string | undefined,
+    _apiKey: string | undefined,
     ctx: RequestContext,
     relay: RelayPlane,
     promptText: string,
@@ -6404,63 +7654,245 @@ async function handleNonStreamingRequest(
     log: (msg: string) => void,
     cooldownManager: CooldownManager,
     cooldownsEnabled: boolean,
+    fallbackTargets: FallbackTarget[],
+    anthropicEnvKey: string | undefined,
     complexity: Complexity = "simple",
+    routingMeta?: RoutingMetadata,
 ): Promise<void> {
-    let responseData: Record<string, unknown>;
+    let responseData: Record<string, unknown> | undefined;
+    const attempts: FallbackTarget[] = [
+        { provider: targetProvider, model: targetModel },
+        ...fallbackTargets,
+    ];
+    let lastFailureStatus = 500;
+    let lastFailureData: Record<string, unknown> = {
+        error: "Fallback chain exhausted",
+    };
+    let activeProvider = targetProvider;
+    let activeModel = targetModel;
+    let succeeded = false;
 
-    try {
-        const result = await executeNonStreamingProviderRequest(
-            request,
-            targetProvider,
-            targetModel,
-            apiKey,
+    for (let i = 0; i < attempts.length; i++) {
+        const attempt = attempts[i]!;
+        const isLast = i === attempts.length - 1;
+        activeProvider = attempt.provider;
+        activeModel = attempt.model;
+
+        if (cooldownsEnabled && !cooldownManager.isAvailable(attempt.provider)) {
+            lastFailureStatus = 503;
+            lastFailureData = {
+                error: `Provider ${attempt.provider} is temporarily cooled down`,
+            };
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: "provider cooldown",
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} unavailable (cooldown) -> ${next.provider}/${next.model}`,
+                );
+                continue;
+            }
+            break;
+        }
+
+        const apiKeyResult = resolveProviderApiKey(
+            attempt.provider,
             ctx,
+            anthropicEnvKey,
         );
-        responseData = result.responseData;
-        if (!result.ok) {
-            if (cooldownsEnabled) {
-                cooldownManager.recordFailure(
-                    targetProvider,
-                    JSON.stringify(responseData),
+        if (apiKeyResult.error) {
+            lastFailureStatus = apiKeyResult.error.status;
+            lastFailureData = apiKeyResult.error.payload;
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: "provider authentication/configuration error",
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} auth/config failed -> ${next.provider}/${next.model}`,
+                );
+                continue;
+            }
+            break;
+        }
+
+        try {
+            let requestForAttempt = request;
+            let result = await executeNonStreamingProviderRequest(
+                requestForAttempt,
+                attempt.provider,
+                attempt.model,
+                apiKeyResult.apiKey,
+                ctx,
+            );
+
+            if (
+                !result.ok &&
+                hasEffortControls(requestForAttempt as Record<string, unknown>) &&
+                isLowerTierModel(attempt.model) &&
+                isEffortUnsupportedError(result.status, result.responseData)
+            ) {
+                const retryRequest = normalizeEffortForProvider(
+                    requestForAttempt as Record<string, unknown>,
+                    attempt.provider,
+                    attempt.model,
+                ) as ChatRequest;
+                if (retryRequest !== requestForAttempt) {
+                    log(
+                        `[effort retry] ${attempt.provider}/${attempt.model} rejected effort. Retrying same model without effort before escalation.`,
+                    );
+                    requestForAttempt = retryRequest;
+                    result = await executeNonStreamingProviderRequest(
+                        requestForAttempt,
+                        attempt.provider,
+                        attempt.model,
+                        apiKeyResult.apiKey,
+                        ctx,
+                    );
+                }
+            }
+            if (
+                !result.ok &&
+                attempt.provider === "anthropic" &&
+                complexity === "simple" &&
+                isLowerTierModel(attempt.model) &&
+                isThinkingContractError(result.status, result.responseData)
+            ) {
+                log(
+                    `[thinking retry] ${attempt.provider}/${attempt.model} rejected thinking contract. Retrying same model with thinking controls stripped before escalation.`,
+                );
+                requestForAttempt = stripThinkingContractFields(
+                    requestForAttempt as Record<string, unknown>,
+                ) as ChatRequest;
+                result = await executeNonStreamingProviderRequest(
+                    requestForAttempt,
+                    attempt.provider,
+                    attempt.model,
+                    apiKeyResult.apiKey,
+                    { ...ctx, betaHeaders: undefined },
                 );
             }
-            const durationMs = Date.now() - startTime;
-            logRequest(
-                request.model ?? "unknown",
-                targetModel,
-                targetProvider,
-                durationMs,
-                false,
-                routingMode,
-                undefined,
-                taskType,
-                complexity,
-            );
-            res.writeHead(result.status, {
-                "Content-Type": "application/json",
-            });
-            res.end(JSON.stringify(responseData));
-            return;
+
+            if (!result.ok) {
+                responseData = result.responseData;
+                lastFailureStatus = result.status;
+                lastFailureData = result.responseData;
+                if (cooldownsEnabled) {
+                    cooldownManager.recordFailure(
+                        attempt.provider,
+                        JSON.stringify(result.responseData),
+                    );
+                }
+                if (!isLast) {
+                    const next = attempts[i + 1]!;
+                    recordFallbackEvent({
+                        timestamp: new Date().toISOString(),
+                        fromProvider: attempt.provider,
+                        fromModel: attempt.model,
+                        toProvider: next.provider,
+                        toModel: next.model,
+                        mode: routingMode,
+                        reason: `HTTP ${result.status}`,
+                        outcome: "rerouted",
+                    });
+                    log(
+                        `[FALLBACK] ${attempt.provider}/${attempt.model} failed [${result.status}] -> ${next.provider}/${next.model}`,
+                    );
+                    continue;
+                }
+            } else {
+                responseData = result.responseData;
+                targetProvider = attempt.provider;
+                targetModel = attempt.model;
+                if (i > 0) {
+                    recordFallbackEvent({
+                        timestamp: new Date().toISOString(),
+                        fromProvider: attempts[i - 1]!.provider,
+                        fromModel: attempts[i - 1]!.model,
+                        toProvider: attempt.provider,
+                        toModel: attempt.model,
+                        mode: routingMode,
+                        reason: "fallback recovered request",
+                        outcome: "recovered",
+                    });
+                }
+                succeeded = true;
+                break;
+            }
+        } catch (err) {
+            const errorMsg = err instanceof Error ? err.message : String(err);
+            lastFailureStatus = 500;
+            lastFailureData = { error: `Provider error: ${errorMsg}` };
+            if (cooldownsEnabled) {
+                cooldownManager.recordFailure(attempt.provider, errorMsg);
+            }
+            if (!isLast) {
+                const next = attempts[i + 1]!;
+                recordFallbackEvent({
+                    timestamp: new Date().toISOString(),
+                    fromProvider: attempt.provider,
+                    fromModel: attempt.model,
+                    toProvider: next.provider,
+                    toModel: next.model,
+                    mode: routingMode,
+                    reason: errorMsg,
+                    outcome: "rerouted",
+                });
+                log(
+                    `[FALLBACK] ${attempt.provider}/${attempt.model} threw error -> ${next.provider}/${next.model}: ${errorMsg}`,
+                );
+                continue;
+            }
         }
-    } catch (err) {
-        const errorMsg = err instanceof Error ? err.message : String(err);
-        if (cooldownsEnabled) {
-            cooldownManager.recordFailure(targetProvider, errorMsg);
-        }
+        break;
+    }
+
+    if (!succeeded || !responseData) {
+        recordFallbackEvent({
+            timestamp: new Date().toISOString(),
+            fromProvider: activeProvider,
+            fromModel: activeModel,
+            toProvider: activeProvider,
+            toModel: activeModel,
+            mode: routingMode,
+            reason:
+                typeof lastFailureData["error"] === "string"
+                    ? (lastFailureData["error"] as string)
+                    : `HTTP ${lastFailureStatus}`,
+            outcome: "exhausted",
+        });
         const durationMs = Date.now() - startTime;
         logRequest(
             request.model ?? "unknown",
-            targetModel,
-            targetProvider,
+            activeModel,
+            activeProvider,
             durationMs,
             false,
             routingMode,
-            undefined,
+            fallbackTargets.length > 0,
             taskType,
             complexity,
+            routingMeta,
         );
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: `Provider error: ${errorMsg}` }));
+        res.writeHead(lastFailureStatus, {
+            "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify(lastFailureData));
         return;
     }
 
@@ -6481,6 +7913,7 @@ async function handleNonStreamingRequest(
         undefined,
         taskType,
         complexity,
+        routingMeta,
     );
     // Update token/cost info
     const usage = (responseData as any)?.usage;

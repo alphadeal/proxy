@@ -13,6 +13,22 @@
  */
 
 export type Complexity = "simple" | "moderate" | "complex";
+export type IntentHint =
+    | "git_ops"
+    | "housekeeping"
+    | "small_refactor"
+    | "architecture"
+    | "multi_step"
+    | "large_context"
+    | "cross_file_refactor";
+
+export interface ComplexityAssessment {
+    complexity: Complexity;
+    score: number;
+    currentTokens: number;
+    signals: string[];
+    intentHints: IntentHint[];
+}
 
 export function isContentBlockArray(
     v: unknown,
@@ -78,12 +94,22 @@ export function classifyComplexity(
     bodyTools?: unknown,
     system?: string,
 ): Complexity {
+    return classifyComplexityWithDetails(messages, bodyTools, system).complexity;
+}
+
+export function classifyComplexityWithDetails(
+    messages: Array<{ content?: unknown; role?: string }>,
+    bodyTools?: unknown,
+    system?: string,
+): ComplexityAssessment {
     // Score the CURRENT turn, not the accumulated history.
     // This prevents long sessions from always routing to Opus.
     const currentText = findLastUserText(messages).toLowerCase();
     const currentTokens = Math.ceil(currentText.length / 4);
 
     let score = 0;
+    const signals: string[] = [];
+    const intentHints = new Set<IntentHint>();
 
     // --- Current-turn signals (what is the user asking NOW?) ---
 
@@ -94,33 +120,92 @@ export function classifyComplexity(
     if (
         /```/.test(currentText) ||
         /function |class |const |import /.test(currentText)
-    )
+    ) {
         score += 2;
+        signals.push("code_pattern");
+    }
 
     // Analytical keywords
-    if (/analyze|compare|evaluate|assess|review|audit/.test(currentText))
+    if (/analyze|compare|evaluate|assess|review|audit/.test(currentText)) {
         score += 1;
+        signals.push("analysis_keyword");
+    }
 
     // Computation keywords
-    if (/calculate|compute|solve|equation|prove|derive/.test(currentText))
+    if (/calculate|compute|solve|equation|prove|derive/.test(currentText)) {
         score += 2;
+        signals.push("computation_keyword");
+    }
 
     // Multi-step instructions
-    if (/first.*then|step \d|1\).*2\)|phase \d/.test(currentText)) score += 1;
+    if (/first.*then|step \d|1\).*2\)|phase \d/.test(currentText)) {
+        score += 2;
+        signals.push("multi_step");
+        intentHints.add("multi_step");
+    }
 
     // Current message token size
-    if (currentTokens > 2000) score += 1;
-    if (currentTokens > 5000) score += 2;
+    if (currentTokens > 2000) {
+        score += 1;
+        signals.push("large_current_turn");
+        intentHints.add("large_context");
+    }
+    if (currentTokens > 5000) {
+        score += 1;
+        signals.push("very_large_current_turn");
+        intentHints.add("large_context");
+    }
 
     // Creative/engineering keywords
     if (
         /write a (story|essay|article|report)|create a|design a|build a/.test(
             currentText,
         )
-    )
+    ) {
         score += 1;
-    if (/refactor|migrate|architect|implement|integrate/.test(currentText))
+        signals.push("creative_or_build_keyword");
+    }
+    if (/refactor|migrate|architect|implement|integrate/.test(currentText)) {
         score += 1;
+        signals.push("engineering_keyword");
+    }
+
+    // Intent hints used by routing gates.
+    if (
+        /\b(commit|push|amend|rebase|cherry-pick|tag|release)\b/.test(
+            currentText,
+        )
+    ) {
+        intentHints.add("git_ops");
+    }
+    if (
+        /\b(typo|whitespace|format|formatting|lint|docs?|documentation|comment-only|rename variable|rename var)\b/.test(
+            currentText,
+        )
+    ) {
+        intentHints.add("housekeeping");
+    }
+    if (
+        /\b(simple|basic|small|minimal)\b.*\brefactor\b|\brefactor\b.*\b(simple|basic|small|minimal)\b|\b(extract helper|rename)\b/.test(
+            currentText,
+        )
+    ) {
+        intentHints.add("small_refactor");
+    }
+    if (
+        /\b(architecture|architect|system design|distributed|scalable|scalability|trade-?off)\b/.test(
+            currentText,
+        )
+    ) {
+        intentHints.add("architecture");
+    }
+    if (
+        /\b(across files|across modules|multiple files|codebase-wide|entire codebase|whole codebase)\b/.test(
+            currentText,
+        )
+    ) {
+        intentHints.add("cross_file_refactor");
+    }
 
     // --- Session-level signals (lightweight context from history) ---
 
@@ -138,9 +223,14 @@ export function classifyComplexity(
                 )
             );
         });
-    if (hasTools) score += 2;
-    if (toolCount >= 5) score += 1; // notable tool surface area
-    if (toolCount >= 15) score += 1; // full agentic context (Claude Code default)
+    if (hasTools) {
+        score += 1;
+        signals.push("has_tools");
+    }
+    if (toolCount >= 10) {
+        score += 1; // large tool surface area
+        signals.push("many_tools");
+    }
 
     // Recent tool activity: only count tool_results in the LAST 6 messages
     // (the current agentic turn), not the entire conversation history.
@@ -151,18 +241,36 @@ export function classifyComplexity(
             isContentBlockArray(c) && c.some((p) => p.type === "tool_result")
         );
     }).length;
-    if (recentToolResults >= 3) score += 1;
+    if (recentToolResults >= 4) {
+        score += 1;
+        signals.push("recent_tool_activity");
+    }
 
     // System prompt length: a large system prompt signals rich project context
     // (CLAUDE.md content, file summaries, tool descriptions). This is an
-    // accurate proxy for task complexity without reading prompt content.
+    // useful proxy, but only when the current ask is not tiny.
     if (system) {
         const systemTokens = Math.ceil(system.length / 4);
-        if (systemTokens > 3000) score += 1; // substantial context loaded
-        if (systemTokens > 8000) score += 2; // full project context
+        const MIN_TOKENS_FOR_LARGE_SYSTEM_PROMPT_SIGNAL = 120;
+        const MIN_TOKENS_FOR_VERY_LARGE_SYSTEM_PROMPT_SIGNAL = 240;
+        if (systemTokens > 3000 && currentTokens > MIN_TOKENS_FOR_LARGE_SYSTEM_PROMPT_SIGNAL) {
+            score += 1; // substantial context loaded
+            signals.push("large_system_prompt");
+        }
+        if (systemTokens > 8000 && currentTokens > MIN_TOKENS_FOR_VERY_LARGE_SYSTEM_PROMPT_SIGNAL) {
+            score += 1; // very large context loaded
+            signals.push("very_large_system_prompt");
+        }
     }
 
-    if (score >= 5) return "complex";
-    if (score >= 3) return "moderate";
-    return "simple";
+    const complexity: Complexity =
+        score >= 5 ? "complex" : score >= 3 ? "moderate" : "simple";
+
+    return {
+        complexity,
+        score,
+        currentTokens,
+        signals,
+        intentHints: Array.from(intentHints),
+    };
 }
