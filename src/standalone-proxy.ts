@@ -3796,9 +3796,10 @@ export function summarizeRoutingInsights(history: RequestHistoryEntry[]): {
 
 export function toTelemetryRun(
     r: RequestHistoryEntry,
+    baselineModel: string = "claude-opus-4-6",
 ): Record<string, unknown> {
     const baseline = isAutoRouted(r.originalModel)
-        ? "claude-opus-4-6"
+        ? baselineModel
         : r.originalModel;
     const origCost = estimateCost(baseline, r.tokensIn, r.tokensOut);
     const perRunSavings = Math.max(0, origCost - r.costUsd);
@@ -3831,6 +3832,7 @@ export function toTelemetryRun(
 
 export function buildTelemetryStatsPayload(
     recent: RequestHistoryEntry[],
+    baselineModel: string = "claude-opus-4-6",
 ): Record<string, unknown> {
     const modelMap = new Map<
         string,
@@ -3839,6 +3841,7 @@ export function buildTelemetryStatsPayload(
             cost: number;
             autoCount: number;
             directCount: number;
+            savings: number;
         }
     >();
     for (const r of recent) {
@@ -3848,11 +3851,14 @@ export function buildTelemetryStatsPayload(
             cost: 0,
             autoCount: 0,
             directCount: 0,
+            savings: 0,
         };
         cur.count++;
         cur.cost += r.costUsd;
         if (isAutoRouted(r.originalModel)) {
             cur.autoCount++;
+            const origCost = estimateCost(baselineModel, r.tokensIn, r.tokensOut);
+            cur.savings += Math.max(0, origCost - r.costUsd);
         } else {
             cur.directCount++;
         }
@@ -3893,7 +3899,7 @@ export function buildTelemetryStatsPayload(
             costUsd: v.cost,
             autoCount: v.autoCount,
             directCount: v.directCount,
-            savings: 0,
+            savings: Math.round(v.savings * 10000) / 10000,
         })),
         dailyCosts: Array.from(dailyMap.entries()).map(([date, v]) => ({
             date,
@@ -4625,13 +4631,16 @@ export async function startProxy(
                 : "";
             const params = new URLSearchParams(queryString);
 
+            const BASELINE_MODEL =
+                proxyConfig.telemetry?.baselineModel ?? "claude-opus-4-6";
+
             if (req.method === "GET" && telemetryPath === "stats") {
                 const days = parseInt(params.get("days") || "7", 10);
                 const cutoff = Date.now() - days * 86400000;
                 const recent = requestHistory.filter(
                     (r) => new Date(r.timestamp).getTime() >= cutoff,
                 );
-                const result = buildTelemetryStatsPayload(recent);
+                const result = buildTelemetryStatsPayload(recent, BASELINE_MODEL);
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(JSON.stringify(result));
                 return;
@@ -4643,7 +4652,7 @@ export async function startProxy(
                 const sorted = [...requestHistory].reverse();
                 const runs = sorted
                     .slice(offset, offset + limit)
-                    .map((r) => toTelemetryRun(r));
+                    .map((r) => toTelemetryRun(r, BASELINE_MODEL));
                 res.writeHead(200, { "Content-Type": "application/json" });
                 res.end(
                     JSON.stringify({
@@ -4659,8 +4668,6 @@ export async function startProxy(
                 // For auto-routing aliases, the baseline is the model the user would
                 // have used without smart routing. Configurable via config.json
                 // telemetry.baselineModel; defaults to Opus for a conservative estimate.
-                const BASELINE_MODEL =
-                    proxyConfig.telemetry?.baselineModel ?? "claude-opus-4-6";
 
                 let totalOriginalCost = 0;
                 let totalActualCost = 0;

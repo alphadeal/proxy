@@ -193,7 +193,7 @@ export function classifyComplexityWithDetails(
         intentHints.add("small_refactor");
     }
     if (
-        /\b(architecture|architect|system design|distributed|scalab|trade-?off)\b/.test(
+        /\b(architecture|architect|system design|distributed|scalable|scalability|trade-?off)\b/.test(
             currentText,
         )
     ) {
@@ -251,11 +251,13 @@ export function classifyComplexityWithDetails(
     // useful proxy, but only when the current ask is not tiny.
     if (system) {
         const systemTokens = Math.ceil(system.length / 4);
-        if (systemTokens > 3000 && currentTokens > 120) {
+        const MIN_TOKENS_FOR_LARGE_SYSTEM_PROMPT_SIGNAL = 120;
+        const MIN_TOKENS_FOR_VERY_LARGE_SYSTEM_PROMPT_SIGNAL = 240;
+        if (systemTokens > 3000 && currentTokens > MIN_TOKENS_FOR_LARGE_SYSTEM_PROMPT_SIGNAL) {
             score += 1; // substantial context loaded
             signals.push("large_system_prompt");
         }
-        if (systemTokens > 8000 && currentTokens > 240) {
+        if (systemTokens > 8000 && currentTokens > MIN_TOKENS_FOR_VERY_LARGE_SYSTEM_PROMPT_SIGNAL) {
             score += 1; // very large context loaded
             signals.push("very_large_system_prompt");
         }
