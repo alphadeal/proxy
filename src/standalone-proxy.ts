@@ -1327,14 +1327,7 @@ function stripThinkingIfUnsupported<T extends Record<string, unknown>>(
     delete stripped["thinking"];
     if (Array.isArray(stripped["betas"])) {
         stripped["betas"] = (stripped["betas"] as string[]).filter(
-            (b) => {
-                const lower = b.toLowerCase();
-                return (
-                    !lower.includes("thinking") &&
-                    !lower.includes("clear_thinking") &&
-                    !lower.includes("reasoning")
-                );
-            },
+            (b) => !isThinkingBeta(b),
         );
         if ((stripped["betas"] as string[]).length === 0) {
             delete stripped["betas"];
@@ -1343,17 +1336,7 @@ function stripThinkingIfUnsupported<T extends Record<string, unknown>>(
         const filtered = (stripped["betas"] as string)
             .split(",")
             .map((b) => b.trim())
-            .filter(
-                (b) => {
-                    if (!b) return false;
-                    const lower = b.toLowerCase();
-                    return (
-                        !lower.includes("thinking") &&
-                        !lower.includes("clear_thinking") &&
-                        !lower.includes("reasoning")
-                    );
-                },
-            );
+            .filter((b) => b && !isThinkingBeta(b));
         if (filtered.length > 0) {
             stripped["betas"] = filtered.join(",");
         } else {
